@@ -52,12 +52,33 @@ a[12] = 0
 open('/tmp/h_nul.caiw','wb').write(a)
 # archive with trailing garbage
 open('/tmp/h_trail.caiw','wb').write(open('/tmp/tst2.caiw','rb').read() + b'GARBAGE')
+def w32(v): return struct.pack('<I', v)
+def w64(v): return struct.pack('<q', v)
+# file table ["a","a.caiwtmp"]: tmp name would collide with a final name
+a = b'CAI5' + w32(2)
+for nm in (b'a', b'a.caiwtmp'): a += w32(len(nm)) + nm + w32(0)
+a += w32(0)
+open('/tmp/h_col.caiw','wb').write(a)
+# FIELD method on I16 dtype: encoder never emits this combo -> must die
+a = b'CAI5' + w32(1) + w32(1) + b'x' + w32(0) + w32(1)
+a += struct.pack('<H',1)+b't'+struct.pack('<H',3)+b'I16'+b'\x01'+w64(32)
+a += struct.pack('<H',0)+b'\x03'+w64(64)+w64(0)+w32(0)
+open('/tmp/h_dtype.caiw','wb').write(a)
+# duplicate filenames in file table
+a = b'CAI5' + w32(2)
+for nm in (b'same.st', b'same.st'): a += w32(len(nm)) + nm + w32(0)
+a += w32(0)
+open('/tmp/h_dupf.caiw','wb').write(a)
 PYEOF
 "$BIN" c /tmp/hz.caiw /tmp/h_dup.st >/dev/null 2>&1 && { echo "DUPNAME ACCEPTED"; fail=1; }
 "$BIN" c /tmp/hz.caiw /tmp/h_meta.st >/dev/null 2>&1 && { echo "BADMETA ACCEPTED"; fail=1; }
 "$BIN" d /tmp/h_nul.caiw /tmp/hzout >/dev/null 2>&1 && { echo "NULNAME ACCEPTED"; fail=1; }
 "$BIN" v /tmp/h_trail.caiw out/pack1.st out/meta.st >/dev/null 2>&1 && { echo "TRAILING ACCEPTED"; fail=1; }
 "$BIN" c /tmp/hz.caiw -j 1x out/pack1.st >/dev/null 2>&1 && { echo "BAD-J ACCEPTED"; fail=1; }
+"$BIN" d /tmp/h_col.caiw /tmp/hzout >/dev/null 2>&1 && { echo "TMPCOLLIDE ACCEPTED"; fail=1; }
+"$BIN" d /tmp/h_dtype.caiw /tmp/hzout >/dev/null 2>&1 && { echo "BADDTYPE ACCEPTED"; fail=1; }
+"$BIN" v /tmp/h_dtype.caiw out/pack1.st >/dev/null 2>&1 && { echo "BADDTYPE-V ACCEPTED"; fail=1; }
+"$BIN" d /tmp/h_dupf.caiw /tmp/hzout >/dev/null 2>&1 && { echo "DUPFNAME ACCEPTED"; fail=1; }
 for f in tests/corpus/*; do
     [ -e "$f" ] || continue
     timeout 10 "$BIN" c /tmp/tz.caiw "$f" -j2 >/dev/null 2>&1; rc=$?
