@@ -49,7 +49,12 @@ enum { M_RAW = 0, M_PACK, M_REF, M_FIELD, M_FIELDPOS, M_DELTA, M_U8, M_F32, M_FI
 #define MF_BH  0x40   /* batch head: first member opens a new batch */
 
 static void die(const char *m) __attribute__((noreturn));
-static void die(const char *m) { fprintf(stderr, "caiw: %s\n", m); exit(1); }
+static void die(const char *m) {
+    static volatile int dying;
+    if (__sync_lock_test_and_set(&dying, 1)) _exit(1);  /* a worker already exiting: don't re-run atexit */
+    fprintf(stderr, "caiw: %s\n", m);
+    exit(1);
+}
 /* d-mode: remove partial outputs if we exit on any failure */
 static char **g_outp; static int g_outn, g_outok;
 static void out_cleanup(void) { if (!g_outok) for (int i = 0; i < g_outn; i++) if (g_outp[i]) unlink(g_outp[i]); }
@@ -1990,7 +1995,13 @@ int main(int argc, char **argv) {
         if (nf > 65535) die("too many inputs");   /* file_idx field is u16 */
         InFile **ins = xc(nf, sizeof(InFile *));
         int64_t NT64 = 0;
-        for (int i = 0; i < nf; i++) { ins[i] = st_load(argv[3 + i], i); NT64 += ins[i]->n; }
+        for (int i = 0; i < nf; i++) {
+            /* c a.st a.st would rename the archive over its own source */
+            if (!strcmp(argv[3 + i], argv[2])) die("input == output path");
+            ins[i] = st_load(argv[3 + i], i); NT64 += ins[i]->n;
+        }
+        for (int r = 0; r < g_nref; r++)
+            if (!strcmp(g_refs[r]->path, argv[2])) die("ref == output path");
         if (NT64 > 0x7FFFFFFFll) die("too many tensors");   /* NT is int below */
         int NT = (int)NT64;
         Tensor *all = xc(NT, sizeof(Tensor));
@@ -2068,8 +2079,18 @@ int main(int argc, char **argv) {
             if (!*bn || strlen(bn) > 3000 || strchr(bn, '\\') ||
                 !strcmp(bn, ".") || !strcmp(bn, ".."))
                 die("bad input basename");
-            for (int j = 0; j < i; j++)
-                if (!strcmp(bn, bname(ins[j]->path))) die("duplicate input basename");
+            char tmpn[3016];
+            snprintf(tmpn, sizeof tmpn, "%s.caiwtmp", bn);   /* bn's own tmp name */
+            for (int j = 0; j < i; j++) {
+                const char *bj = bname(ins[j]->path);
+                if (!strcmp(bn, bj)) die("duplicate input basename");
+                /* decoder writes <name>.caiwtmp then renames — a pair like
+                   (a, a.caiwtmp) would clobber; refuse to emit it */
+                char tj[3016];
+                snprintf(tj, sizeof tj, "%s.caiwtmp", bj);
+                if (!strcmp(bj, tmpn) || !strcmp(bn, tj))
+                    die("basename collides with temp name");
+            }
             w32(of, strlen(bn)); fwrite(bn, 1, strlen(bn), of);
             uint32_t ml = ins[i]->meta ? (uint32_t)strlen(ins[i]->meta) : 0;
             w32(of, ml);
@@ -2179,10 +2200,15 @@ int main(int argc, char **argv) {
            to another member's temp name would make the final rename clobber
            the wrong file; reject the collision up front */
         {
-            char tb[3016];
+            char tb[4096];
             for (uint32_t i = 0; i < nf; i++) {
                 snprintf(tb, sizeof tb, "%s.caiwtmp", fnames[i]);
                 if (nf_find(fset, fcap - 1, tb, 0)) die("filename collides with temp name");
+                /* a member whose output path IS the archive would clobber
+                   its own input mid-decode */
+                int w = snprintf(tb, sizeof tb, "%s/%s", argv[3], fnames[i]);
+                if (w > 0 && (size_t)w < sizeof tb && !strcmp(tb, argv[2]))
+                    die("output overwrites archive");
             }
         }
         BND(p, 4); uint32_t NT = r32(&p);
@@ -2257,8 +2283,10 @@ int main(int argc, char **argv) {
                 size_t need = 7 * (strlen(t->name) + strlen(t->dtype)) +
                               24 * ((size_t)t->nd + 1) + 128;
                 while (jl + need > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
-                /* off_t is signed: keep every data_offset <= INT64_MAX */
-                if (t->len > (uint64_t)INT64_MAX - foff[i]) die("size overflow");
+                /* off_t is signed: data_offset + header base must stay <
+                   INT64_MAX — leave 2^40 headroom for the JSON header */
+                if (t->len > (uint64_t)INT64_MAX - foff[i] - (1ull << 40))
+                    die("size overflow");
                 t->dataoff = foff[i];
                 char *en = xm(6 * strlen(t->name) + 1), *ed = xm(6 * strlen(t->dtype) + 1);
                 jesc(en, 6 * strlen(t->name) + 1, t->name);
@@ -2358,6 +2386,7 @@ int main(int argc, char **argv) {
         dlim_init();
         uint64_t fsz; uint8_t *buf = slurp(argv[2], &fsz);
         int nf = argc - 3;
+        if (nf > 65535) die("too many inputs");   /* positional match to u16 file idx */
         InFile **ins = xc(nf, sizeof(InFile *));
         for (int i = 0; i < nf; i++) ins[i] = st_load(argv[3 + i], i);
         const uint8_t *p = buf, *bend = buf + fsz;
