@@ -22,9 +22,11 @@ Qwen3-4B shard 3 (BF16, 99.6 MB), `-j8`, this machine:
 | gzip -9 | 79.22 MB | 0.795 | 7.8 s |
 
 Full Qwen3-4B (8.0 GB, 3 shards, 398 tensors): **5.32 GB (0.662)**,
-encoded in 4m05s, verified byte-exact in 2m04s.
+encoded in 4m40s, verified `0 bad`.
 
-MoE shard (4.0 GB, 1063 tensors): **2.65 GB (0.663)**, 80 s encode.
+MoE shard (4.0 GB, 1063 tensors): **2.65 GB (0.663)**, ~2 min encode.
+OLMo-2 F32 pair (5.0 GB) against its base snapshot via `--ref`:
+**2.79 GB (0.560)** — 170 of 173 tensors resolved as `DELTAX`.
 
 ## Quick start
 
@@ -65,10 +67,10 @@ helps, RAW wins.
 | `RAW` | store — the honest floor |
 
 **Parallelism without nondeterminism.** Candidate trials and consecutive
-tensors encode in parallel (batches, `CAI4`): each worker sees a snapshot
+tensors encode in parallel (batches, `CAI5`): each worker sees a snapshot
 of the committed histogram state, histogram deltas merge commutatively,
-and the archive records batch boundaries so *any* `-j` reproduces — and
-decodes — the identical byte stream.
+and the archive records batch boundaries so an archive written at *any*
+`-j` decodes to identical bytes under *any* `-j`.
 
 **Rolling context models.** Each channel keeps a cumulative histogram;
 per-block tables are normalized only over contexts the block actually
@@ -78,7 +80,9 @@ already-decoded reference tensor.
 ## Correctness and robustness
 
 - **Byte-exact by construction** — `v` re-derives every tensor and
-  compares bytes + CRC32; `d` output data regions compare equal to input.
+  compares bytes + CRC32 in both directions (archive vs source, incl.
+  dtype/shape/`__metadata__`); `d` restores every tensor and the
+  verbatim metadata object.
 - **Hostile-input safe** — every malformed archive or truncated
   safetensors file exits(1) through `die()`; the decoder validates every
   field, method/dtype pair, payload bound, and batch reference before
@@ -88,7 +92,8 @@ already-decoded reference tensor.
   bijection; the rANS core is covered by an exhaustive
   boundary sweep (524,537 cases — every frequency × every 256-power
   transition) and `dsym` by 3,264 tables × all 32,768 symbol values.
-- **Deterministic** — identical archives across runs and thread counts.
+- **Deterministic** — fixed `-j` reproduces identical archives;
+  archives are `-j`-independent on the decode side.
 
 See `AGENTS.md` for the format specification, the decoder trust-boundary
 checklist, and the full verification log.

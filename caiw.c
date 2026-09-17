@@ -82,10 +82,11 @@ static uint64_t fnv(const void *d, size_t n) {
 /* ================= safetensors ================= */
 typedef struct Tensor {
     char *name, *dtype;
-    int64_t shape[8]; int nd;
+    int64_t shape[64]; int nd;  /* max dims; inputs with more are rejected */
     uint64_t off, len;
     uint8_t *data;
     int file;
+    int matched;                /* v-mode: this source tensor was found in the archive */
     uint64_t dataoff;           /* decode: output offset within file data region */
     int method; uint32_t ref; uint64_t plen; uint32_t crc;
     int bat;                    /* decoded: member of a parallel batch */
@@ -94,30 +95,141 @@ typedef struct Tensor {
     uint32_t candref[4]; int ncand; /* intra DELTA ref candidates */
 } Tensor;
 
-typedef struct { char *path; Tensor *t; int n; uint8_t *base; uint64_t bsz_; int mapped; } InFile;
+typedef struct {
+    char *path; Tensor *t; int n;
+    uint8_t *base; uint64_t bsz_; int mapped;
+    char *meta;                 /* verbatim __metadata__ object text or NULL */
+} InFile;
 static InFile **g_refs = NULL; static int g_nref = 0;
 
-static const char *jget(const char *obj, const char *oend, const char *key, char *buf, int bs) {
-    /* find key within [obj,oend) */
-    size_t kl = strlen(key);
-    const char *p = obj;
-    while ((p = memchr(p, '"', oend - p))) {
-        if ((size_t)(oend - p) > kl && !memcmp(p, key, kl)) break;
+/* ---- minimal JSON for safetensors headers ---- */
+static int hex4(const char *p, unsigned *out) {
+    unsigned v = 0;
+    for (int k = 0; k < 4; k++) {
+        char c = p[k]; v <<= 4;
+        if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+        else return 0;
+    }
+    *out = v; return 1;
+}
+/* parse a JSON string at p ('"'); unescape into buf (\u -> UTF-8).
+   returns char past the closing quote, NULL on malformed input. */
+static const char *jstr(const char *p, char *buf, size_t bs) {
+    if (*p != '"') return 0;
+    p++;
+    size_t i = 0;
+    for (;;) {
+        unsigned char c = (unsigned char)*p;
+        if (!c) return 0;
+        if (c == '"') { buf[i] = 0; return p + 1; }
+        if (c == '\\') {
+            p++;
+            switch (*p) {
+            case '"': case '\\': case '/': c = (unsigned char)*p; break;
+            case 'b': c = '\b'; break; case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break; case 'r': c = '\r'; break; case 't': c = '\t'; break;
+            case 'u': {
+                unsigned cp;
+                if (!hex4(p + 1, &cp)) return 0;
+                p += 5;
+                if (cp >= 0xD800 && cp <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
+                    unsigned lo;
+                    if (hex4(p + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    }
+                }
+                if (i + 4 >= bs) return 0;
+                if (cp < 0x80) buf[i++] = (char)cp;
+                else if (cp < 0x800) {
+                    buf[i++] = (char)(0xC0 | (cp >> 6));
+                    buf[i++] = (char)(0x80 | (cp & 63));
+                } else if (cp < 0x10000) {
+                    buf[i++] = (char)(0xE0 | (cp >> 12));
+                    buf[i++] = (char)(0x80 | ((cp >> 6) & 63));
+                    buf[i++] = (char)(0x80 | (cp & 63));
+                } else {
+                    buf[i++] = (char)(0xF0 | (cp >> 18));
+                    buf[i++] = (char)(0x80 | ((cp >> 12) & 63));
+                    buf[i++] = (char)(0x80 | ((cp >> 6) & 63));
+                    buf[i++] = (char)(0x80 | (cp & 63));
+                }
+                continue;
+            }
+            default: return 0;
+            }
+            p++;                    /* past the escape letter */
+            if (i + 1 >= bs) return 0;
+            buf[i++] = (char)c;
+            continue;
+        }
+        if (i + 1 >= bs) return 0;
+        buf[i++] = (char)c;
         p++;
     }
-    if (!p || p >= oend) return 0;
-    p = memchr(p + kl, ':', oend - p - kl);
-    if (!p) return 0;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-    int i = 0;
-    if (*p == '"') { p++; while (*p && *p != '"' && i < bs - 1) buf[i++] = *p++; }
-    else if (*p == '[') { while (*p && *p != ']' && i < bs - 1) buf[i++] = *p++; if (*p == ']' && i < bs - 1) buf[i++] = *p++; }
-    else while (*p && *p != ',' && *p != '}' && *p != ']' && i < bs - 1) buf[i++] = *p++;
-    buf[i] = 0;
-    return buf;
+}
+/* skip a JSON string at p; returns char past the closing quote */
+static const char *jstr_skip(const char *p) {
+    for (p++; *p && *p != '"'; p++) if (*p == '\\' && p[1]) p++;
+    return *p ? p + 1 : 0;
+}
+/* skip a balanced {..} / [..] starting at p (string-aware) */
+static const char *jspan(const char *p) {
+    char open = *p, close = open == '{' ? '}' : ']';
+    if (open != '{' && open != '[') return 0;
+    int depth = 0;
+    for (;; p++) {
+        if (!*p) return 0;
+        if (*p == '"') {
+            const char *e = jstr_skip(p);
+            if (!e) return 0;
+            p = e - 1;
+        } else if (*p == open) depth++;
+        else if (*p == close && --depth == 0) return p + 1;
+    }
+}
+/* fetch key's value within flat object [obj,oend); string values are
+   unescaped, arrays/objects copied verbatim. key given WITHOUT quotes. */
+static const char *jget(const char *obj, const char *oend, const char *key, char *buf, int bs) {
+    const char *p = obj;
+    char kb[600];
+    while (p < oend) {
+        const char *q = memchr(p, '"', oend - p);
+        if (!q) return 0;
+        const char *e = jstr(q, kb, sizeof kb);
+        if (!e || e > oend) return 0;
+        const char *np = e;
+        while (np < oend && (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r')) np++;
+        p = e;
+        if (np >= oend || *np != ':') continue;
+        np++;
+        while (np < oend && (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r')) np++;
+        if (np >= oend) return 0;
+        if (!strcmp(kb, key)) {
+            if (*np == '"') return jstr(np, buf, bs) ? buf : 0;
+            if (*np == '[' || *np == '{') {
+                const char *ve = jspan(np);
+                if (!ve || ve > oend || (size_t)(ve - np) >= (size_t)bs) return 0;
+                memcpy(buf, np, (size_t)(ve - np));
+                buf[ve - np] = 0;
+                return buf;
+            }
+            int i = 0;
+            while (np < oend && *np != ',' && *np != '}' && i < bs - 1) buf[i++] = *np++;
+            buf[i] = 0;
+            return buf;
+        }
+        /* skip the value so its contents can't fake a key */
+        if (*np == '"') { const char *ve = jstr_skip(np); p = ve ? ve : oend; }
+        else if (*np == '{' || *np == '[') { const char *ve = jspan(np); p = ve ? ve : oend; }
+        else { while (np < oend && *np != ',') np++; p = np; }
+    }
+    return 0;
 }
 
+static int dtb(const char *d);
 static InFile *st_load(const char *path, int fidx) {
     FILE *f = fopen(path, "rb");
     if (!f) die("cannot open input");
@@ -132,44 +244,77 @@ static InFile *st_load(const char *path, int fidx) {
     InFile *inf = xc(1, sizeof(InFile));
     inf->path = strdup(path);
     inf->t = xc(nt ? nt : 1, sizeof(Tensor));
-    char *p = hdr, kb[600], vb[4200];
-    while ((p = strchr(p, '"')) && inf->n < nt) {
-        char *e = strchr(p + 1, '"');
-        if (!e) break;
-        int kl = e - p - 1;
-        if (kl <= 0 || kl >= 590) { p = e + 1; continue; }
-        memcpy(kb, p + 1, kl); kb[kl] = 0;
-        char *np = e + 1;
-        while (*np == ' ' || *np == '\t' || *np == '\n') np++;
-        if (*np != ':') { p = np; continue; }
+    const char *p = hdr; char kb[600], vb[4200];
+    while ((p = strchr(p, '"'))) {
+        const char *e = jstr(p, kb, sizeof kb);
+        if (!e) die("bad header string");
+        const char *np = e;
+        while (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r') np++;
+        if (*np != ':') { p = e; continue; }
         np++;
-        while (*np == ' ' || *np == '\t' || *np == '\n') np++;
+        while (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r') np++;
+        if (*np == '"') {           /* plain string value: skip whole string */
+            const char *ve = jstr_skip(np);
+            if (!ve) die("bad header string");
+            p = ve; continue;
+        }
         if (*np != '{') { p = np; continue; }
-        char *ob = np;
-        char *oend = strchr(ob, '}');   /* flat objects: first } ends it */
-        if (!oend) break;
-        if (!jget(ob, oend, "\"data_offsets\"", vb, sizeof vb)) { p = oend + 1; continue; }
+        const char *oend = jspan(np);   /* char past matching '}' */
+        if (!oend) die("bad header object");
+        if (!strcmp(kb, "__metadata__")) {   /* keep verbatim for byte-faithful replay */
+            free(inf->meta);
+            inf->meta = xm((size_t)(oend - np) + 1);
+            memcpy(inf->meta, np, (size_t)(oend - np));
+            inf->meta[oend - np] = 0;
+            p = oend; continue;
+        }
+        if (!jget(np, oend, "data_offsets", vb, sizeof vb)) { p = oend; continue; }
+        if (inf->n >= nt) die("tensor count overflow");
+        for (int k = 0; k < inf->n; k++)
+            if (!strcmp(inf->t[k].name, kb)) die("dup tensor name");
         Tensor *t = &inf->t[inf->n];
         t->name = strdup(kb);
         t->file = fidx;
         char dbuf[64];
-        t->dtype = jget(ob, oend, "\"dtype\"", dbuf, sizeof dbuf) ? strdup(dbuf) : strdup("?");
-        char sbuf[600];
+        t->dtype = jget(np, oend, "dtype", dbuf, sizeof dbuf) ? strdup(dbuf) : strdup("?");
+        char sbuf[4200];
         t->nd = 0;
-        if (jget(ob, oend, "\"shape\"", sbuf, sizeof sbuf)) {
+        if (!jget(np, oend, "shape", sbuf, sizeof sbuf)) die("bad shape");
+        {
             char *q = sbuf;
-            while (*q && t->nd < 8) {
+            while (*q && t->nd < 64) {
                 while (*q && (*q < '0' || *q > '9')) q++;
                 if (!*q) break;
                 t->shape[t->nd++] = strtoll(q, &q, 10);
             }
+            while (*q && *q != ']' && (*q < '0' || *q > '9')) q++;
+            if (*q >= '0' && *q <= '9') die("too many dims");
         }
         uint64_t a = 0, b = 0;
-        sscanf(vb, "[%llu,%llu]", (unsigned long long *)&a, (unsigned long long *)&b);
+        {
+            char *q = strchr(vb, '['), *e2;
+            if (!q) die("bad data_offsets");
+            a = strtoull(q + 1, &e2, 10);
+            for (q = e2; *q == ' ' || *q == '\t'; q++) ;
+            if (*q != ',') die("bad data_offsets");
+            b = strtoull(q + 1, &e2, 10);
+            for (q = e2; *q == ' ' || *q == '\t'; q++) ;
+            if (*q != ']') die("bad data_offsets");
+        }
         if (b < a) die("bad data_offsets");
         t->off = a; t->len = b - a;
+        /* safetensors invariant: len == product(shape) * dtype size */
+        {
+            unsigned __int128 prod = 1;
+            for (int d = 0; d < t->nd; d++) {
+                if (t->shape[d] < 0) die("bad shape");
+                prod *= (uint64_t)t->shape[d];
+                if (prod > UINT64_MAX / 8) die("bad shape");
+            }
+            if ((uint64_t)prod * (uint64_t)dtb(t->dtype) != t->len) die("shape/len mismatch");
+        }
         inf->n++;
-        p = oend + 1;
+        p = oend;
     }
     free(hdr);
     uint64_t dsz = 0;
@@ -248,34 +393,34 @@ static const int csz[NCH] = {
     2 + 512 + 512 * 128 + 512 * 256 + 512 * 256,
     4 * 256 * 256,
 };
-static uint32_t *gch[NCH];                /* committed model state (main thread) */
-static _Thread_local uint32_t **gh;       /* active channel array; NULL = unmaterialized */
-static _Thread_local uint32_t **gsnp;     /* batch snapshot backing lazy clones (workers) */
+static uint64_t *gch[NCH];                /* committed model state (main thread) */
+static _Thread_local uint64_t **gh;       /* active channel array; NULL = unmaterialized */
+static _Thread_local uint64_t **gsnp;     /* batch snapshot backing lazy clones (workers) */
 static int g_threads = 1;
 
 static void model_init(void) {
     for (int c = 0; c < NCH; c++) {
-        gh[c] = xm(csz[c] * 4);
+        gh[c] = xm(csz[c] * 8);
         for (int i = 0; i < csz[c]; i++) gh[c][i] = 1;
     }
 }
 /* channel access for writing: materializes a lazy worker clone from the
    batch snapshot on first touch. Main thread channels are always live. */
-static uint32_t *H(int c) {
-    uint32_t *p = gh[c];
-    if (!p) { p = xm(csz[c] * 4); memcpy(p, gsnp[c], csz[c] * 4); gh[c] = p; }
+static uint64_t *H(int c) {
+    uint64_t *p = gh[c];
+    if (!p) { p = xm(csz[c] * 8); memcpy(p, gsnp[c], csz[c] * 8); gh[c] = p; }
     return p;
 }
-static uint32_t *hclone(int c) {
-    const uint32_t *s = gh[c] ? gh[c] : gsnp[c];
-    uint32_t *h = xm(csz[c] * 4); memcpy(h, s, csz[c] * 4); return h;
+static uint64_t *hclone(int c) {
+    const uint64_t *s = gh[c] ? gh[c] : gsnp[c];
+    uint64_t *h = xm(csz[c] * 8); memcpy(h, s, csz[c] * 8); return h;
 }
-static void hcommit(int c, uint32_t *h) {
-    if (!gh[c]) gh[c] = xm(csz[c] * 4);
-    memcpy(gh[c], h, csz[c] * 4); free(h);
+static void hcommit(int c, uint64_t *h) {
+    if (!gh[c]) gh[c] = xm(csz[c] * 8);
+    memcpy(gh[c], h, csz[c] * 8); free(h);
 }
 
-static void norm_ctx(const uint32_t *h, uint16_t *f, int aw) {
+static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
     uint64_t tot = 0; int nz = 0;
     for (int i = 0; i < aw; i++) { tot += h[i]; if (h[i]) nz++; }
     if (!nz) {
@@ -287,7 +432,7 @@ static void norm_ctx(const uint32_t *h, uint16_t *f, int aw) {
     int64_t rem = TOT, bud = TOT - nz; int bi = 0;
     for (int i = 0; i < aw; i++) {
         if (h[i] > h[bi]) bi = i;
-        uint32_t q = h[i] ? (uint32_t)((uint64_t)h[i] * bud / tot) + 1 : 0;
+        uint32_t q = h[i] ? (uint32_t)(h[i] * bud / tot) + 1 : 0;
         f[i] = (uint16_t)q;
         rem -= q;
     }
@@ -328,7 +473,7 @@ static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *
 }
 
 /* ============ FIELD 16-bit ============ */
-static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint32_t *h) {
+static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint64_t *h) {
     int ew = 1 << (15 - mb), mw = 1 << mb;
     uint8_t *o = out;
     uint16_t *ft = xm((2 + 2 * ew + (size_t)2 * ew * mw) * 2);
@@ -362,7 +507,7 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint3
     free(ft); free(cum); free(scr);
     return o - out;
 }
-static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, uint16_t *s, uint32_t *h) {
+static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, uint16_t *s, uint64_t *h) {
     int ew = 1 << (15 - mb), mw = 1 << mb;
     const uint8_t *rp = in;
     uint16_t *ft = xm((2 + 2 * ew + (size_t)2 * ew * mw) * 2);
@@ -409,7 +554,7 @@ static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, u
  * hist: [SE|pos: K*sew][M|SE: 2*ew*mw]
  */
 static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int rowwise,
-                      uint8_t *out, uint32_t *h) {
+                      uint8_t *out, uint64_t *h) {
     if (P <= 0) return 0;   /* degenerate shape: not applicable */
     int ew = 1 << (15 - mb), mw = 1 << mb, sew = 2 * ew;
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
@@ -453,7 +598,7 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
     return o - out;
 }
 static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, int64_t P, int rowwise,
-                    uint16_t *s, uint32_t *h) {
+                    uint16_t *s, uint64_t *h) {
     if (P <= 0) die("bad shape");
     int ew = 1 << (15 - mb), mw = 1 << mb, sew = 2 * ew;
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
@@ -500,7 +645,7 @@ static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, i
 }
 
 /* ============ F32: S|E|m1(7)|m2(8)|m3(8) ============ */
-static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint32_t *h) {
+static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
     uint8_t *o = out;
     size_t nM1 = 512 * 128, nM2 = 512 * 256, nM3 = 512 * 256;
     uint16_t *ft = xm((2 + 512 + nM1 + nM2 + nM3) * 2);
@@ -545,7 +690,7 @@ static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint32_t *h) 
     free(ft); free(cum); free(scr);
     return o - out;
 }
-static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t *s, uint32_t *h) {
+static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t *s, uint64_t *h) {
     const uint8_t *rp = in;
     size_t nM1 = 512 * 128, nM2 = 512 * 256, nM3 = 512 * 256;
     uint16_t *ft = xm((2 + 512 + nM1 + nM2 + nM3) * 2);
@@ -599,7 +744,7 @@ static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t 
 }
 
 /* ============ U8 ============ */
-static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint32_t *h) {
+static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
     uint8_t *o = out, *scr = xm(SCRSZ);
     uint16_t ft[256]; uint32_t cum[257];
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
@@ -616,7 +761,7 @@ static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint32_t *h) {
     free(scr);
     return o - out;
 }
-static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint8_t *s, uint32_t *h) {
+static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint8_t *s, uint64_t *h) {
     const uint8_t *rp = in;
     uint16_t ft[256]; uint32_t cum[257];
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
@@ -653,7 +798,7 @@ static inline int64_t kmap32(uint32_t u) {   /* ordering map for delta_ok pretes
 #define DSYMS (2 * DR + 1)
 #define DCTX 128               /* residual ctx = top 7 bits of ref element */
 static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
-                      uint8_t *out, uint32_t *h, int mb, uint32_t *hesc) {
+                      uint8_t *out, uint64_t *h, int mb, uint64_t *hesc) {
     uint8_t *o = out, *scr = xm(SCRSZ);
     uint16_t *ft = xm(DCTX * DSYMS * 2);
     uint32_t *dcum = xm(DCTX * (DSYMS + 1) * 4);
@@ -697,7 +842,7 @@ static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
     return o - out;
 }
 static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
-                    uint16_t *cur, uint32_t *h, int mb, uint32_t *hesc) {
+                    uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc) {
     const uint8_t *rp = in;
     uint16_t *ft = xm(DCTX * DSYMS * 2);
     uint32_t *cum = xm(DCTX * (DSYMS + 1) * 4);
@@ -753,7 +898,7 @@ static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, 
 /* each XOR plane coded conditioned on ref exponent byte (ref>>23):
  * ~0.6b/elem gain on real F32 checkpoint deltas */
 static size_t dlt32_enc(const uint32_t *cur, const uint32_t *ref, uint64_t n,
-                        uint8_t *out, uint32_t *h) {
+                        uint8_t *out, uint64_t *h) {
     uint8_t *pl = xm(D32CN), *cb = xm(D32CN), *o = out, *scr = xm(SCRSZ);
     uint16_t *ft = xm(256 * 256 * 2); uint32_t *cum = xm(256 * 257 * 4);
     for (int p = 0; p < 4; p++) {
@@ -790,7 +935,7 @@ static size_t dlt32_enc(const uint32_t *cur, const uint32_t *ref, uint64_t n,
     return o - out;
 }
 static void dlt32_dec(const uint8_t *in, const uint8_t *lim, const uint32_t *ref, uint64_t n,
-                      uint32_t *cur, uint32_t *h) {
+                      uint32_t *cur, uint64_t *h) {
     uint8_t *pl = xm(BLK), *cb = xm(BLK);
     uint16_t *ft = xm(256 * 256 * 2); uint32_t *cum = xm(256 * 257 * 4);
     for (int p = 0; p < 4; p++) {
@@ -877,13 +1022,15 @@ static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz,
     uint16_t dict[256];
     memcpy(dict, in, k * 2); in += k * 2;
     int ib = 0; while ((1 << ib) < k) ib++;
-    uint64_t ne = n / bsz, bit = 0;
+    uint64_t ne = n / bsz, bit = 0, nb = (uint64_t)(lim - in);
     for (uint64_t i = 0; i < ne; i++) {
         uint32_t idx = 0;
-        if (in + ((bit + ib - 1) >> 3) >= lim) die("corrupt pack");
-        for (int b = 0; b < ib; b++) {
-            idx = (idx << 1) | ((in[bit >> 3] >> (7 - (bit & 7))) & 1);
-            bit++;
+        if (ib) {   /* k==1: zero-bit indices — the index stream is empty */
+            if ((bit + (uint64_t)ib - 1) >> 3 >= nb) die("corrupt pack");
+            for (int b = 0; b < ib; b++) {
+                idx = (idx << 1) | ((in[bit >> 3] >> (7 - (bit & 7))) & 1);
+                bit++;
+            }
         }
         if (idx >= (uint32_t)k) die("corrupt pack");
         if (bsz == 2) ((uint16_t *)data)[i] = dict[idx];
@@ -948,6 +1095,28 @@ static const char *bname(const char *p) {
     return s ? s + 1 : p;
 }
 
+/* JSON-escape s into o[cap]; returns full needed length (snprintf-style) */
+static size_t jesc(char *o, size_t cap, const char *s) {
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char tmp[8]; const char *rep = tmp;
+        switch (*p) {
+        case '"': rep = "\\\""; break;  case '\\': rep = "\\\\"; break;
+        case '\b': rep = "\\b"; break;  case '\f': rep = "\\f"; break;
+        case '\n': rep = "\\n"; break;  case '\r': rep = "\\r"; break;
+        case '\t': rep = "\\t"; break;
+        default:
+            if (*p < 0x20) snprintf(tmp, sizeof tmp, "\\u%04x", *p);
+            else { tmp[0] = (char)*p; tmp[1] = 0; }
+        }
+        size_t rl = strlen(rep);
+        if (n + rl + 1 <= cap) memcpy(o + n, rep, rl + 1);
+        n += rl;
+    }
+    if (cap) o[n < cap ? n : cap - 1] = 0;
+    return n;
+}
+
 /* digit runs -> '#': groups tensors into families (layers.N.*, experts.N.*) */
 static char *nnorm(const char *s) {
     char *r = xm(strlen(s) + 1), *d = r;
@@ -996,7 +1165,40 @@ static int delta_ok(const uint8_t *cur, const uint8_t *ref, uint64_t nbytes, int
    channel hist clones written to hout[0..1] with channel ids in
    chout[0..1] (-1 = unused); caller commits or frees each.
    ri: intra-archive ref index for M_DELTA. */
-static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t **hout, int *chout, uint32_t ri) {
+/* RAW/PACK carry no rANS streams, so a winning RAW/PACK would otherwise
+ * leave the float channels cold forever on many small tensors. Feed the
+ * tensor's natural channel instead — identical counting on both sides,
+ * so encode and decode stay in lockstep. Runs AFTER winner commit on the
+ * encode side / after payload decode on the decode side. */
+static void teach(const Tensor *t) {
+    int bsz = dtb(t->dtype);
+    uint64_t ne = bsz > 1 ? t->len / bsz : 0;
+    if (ne && is_flt16(t->dtype)) {
+        int mb = mbits_of(t->dtype), ew = 1 << (15 - mb), mw = 1 << mb;
+        uint64_t *h = H(is_bf(t->dtype) ? CBF : CFP);
+        const uint16_t *s = (const uint16_t *)t->data;
+        for (uint64_t i = 0; i < ne; i++) {
+            uint32_t v = s[i], S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
+            h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
+        }
+    } else if (ne && is_f32(t->dtype)) {
+        uint64_t *h = H(C32);
+        const uint32_t *s = (const uint32_t *)t->data;
+        for (uint64_t i = 0; i < ne; i++) {
+            uint32_t v = s[i], S = v >> 31, E = (v >> 23) & 255;
+            size_t se = S * 256 + E;
+            h[S]++; h[2 + S * 256 + E]++;
+            h[2 + 512 + se * 128 + ((v >> 16) & 127)]++;
+            h[2 + 512 + 512 * 128 + se * 256 + ((v >> 8) & 255)]++;
+            h[2 + 512 + 512 * 128 + 512 * 256 + se * 256 + (v & 255)]++;
+        }
+    } else {
+        uint64_t *h = H(C8);
+        for (uint64_t i = 0; i < t->len; i++) h[t->data[i]]++;
+    }
+}
+
+static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri) {
     hout[0] = 0; hout[1] = 0; chout[0] = -1; chout[1] = -1;
     int bsz = dtb(t->dtype);
     uint64_t ne = bsz ? t->len / bsz : 0;
@@ -1010,7 +1212,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
     case M_FIELD: {
         if (!is_flt16(t->dtype) || !ne) return 0;
         int c = is_bf(t->dtype) ? CBF : CFP;
-        uint32_t *h = hclone(c);
+        uint64_t *h = hclone(c);
         uint64_t sz = f16_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), scr, h);
         hout[0] = h; chout[0] = c;
         return sz;
@@ -1018,7 +1220,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
     case M_FIELDPOS: {
         if (!is_flt16(t->dtype) || !ne || t->nd < 1) return 0;
         int c = is_bf(t->dtype) ? CBPOS : CFPOS;
-        uint32_t *h = hclone(c);
+        uint64_t *h = hclone(c);
         uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), t->shape[t->nd - 1], 0, scr, h);
         hout[0] = h; chout[0] = c;
         return sz;
@@ -1026,21 +1228,21 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
     case M_FIELDROW: {
         if (!is_flt16(t->dtype) || !ne || t->nd < 2) return 0;
         int c = is_bf(t->dtype) ? CBPOS : CFPOS;
-        uint32_t *h = hclone(c);
+        uint64_t *h = hclone(c);
         uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), t->shape[0], 1, scr, h);
         hout[0] = h; chout[0] = c;
         return sz;
     }
     case M_F32: {
         if (!is_f32(t->dtype)) return 0;
-        uint32_t *h = hclone(C32);
+        uint64_t *h = hclone(C32);
         uint64_t sz = f32_enc((uint32_t *)t->data, ne, scr, h);
         hout[0] = h; chout[0] = C32;
         return sz;
     }
     case M_U8: {
         if (!t->len) return 0;
-        uint32_t *h = hclone(C8);
+        uint64_t *h = hclone(C8);
         uint64_t sz = u8_enc(t->data, t->len, scr, h);
         hout[0] = h; chout[0] = C8;
         return sz;
@@ -1051,7 +1253,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
         uint8_t *rh = 0;
         const uint8_t *rd = alview(r->data, r->len, bsz, &rh);
         if (is_f32(t->dtype)) {
-            uint32_t *h = hclone(C32D);
+            uint64_t *h = hclone(C32D);
             uint64_t sz = dlt32_enc((const uint32_t *)t->data, (const uint32_t *)rd, ne, scr, h);
             free(rh); hout[0] = h; chout[0] = C32D;
             return sz;
@@ -1059,7 +1261,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
         if (!is_flt16(t->dtype)) { free(rh); return 0; }
         {
             int ec = is_bf(t->dtype) ? CBF : CFP;
-            uint32_t *h = hclone(CD), *h2 = hclone(ec);
+            uint64_t *h = hclone(CD), *h2 = hclone(ec);
             uint64_t sz = dlt_enc((const uint16_t *)t->data, (const uint16_t *)rd, ne, scr, h, mbits_of(t->dtype), h2);
             free(rh); hout[0] = h; chout[0] = CD; hout[1] = h2; chout[1] = ec;
             return sz;
@@ -1070,7 +1272,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
         uint8_t *rh = 0;
         const uint8_t *rd = alview(t->xreft->data, t->xreft->len, bsz, &rh);
         if (is_f32(t->dtype)) {
-            uint32_t *h = hclone(C32D);
+            uint64_t *h = hclone(C32D);
             uint64_t sz = dlt32_enc((const uint32_t *)t->data, (const uint32_t *)rd, ne, scr, h);
             free(rh); hout[0] = h; chout[0] = C32D;
             return sz;
@@ -1078,7 +1280,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint32_t
         if (!is_flt16(t->dtype)) { free(rh); return 0; }
         {
             int ec = is_bf(t->dtype) ? CBF : CFP;
-            uint32_t *h = hclone(CD), *h2 = hclone(ec);
+            uint64_t *h = hclone(CD), *h2 = hclone(ec);
             uint64_t sz = dlt_enc((const uint16_t *)t->data, (const uint16_t *)rd, ne, scr, h, mbits_of(t->dtype), h2);
             free(rh); hout[0] = h; chout[0] = CD; hout[1] = h2; chout[1] = ec;
             return sz;
@@ -1187,9 +1389,9 @@ static Tensor *ref_resolve(Tensor *t) {
 
 typedef struct {
     int m; Tensor *t; Tensor *all; uint32_t ri;
-    uint32_t **ghs, **snp;               /* owner channel state (read-only here) */
+    uint64_t **ghs, **snp;               /* owner channel state (read-only here) */
     uint64_t sz; uint8_t *buf;
-    uint32_t *ho[2]; int ch[2];
+    uint64_t *ho[2]; int ch[2];
 } TJob;
 /* worst-case payload for method m on a len-byte tensor. Every enc() call
    emits <=2B (x<2^39 vs XMAX>=2^24). Per-element call counts: FIELD 3
@@ -1248,6 +1450,10 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
     uint64_t per = ebound(t->len);
     if (nsp > 1 && per * (uint64_t)nsp > TRYBUD) nsp = (int)(TRYBUD / per);
     if (nsp < 1) nsp = 1;
+    /* rolling best: keep only the current winner's buffer+hist clones so peak
+       memory is ~(nsp+1) x ebound, not nc x ebound */
+    uint64_t best = t->len; int wm = -1; uint32_t wri = 0;
+    uint8_t *wbuf = 0; uint64_t *who[2] = {0, 0}; int wch[2] = {-1, -1};
     for (int k = 0; k < nc; k += nsp) {
         int e = k + nsp < nc ? k + nsp : nc;
         for (int k2 = k; k2 < e; k2++) {
@@ -1258,21 +1464,29 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
             else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
         }
         for (int k2 = k; k2 < e; k2++) if (nsp > 1) pthread_join(th[k2], 0);
+        for (int k2 = k; k2 < e; k2++) {
+            TJob *j = &jb[k2];
+            if (j->sz && j->sz < best) {   /* promote: free old best, keep this */
+                free(wbuf); free(who[0]); free(who[1]);
+                best = j->sz; wm = j->m; wri = j->ri; wbuf = j->buf;
+                who[0] = j->ho[0]; who[1] = j->ho[1];
+                wch[0] = j->ch[0]; wch[1] = j->ch[1];
+            } else {
+                free(j->buf);
+                for (int s = 0; s < 2; s++) free(j->ho[s]);
+            }
+        }
     }
-    int w = -1; uint64_t best = t->len;
-    for (int k = 0; k < nc; k++)
-        if (jb[k].sz && jb[k].sz < best) { best = jb[k].sz; w = k; }
-    if (w >= 0) {
-        t->method = jb[w].m; t->plen = jb[w].sz;
-        t->ref = (jb[w].m == M_DELTA) ? jb[w].ri : 0xFFFFFFFFu;
-        *outp = jb[w].buf;
-        for (int s = 0; s < 2; s++) if (jb[w].ho[s]) hcommit(jb[w].ch[s], jb[w].ho[s]);
-    }
-    for (int k = 0; k < nc; k++) if (k != w) {
-        free(jb[k].buf);
-        for (int s = 0; s < 2; s++) if (jb[k].ho[s]) free(jb[k].ho[s]);
+    if (wm >= 0) {
+        t->method = wm; t->plen = best;
+        t->ref = (wm == M_DELTA) ? wri : 0xFFFFFFFFu;
+        *outp = wbuf;
+        for (int s = 0; s < 2; s++) if (who[s]) hcommit(wch[s], who[s]);
     }
     free(jb); free(th);
+    /* RAW/PACK write no rANS streams — feed the natural channel anyway so
+       short tensors still train the model (decode replays the same count) */
+    if (t->method == M_RAW || t->method == M_PACK) teach(t);
     t->data = aorig; free(ahold);
 }
 
@@ -1289,8 +1503,8 @@ static int joinable(const Tensor *t, uint32_t bstart) {
    batch snapshot; its hist delta is merged into gch by the main thread. */
 typedef struct {
     Tensor *t; Tensor *all; uint32_t refcut;
-    uint32_t **snp;
-    uint32_t *ch[NCH];
+    uint64_t **snp;
+    uint64_t *ch[NCH];
     uint8_t *out;
 } EJob;
 static void *ejob_run(void *a) {
@@ -1302,15 +1516,15 @@ static void *ejob_run(void *a) {
 
 /* merge worker hist deltas: gch += (worker - snap), channel-wise.
    counts commute, so member order is irrelevant. */
-static void hmerge(uint32_t *const wch[NCH], uint32_t *const snap[NCH]) {
+static void hmerge(uint64_t *const wch[NCH], uint64_t *const snap[NCH]) {
     for (int c = 0; c < NCH; c++) if (wch[c]) {
-        uint32_t *w = wch[c], *g = gch[c], *s = snap[c];
+        uint64_t *w = wch[c], *g = gch[c], *s = snap[c];
         for (int i = 0; i < csz[c]; i++) g[i] += w[i] - s[i];
         free(w);
     }
 }
-static void hsnap(uint32_t *snap[NCH]) {
-    for (int c = 0; c < NCH; c++) { snap[c] = xm(csz[c] * 4); memcpy(snap[c], gch[c], csz[c] * 4); }
+static void hsnap(uint64_t *snap[NCH]) {
+    for (int c = 0; c < NCH; c++) { snap[c] = xm(csz[c] * 8); memcpy(snap[c], gch[c], csz[c] * 8); }
 }
 
 /* ================= decode ================= */
@@ -1364,12 +1578,13 @@ static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
         break;
     }
     }
+    if (t->method == M_RAW || t->method == M_PACK) teach(t);
 }
 
 typedef struct {
     Tensor *t; const uint8_t *pl; Tensor *all;
-    uint32_t **snp;
-    uint32_t *ch[NCH];
+    uint64_t **snp;
+    uint64_t *ch[NCH];
 } DJob;
 static void *djob_run(void *a) {
     DJob *j = a;
@@ -1385,7 +1600,7 @@ static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf) {
     for (uint32_t k = i; k < j; k++)
         if ((all[k].method == M_REF || all[k].method == M_DELTA) && all[k].ref >= i)
             die("batch ref into open batch");
-    uint32_t *snap[NCH]; hsnap(snap);
+    uint64_t *snap[NCH]; hsnap(snap);
     for (uint32_t k = i; k < j; k += (uint32_t)g_threads) {
         uint32_t e = k + (uint32_t)g_threads < j ? k + (uint32_t)g_threads : j;
         uint32_t cnt = e - k;
@@ -1485,13 +1700,16 @@ int main(int argc, char **argv) {
         free(nn);
         model_init();
         /* header */
-        fwrite("CAI4", 4, 1, of);
+        fwrite("CAI5", 4, 1, of);
         w32(of, nf);
         for (int i = 0; i < nf; i++) {
             const char *bn = bname(ins[i]->path);
             for (int j = 0; j < i; j++)
                 if (!strcmp(bn, bname(ins[j]->path))) die("duplicate input basename");
             w32(of, strlen(bn)); fwrite(bn, 1, strlen(bn), of);
+            uint32_t ml = ins[i]->meta ? (uint32_t)strlen(ins[i]->meta) : 0;
+            w32(of, ml);
+            if (ml) fwrite(ins[i]->meta, 1, ml, of);   /* verbatim __metadata__ object */
         }
         w32(of, NT);
         uint64_t tin = 0, tout = 0;
@@ -1507,7 +1725,7 @@ int main(int argc, char **argv) {
                     blen += all[i + nm].len; nm++;
                 }
             if (nm > 1) {
-                uint32_t *snap[NCH]; hsnap(snap);
+                uint64_t *snap[NCH]; hsnap(snap);
                 EJob *ej = xc(nm, sizeof(EJob));
                 pthread_t *th = xc(nm, sizeof(pthread_t));
                 for (uint32_t k = 0; k < nm; k++) {
@@ -1562,11 +1780,15 @@ int main(int argc, char **argv) {
         const uint8_t *p = buf, *bend = buf + fsz;
 #define BND(q, need) do { if ((uint64_t)(need) > (uint64_t)(bend - (q))) die("truncated archive"); } while (0)
         BND(p, 4);
-        if (memcmp(p, "CAI3", 4) && memcmp(p, "CAI4", 4)) die("bad magic");
+        int cver;
+        if (!memcmp(p, "CAI5", 4)) cver = 5;
+        else if (!memcmp(p, "CAI4", 4)) cver = 4;
+        else if (!memcmp(p, "CAI3", 4)) cver = 3;
+        else die("bad magic");
         p += 4;
         BND(p, 4); uint32_t nf = r32(&p);
         if (nf > 65535) die("too many files");
-        char **fnames = xc(nf, sizeof(char *));
+        char **fnames = xc(nf, sizeof(char *)), **fmeta = xc(nf, sizeof(char *));
         for (uint32_t i = 0; i < nf; i++) {
             BND(p, 4); uint32_t l = r32(&p); BND(p, l);
             fnames[i] = xm(l + 1); memcpy(fnames[i], p, l); fnames[i][l] = 0; p += l;
@@ -1575,6 +1797,11 @@ int main(int argc, char **argv) {
                 !strcmp(fnames[i], ".") || !strcmp(fnames[i], ".."))
                 die("bad filename");
             for (uint32_t j = 0; j < i; j++) if (!strcmp(fnames[i], fnames[j])) die("dup filename");
+            if (cver >= 5) {   /* CAI5: verbatim __metadata__ per file */
+                BND(p, 4); uint32_t ml = r32(&p); BND(p, ml);
+                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; }
+                p += ml;
+            }
         }
         BND(p, 4); uint32_t NT = r32(&p);
         Tensor *all = xc(NT, sizeof(Tensor));
@@ -1589,7 +1816,7 @@ int main(int argc, char **argv) {
             BND(q, 2); memcpy(&dl, q, 2); q += 2;
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
             BND(q, 1); t->nd = r8(&q);
-            if (t->nd > 8) die("bad nd");
+            if (t->nd > 64) die("bad nd");
             BND(q, 8 * t->nd);
             for (int d = 0; d < t->nd; d++) t->shape[d] = (int64_t)r64(&q);
             BND(q, 2); t->file = r16(&q);
@@ -1599,6 +1826,17 @@ int main(int argc, char **argv) {
             t->method = mraw & 0x3F;
             if (t->method > M_DELTAX) die("bad method");
             BND(q, 8); t->len = r64(&q);
+            /* safetensors invariant: len == product(shape) * dtype size —
+               also bounds pos_dec's ctx index (po*K/P) to < K */
+            {
+                unsigned __int128 prod = 1;
+                for (int d = 0; d < t->nd; d++) {
+                    if (t->shape[d] < 0) die("bad shape");
+                    prod *= (uint64_t)t->shape[d];
+                    if (prod > UINT64_MAX / 8) die("bad shape");
+                }
+                if ((uint64_t)prod * (uint64_t)dtb(t->dtype) != t->len) die("shape/len mismatch");
+            }
             t->ref = 0xFFFFFFFFu;
             if (t->method == M_REF || t->method == M_DELTA) {
                 BND(q, 4); t->ref = r32(&q);
@@ -1622,13 +1860,24 @@ int main(int argc, char **argv) {
             size_t hcap = 1 << 20; char *j = xm(hcap); size_t jl = 0;
             jl += snprintf(j + jl, hcap - jl, "{");
             int first = 1;
+            if (fmeta[i]) {   /* CAI5: replay __metadata__ verbatim */
+                while (jl + strlen(fmeta[i]) + 64 > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
+                jl += snprintf(j + jl, hcap - jl, "\"__metadata__\":%s", fmeta[i]);
+                first = 0;
+            }
             for (uint32_t k = 0; k < NT; k++) {
                 Tensor *t = &all[k];
                 if (t->file != (int)i) continue;
-                while (jl + 4096 > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
+                /* names/dtypes are arbitrary bytes -> worst-case 6x escape growth */
+                size_t need = 7 * (strlen(t->name) + strlen(t->dtype)) + 512;
+                while (jl + need > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
                 t->dataoff = foff[i];
+                char *en = xm(6 * strlen(t->name) + 1), *ed = xm(6 * strlen(t->dtype) + 1);
+                jesc(en, 6 * strlen(t->name) + 1, t->name);
+                jesc(ed, 6 * strlen(t->dtype) + 1, t->dtype);
                 jl += snprintf(j + jl, hcap - jl, "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[",
-                               first ? "" : ",", t->name, t->dtype);
+                               first ? "" : ",", en, ed);
+                free(en); free(ed);
                 for (int d = 0; d < t->nd; d++) jl += snprintf(j + jl, hcap - jl, "%s%lld", d ? "," : "", (long long)t->shape[d]);
                 jl += snprintf(j + jl, hcap - jl, "],\"data_offsets\":[%llu,%llu]}",
                                (unsigned long long)foff[i], (unsigned long long)(foff[i] + t->len));
@@ -1690,10 +1939,38 @@ int main(int argc, char **argv) {
         for (int i = 0; i < nf; i++) ins[i] = st_load(argv[3 + i], i);
         const uint8_t *p = buf, *bend = buf + fsz;
         BND(p, 4);
-        if (memcmp(p, "CAI3", 4) && memcmp(p, "CAI4", 4)) die("bad magic");
+        int cver;
+        if (!memcmp(p, "CAI5", 4)) cver = 5;
+        else if (!memcmp(p, "CAI4", 4)) cver = 4;
+        else if (!memcmp(p, "CAI3", 4)) cver = 3;
+        else die("bad magic");
         p += 4;
         BND(p, 4); uint32_t nfa = r32(&p);
-        for (uint32_t i = 0; i < nfa; i++) { BND(p, 4); uint32_t l = r32(&p); BND(p, l); p += l; }
+        char **fnames = xc(nfa ? nfa : 1, sizeof(char *)), **fmeta = xc(nfa ? nfa : 1, sizeof(char *));
+        for (uint32_t i = 0; i < nfa; i++) {
+            BND(p, 4); uint32_t l = r32(&p); BND(p, l);
+            fnames[i] = xm(l + 1); memcpy(fnames[i], p, l); fnames[i][l] = 0; p += l;
+            if (cver >= 5) {
+                BND(p, 4); uint32_t ml = r32(&p); BND(p, ml);
+                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; }
+                p += ml;
+            }
+        }
+        /* completeness: file set must match positionally (archives store
+           positional file indices) */
+        int bad = 0;
+        if ((int)nfa != nf) { fprintf(stderr, "FILECOUNT archive=%u source=%d\n", nfa, nf); bad++; }
+        for (uint32_t i = 0; i < nfa && i < (uint32_t)nf; i++) {
+            if (strcmp(fnames[i], bname(ins[i]->path))) {
+                fprintf(stderr, "FILE %u archive=%s source=%s\n", i, fnames[i], bname(ins[i]->path));
+                bad++;
+            }
+            const char *am = fmeta[i], *sm = ins[i]->meta;
+            if ((am != 0) != (sm != 0) || (am && strcmp(am, sm))) {
+                fprintf(stderr, "META %s\n", fnames[i]);
+                bad++;
+            }
+        }
         BND(p, 4); uint32_t NT = r32(&p);
         model_init();
         Tensor *all = xc(NT, sizeof(Tensor));
@@ -1708,16 +1985,27 @@ int main(int argc, char **argv) {
             BND(q, 2); memcpy(&dl, q, 2); q += 2;
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
             BND(q, 1); t->nd = r8(&q);
-            if (t->nd > 8) die("bad nd");
+            if (t->nd > 64) die("bad nd");
             BND(q, 8 * t->nd);
             for (int d = 0; d < t->nd; d++) t->shape[d] = (int64_t)r64(&q);
             BND(q, 2); t->file = r16(&q);
-            if (t->file >= nf) die("bad file idx");
+            if (t->file >= (int)nfa) die("bad file idx");
             BND(q, 1); int mraw = r8(&q);
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
             if (t->method > M_DELTAX) die("bad method");
             BND(q, 8); t->len = r64(&q);
+            /* safetensors invariant: len == product(shape) * dtype size —
+               also bounds pos_dec's ctx index (po*K/P) to < K */
+            {
+                unsigned __int128 prod = 1;
+                for (int d = 0; d < t->nd; d++) {
+                    if (t->shape[d] < 0) die("bad shape");
+                    prod *= (uint64_t)t->shape[d];
+                    if (prod > UINT64_MAX / 8) die("bad shape");
+                }
+                if ((uint64_t)prod * (uint64_t)dtb(t->dtype) != t->len) die("shape/len mismatch");
+            }
             t->ref = 0xFFFFFFFFu;
             if (t->method == M_REF || t->method == M_DELTA) {
                 BND(q, 4); t->ref = r32(&q);
@@ -1735,7 +2023,7 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < NT; i++)
             if ((all[i].method == M_REF || all[i].method == M_DELTA) && all[i].ref < NT)
                 keep[all[i].ref] = 1;
-        int bad = 0, checked = 0;
+        int checked = 0;
         for (uint32_t i = 0; i < NT;) {
             uint32_t i0 = i, i1 = i + 1;
             if (all[i].bat) {
@@ -1750,11 +2038,19 @@ int main(int argc, char **argv) {
             /* post: compare each decoded tensor against the source */
             for (uint32_t k = i0; k < i1; k++) {
                 Tensor *t = &all[k];
+                if (t->file >= nf) { fprintf(stderr, "BADFILE %s\n", t->name); bad++; continue; }
                 InFile *src = ins[t->file];
                 Tensor *st = 0;
                 for (int j = 0; j < src->n; j++) if (!strcmp(src->t[j].name, t->name)) st = &src->t[j];
                 if (!st) { fprintf(stderr, "MISS %s\n", t->name); bad++; continue; }
+                if (st->matched) { fprintf(stderr, "DUP %s\n", t->name); bad++; }
+                st->matched = 1;
                 checked++;
+                if (strcmp(st->dtype, t->dtype) || st->nd != t->nd ||
+                    memcmp(st->shape, t->shape, (size_t)t->nd * 8)) {
+                    fprintf(stderr, "META %s\n", t->name);
+                    bad++;
+                }
                 if (st->len != t->len || memcmp(st->data, t->data, t->len)) {
                     fprintf(stderr, "DIFF %s method=%d\n", t->name, t->method);
                     bad++;
@@ -1765,6 +2061,13 @@ int main(int argc, char **argv) {
             }
             i = i1;
         }
+        /* reverse direction: every source tensor must appear in the archive */
+        for (int i = 0; i < nf; i++)
+            for (int j = 0; j < ins[i]->n; j++)
+                if (!ins[i]->t[j].matched) {
+                    fprintf(stderr, "MISS-SRC %s\n", ins[i]->t[j].name);
+                    bad++;
+                }
         fprintf(stderr, "verify: %d tensors, %d bad\n", checked, bad);
         return bad ? 1 : 0;
     }

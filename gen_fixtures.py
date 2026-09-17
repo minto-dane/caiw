@@ -6,9 +6,11 @@ from array import array
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
-def wst(path, tensors):
-    """tensors: {name: (dtype, shape, bytes)}"""
+def wst(path, tensors, gmeta=None):
+    """tensors: {name: (dtype, shape, bytes)}; gmeta: optional __metadata__ dict"""
     meta, blob = {}, b''
+    if gmeta is not None:
+        meta['__metadata__'] = gmeta
     for k, (dt, sh, b) in tensors.items():
         meta[k] = {'dtype': dt, 'shape': list(sh), 'data_offsets': [len(blob), len(blob) + len(b)]}
         blob += b
@@ -94,6 +96,28 @@ def main():
                 ('BF16', shp, bf16([rng.gauss(0, 0.02) for _ in range(shp[0] * shp[1])]))
     E['model.layers.0.input_layernorm.weight'] = ('BF16', [96], bf16([1.0 + rng.gauss(0, .01) for _ in range(96)]))
     wst(os.path.join(OUT, 'exp.st'), E)
+
+    # review-driven regressions (CAI5 parser/decoder edge cases):
+    # pack1: one distinct value -> PACK dictionary of k=1 (zero-bit indices)
+    wst(os.path.join(OUT, 'pack1.st'), {'w': ('F16', [1024], f16([0.0] * 1024))})
+    # escname: json.dumps escapes quotes/backslashes/unicode in tensor names —
+    # the archive stores raw names and `d` re-escapes; both must round-trip
+    wst(os.path.join(OUT, 'escname.st'), {
+        'a"b\\c':      ('F32', [16], f32([float(i) for i in range(16)])),
+        'uniéname': ('F16', [8],  f16([1.5] * 8)),
+    })
+    # ndim9: >8 dims used to truncate silently — now supported to 64
+    wst(os.path.join(OUT, 'ndim9.st'), {'deep': ('F32', [2] * 9, f32([rng.gauss(0, 1) for _ in range(512)]))})
+    # meta: __metadata__ must be preserved verbatim through c/d
+    wst(os.path.join(OUT, 'meta.st'), {'w': ('F32', [8], f32([1.0] * 8))},
+        gmeta={'format': 'pt', 'training': 'step-4200'})
+    # split: 64 small bf16 tensors sharing one distribution — cold-start
+    # regression: RAW winners must still train the FIELD channel via teach()
+    S = {}
+    rows = [rng.gauss(0, 0.02) for _ in range(64 * 256 * 256)]
+    for e in range(64):
+        S['expert.%02d' % e] = ('BF16', [256, 256], bf16(rows[e * 65536:(e + 1) * 65536]))
+    wst(os.path.join(OUT, 'split.st'), S)
 
 if __name__ == '__main__':
     main()
