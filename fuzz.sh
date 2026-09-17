@@ -24,9 +24,10 @@ elif mode == 2:    # truncate
 else:              # field-targeted: corrupt a record's method/len/plen region
     p = random.randrange(min(3000, len(d)))
     for _ in range(random.randrange(1, 17)):
-        d[p + random.randrange(64)] = random.randrange(256)
+        q = p + random.randrange(64)
+        if q < len(d): d[q] = random.randrange(256)
 open('/tmp/fz.caiw','wb').write(d)
-"
+" || continue
     timeout 10 "$BIN" v /tmp/fz.caiw -j4 "$SRC" >/dev/null 2>&1
     rc=$?
     if [ $rc -ge 128 ]; then echo "CRASH seed=$i rc=$rc"; cp /tmp/fz.caiw /tmp/crash_$i.caiw; crash=$((crash+1));
