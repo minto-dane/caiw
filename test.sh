@@ -2,6 +2,7 @@
 # regression: generate fixtures if missing, round-trip -j1/-j4,
 # DELTAX external-ref path, then tests/corpus/ must die cleanly (never crash).
 BIN=${1:-./caiw}
+export BIN
 cd "$(dirname "$0")"
 set -u; fail=0
 [ -f out/edgeA.st ] || python3 gen_fixtures.py
@@ -72,6 +73,32 @@ open('/tmp/h_dupf.caiw','wb').write(a)
 # member whose output path is the archive itself
 a = b'CAI5' + w32(1) + w32(11) + b'h_self.caiw' + w32(0) + w32(0)
 open('/tmp/h_self.caiw','wb').write(a)
+# a single-tensor archive whose record payload has 4 garbage bytes appended:
+# plen is bumped so the record walk stays in-frame — the codec must notice
+# the stream does not consume the whole payload
+import subprocess, os
+subprocess.run([os.environ.get('BIN', './caiw'),'c','/tmp/h_pad.caiw','out/pack1.st','-j1'],
+               check=True, capture_output=True)
+d = bytearray(open('/tmp/h_pad.caiw','rb').read())
+p = 4
+nf = struct.unpack('<I', d[p:p+4])[0]; p += 4
+for _ in range(nf):
+    nl = struct.unpack('<I', d[p:p+4])[0]; p += 4 + nl
+    ml = struct.unpack('<I', d[p:p+4])[0]; p += 4 + ml
+p += 4  # NT == 1
+p += 2 + struct.unpack('<H', d[p:p+2])[0]   # name
+p += 2 + struct.unpack('<H', d[p:p+2])[0]   # dtype
+p += 1 + d[p] * 8                          # nd + shape
+p += 2                                     # file
+m = d[p]; p += 1                           # method
+p += 8                                     # len
+if (m & 0x3f) in (2, 5, 9): p += 4         # REF/DELTA/DELTAX ref field
+plen_at = p
+plen = struct.unpack('<Q', d[p:p+8])[0]
+p += 8 + 4                                 # plen + crc
+p += plen
+d2 = bytearray(d[:plen_at]) + struct.pack('<Q', plen + 4) + d[plen_at+8:p] + b'JUNK' + d[p:]
+open('/tmp/h_pad.caiw','wb').write(d2)
 PYEOF
 "$BIN" c /tmp/hz.caiw /tmp/h_dup.st >/dev/null 2>&1 && { echo "DUPNAME ACCEPTED"; fail=1; }
 "$BIN" c /tmp/hz.caiw /tmp/h_meta.st >/dev/null 2>&1 && { echo "BADMETA ACCEPTED"; fail=1; }
@@ -84,8 +111,26 @@ PYEOF
 "$BIN" d /tmp/h_dupf.caiw /tmp/hzout >/dev/null 2>&1 && { echo "DUPFNAME ACCEPTED"; fail=1; }
 "$BIN" d /tmp/h_self.caiw /tmp >/dev/null 2>&1 && { echo "SELFD ACCEPTED"; fail=1; }
 [ -f /tmp/h_self.caiw ] || { echo "ARCHIVE CLOBBERED"; fail=1; }
+"$BIN" v /tmp/h_pad.caiw out/pack1.st >/dev/null 2>&1 && { echo "PADPAY ACCEPTED"; fail=1; }
+"$BIN" d /tmp/h_pad.caiw /tmp/hzout >/dev/null 2>&1 && { echo "PADPAY-D ACCEPTED"; fail=1; }
 cp out/pack1.st /tmp/tcself.st
 "$BIN" c /tmp/tcself.st /tmp/tcself.st >/dev/null 2>&1 && { echo "SELF-C ACCEPTED"; fail=1; }
+# symlink alias: output path resolves to the input — must be caught too
+cp out/pack1.st /tmp/tcreal.st && ln -sf /tmp/tcreal.st /tmp/tcalias.st
+"$BIN" c /tmp/tcalias.st /tmp/tcreal.st >/dev/null 2>&1 && { echo "ALIAS-C ACCEPTED"; fail=1; }
+[ -s /tmp/tcreal.st ] || { echo "ALIAS CLOBBERED SOURCE"; fail=1; }
+# d-side: member output resolving to the archive via a symlinked outdir
+mkdir -p /tmp/tcreald
+python3 - <<'PYEOF'
+import struct
+def w32(v): return struct.pack('<I', v)
+# member name "x.caiw"; archive itself placed at reald/x.caiw
+a = b'CAI5' + w32(1) + w32(6) + b'x.caiw' + w32(0) + w32(0)
+open('/tmp/tcreald/x.caiw','wb').write(a)
+PYEOF
+ln -sfn /tmp/tcreald /tmp/tcdlink
+"$BIN" d /tmp/tcreald/x.caiw /tmp/tcdlink >/dev/null 2>&1 && { echo "ALIAS-D ACCEPTED"; fail=1; }
+[ -f /tmp/tcreald/x.caiw ] || { echo "ALIAS-D CLOBBERED"; fail=1; }
 "$BIN" c /tmp/tcself.st --ref out/f32A.st out/f32B.st >/dev/null 2>&1 || { echo "LEGIT-REF FAILED"; fail=1; }
 cp out/f32A.st /tmp/tcref.st
 "$BIN" c /tmp/tcref.st --ref /tmp/tcref.st out/f32B.st >/dev/null 2>&1 && { echo "SELF-REF ACCEPTED"; fail=1; }
