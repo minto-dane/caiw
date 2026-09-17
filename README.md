@@ -61,6 +61,7 @@ helps, RAW wins.
 | `F32` | 5-plane field decomposition for f32 |
 | `DELTA` | residual vs an earlier same-name/family tensor (checkpoint chains) |
 | `DELTAX` | residual vs an external `--ref` checkpoint |
+| `PRW` | residual vs the previous row of the same tensor (smooth rows) |
 | `REF` | content-hash exact dedup |
 | `PACK` | restricted alphabets (≤256 distinct atoms → bit-packed indices) |
 | `U8` | per-byte entropy fallback |
