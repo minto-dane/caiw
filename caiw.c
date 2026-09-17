@@ -34,7 +34,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <libgen.h>
 #include <pthread.h>
+
+/* length arithmetic is u64 throughout; size_t must not truncate it */
+typedef char caiw_needs_64bit_size_t[(sizeof(size_t) >= 8) ? 1 : -1];
 
 #define BS 17
 #define BLK (1u << BS)
@@ -650,6 +654,7 @@ static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, u
             h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
         }
     }
+    if (rp != lim) die("corrupt field");   /* every caller hands the exact stream end */
     free(ft); free(cum);
 }
 
@@ -748,6 +753,7 @@ static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, i
             h[tSE + (size_t)SE * mw + Mv]++;
         }
     }
+    if (rp != lim) die("corrupt pos");
     free(ft); free(cum);
 }
 
@@ -847,6 +853,7 @@ static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t 
             h[2 + 512 + nM1 + nM2 + se * 256 + (v & 255)]++;
         }
     }
+    if (rp != lim) die("corrupt f32");
     free(ft); free(cum);
 }
 
@@ -886,6 +893,7 @@ static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, 
         rp = end;
         for (uint64_t i = 0; i < bn; i++) h[s[b0 + i]]++;
     }
+    if (rp != lim) die("corrupt u8");
     return rp;
 }
 
@@ -1021,10 +1029,10 @@ static void dlt_dec_ws(const uint8_t *in, const uint8_t *lim, const uint16_t *re
     if (ne != escn) die("delta esc count mismatch");
     if (escn) {
         uint16_t *eb = xm(escn * 2);
-        f16_dec(rp, lim, escn, mb, eb, hesc);   /* escapes from FIELD channel */
+        f16_dec(rp, lim, escn, mb, eb, hesc);   /* escapes from FIELD channel; consumes to lim */
         for (uint64_t i = 0; i < escn; i++) cur[escpos[i]] = eb[i];
         free(eb);
-    }
+    } else if (rp != lim) die("corrupt delta");
 }
 static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
                     uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc) {
@@ -1116,6 +1124,7 @@ static void dlt32_dec(const uint8_t *in, const uint8_t *lim, const uint32_t *ref
             }
         }
     }
+    if (in != lim) die("corrupt delta32");
     free(pl); free(cb); free(ft); free(cum);
 }
 
@@ -1179,6 +1188,8 @@ static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz,
         if (bsz == 2) ((uint16_t *)data)[i] = dict[idx];
         else data[i] = (uint8_t)dict[idx];
     }
+    /* the index stream must be exactly ceil(ne*ib/8) bytes — no slack */
+    if ((uint64_t)(lim - in) != (bit + 7) / 8) die("corrupt pack");
 }
 
 /* ================= archive ================= */
@@ -1313,6 +1324,32 @@ static void drop_pages(const void *p, uint64_t n, int mapped) {
 static const char *bname(const char *p) {
     const char *s = strrchr(p, '/');
     return s ? s + 1 : p;
+}
+
+/* is `out` the same file as `in`?  Plain strcmp misses symlink/hardlink
+   aliases and textual aliases like "dir/../out".  stat() catches any alias
+   when `out` already exists; otherwise canonicalize the directory part and
+   compare resolved paths. */
+static int same_out_path(const char *out, const char *in) {
+    if (!strcmp(out, in)) return 1;
+    struct stat so, si;
+    if (!stat(in, &si) && !stat(out, &so) &&
+        si.st_dev == so.st_dev && si.st_ino == so.st_ino) return 1;
+    char *ri = realpath(in, NULL);
+    if (!ri) return 0;                    /* unreadable input dies elsewhere */
+    int eq = 0;
+    char *od = xstrdup(out);
+    const char *d = dirname(od);          /* GNU dirname: may return "." */
+    char *rd = realpath(d, NULL);
+    if (rd) {
+        size_t n = strlen(rd) + strlen(bname(out)) + 2;
+        char *full = xm(n);
+        snprintf(full, n, "%s/%s", rd, bname(out));
+        eq = !strcmp(full, ri);
+        free(full); free(rd);
+    }
+    free(od); free(ri);
+    return eq;
 }
 
 /* JSON-escape s into o[cap]; returns full needed length (snprintf-style) */
@@ -1996,12 +2033,13 @@ int main(int argc, char **argv) {
         InFile **ins = xc(nf, sizeof(InFile *));
         int64_t NT64 = 0;
         for (int i = 0; i < nf; i++) {
-            /* c a.st a.st would rename the archive over its own source */
-            if (!strcmp(argv[3 + i], argv[2])) die("input == output path");
+            /* c a.st a.st would rename the archive over its own source;
+               aliases (links, "dir/../x") count too */
+            if (same_out_path(argv[2], argv[3 + i])) die("input == output path");
             ins[i] = st_load(argv[3 + i], i); NT64 += ins[i]->n;
         }
         for (int r = 0; r < g_nref; r++)
-            if (!strcmp(g_refs[r]->path, argv[2])) die("ref == output path");
+            if (same_out_path(argv[2], g_refs[r]->path)) die("ref == output path");
         if (NT64 > 0x7FFFFFFFll) die("too many tensors");   /* NT is int below */
         int NT = (int)NT64;
         Tensor *all = xc(NT, sizeof(Tensor));
@@ -2207,7 +2245,7 @@ int main(int argc, char **argv) {
                 /* a member whose output path IS the archive would clobber
                    its own input mid-decode */
                 int w = snprintf(tb, sizeof tb, "%s/%s", argv[3], fnames[i]);
-                if (w > 0 && (size_t)w < sizeof tb && !strcmp(tb, argv[2]))
+                if (w > 0 && (size_t)w < sizeof tb && same_out_path(tb, argv[2]))
                     die("output overwrites archive");
             }
         }
