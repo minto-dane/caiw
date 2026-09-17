@@ -119,6 +119,18 @@ def main():
         S['expert.%02d' % e] = ('BF16', [256, 256], bf16(rows[e * 65536:(e + 1) * 65536]))
     wst(os.path.join(OUT, 'split.st'), S)
 
+    # rows: smooth-row f16 matrix — adjacent rows are tiny perturbations of
+    # each other (embedding-like) -> PREVROW should beat FIELD outright
+    R = 2048; C = 256
+    r0 = [rng.gauss(0, 0.03) for _ in range(C)]
+    rowsv = r0[:]
+    for r in range(1, R):
+        rowsv += [x + rng.gauss(0, 0.0004) for x in rowsv[(r - 1) * C:r * C]]
+    wst(os.path.join(OUT, 'rows.st'), {
+        'emb.weight': ('F16', [R, C], f16(rowsv)),
+        'plain':      ('F16', [512, 128], f16([rng.gauss(0, 0.02) for _ in range(512 * 128)])),
+    })
+
 if __name__ == '__main__':
     main()
     print('fixtures ->', OUT)

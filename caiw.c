@@ -44,7 +44,7 @@
 #define SCRSZ (BLK * 16 + 64)   /* worst-case renorm bytes: 3B per enc call, <=5 calls/elem */
 #define XMAX(f) ((((LOWER) << 8) / TOT) * (uint64_t)(f))
 
-enum { M_RAW = 0, M_PACK, M_REF, M_FIELD, M_FIELDPOS, M_DELTA, M_U8, M_F32, M_FIELDROW, M_DELTAX };
+enum { M_RAW = 0, M_PACK, M_REF, M_FIELD, M_FIELDPOS, M_DELTA, M_U8, M_F32, M_FIELDROW, M_DELTAX, M_PRW };
 #define MF_BAT 0x80   /* method-byte flag: parallel batch member (CAI4) */
 #define MF_BH  0x40   /* batch head: first member opens a new batch */
 
@@ -455,6 +455,22 @@ static uint64_t *gch[NCH];                /* committed model state (main thread)
 static _Thread_local uint64_t **gh;       /* active channel array; NULL = unmaterialized */
 static _Thread_local uint64_t **gsnp;     /* batch snapshot backing lazy clones (workers) */
 static int g_threads = 1;
+/* resident decoded bytes (d/v): bounded so a hostile archive dies loudly
+   instead of letting overcommit turn xc() success into a SIGKILL */
+static volatile uint64_t g_dlive;
+static uint64_t g_dlim = UINT64_MAX;
+static void dlim_init(void) {
+    long ap = sysconf(_SC_AVPHYS_PAGES), ps = sysconf(_SC_PAGESIZE);
+    if (ap > 0 && ps > 0) g_dlim = (uint64_t)ap * (uint64_t)ps;
+}
+static void mkpath(const char *p) {   /* mkdir -p semantics */
+    char tmp[4096]; size_t l = strlen(p);
+    if (!l || l >= sizeof tmp) die("outdir path too long");
+    memcpy(tmp, p, l + 1);
+    for (char *s = tmp + 1; *s; s++)
+        if (*s == '/') { *s = 0; mkdir(tmp, 0755); *s = '/'; }
+    mkdir(tmp, 0755);
+}
 
 static void model_init(void) {
     for (int c = 0; c < NCH; c++) {
@@ -488,11 +504,20 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
         return;
     }
     int64_t rem = TOT, bud = TOT - nz; int bi = 0;
-    for (int i = 0; i < aw; i++) {
-        if (h[i] > h[bi]) bi = i;
-        uint32_t q = h[i] ? (uint32_t)(h[i] * bud / tot) + 1 : 0;
-        f[i] = (uint16_t)q;
-        rem -= q;
+    if (tot < ((uint64_t)1 << 49)) {   /* h[i]<=tot => h[i]*bud < 2^64: u64 mul safe */
+        for (int i = 0; i < aw; i++) {
+            if (h[i] > h[bi]) bi = i;
+            uint32_t q = h[i] ? (uint32_t)(h[i] * bud / tot) + 1 : 0;
+            f[i] = (uint16_t)q;
+            rem -= q;
+        }
+    } else {   /* absurdly large counts: u128 keeps the model exact */
+        for (int i = 0; i < aw; i++) {
+            if (h[i] > h[bi]) bi = i;
+            uint32_t q = h[i] ? (uint32_t)(((unsigned __int128)h[i] * (uint64_t)bud) / tot) + 1 : 0;
+            f[i] = (uint16_t)q;
+            rem -= q;
+        }
     }
     f[bi] += (uint32_t)rem;   /* rem>=0 by construction; deficit to dominant cell */
 }
@@ -855,14 +880,35 @@ static inline int64_t kmap32(uint32_t u) {   /* ordering map for delta_ok pretes
 #define DESC (2 * DR)
 #define DSYMS (2 * DR + 1)
 #define DCTX 128               /* residual ctx = top 7 bits of ref element */
-static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
-                      uint8_t *out, uint64_t *h, int mb, uint64_t *hesc) {
-    uint8_t *o = out, *scr = xm(SCRSZ);
-    uint16_t *ft = xm(DCTX * DSYMS * 2);
-    uint32_t *dcum = xm(DCTX * (DSYMS + 1) * 4);
-    uint16_t *sB = xm(BLK * 2); uint8_t *cB = xm(BLK), *used = xm(DCTX);
-    uint64_t esc_cap = n / 8 + 1024, esc_n = 0;
-    uint16_t *escbuf = xm(esc_cap * 2);
+/* reusable scratch for the DELTA16 codec — PRW runs it once per row, so the
+   buffers must persist across calls instead of mmap-churning per row */
+typedef struct {
+    uint8_t *scr, *cB, *used;
+    uint16_t *ft, *sB, *escbuf;
+    uint32_t *dcum;
+    uint64_t esc_cap;
+    uint64_t *escpos, escap;        /* decode side only */
+} DltWs;
+static void dltws_init(DltWs *w) {
+    w->scr = xm(SCRSZ); w->cB = xm(BLK); w->used = xm(DCTX);
+    w->ft = xm(DCTX * DSYMS * 2); w->sB = xm(BLK * 2);
+    w->dcum = xm(DCTX * (DSYMS + 1) * 4);
+    w->esc_cap = 8192; w->escbuf = xm(w->esc_cap * 2);
+    w->escpos = 0; w->escap = 0;
+}
+static void dltws_free(DltWs *w) {
+    free(w->scr); free(w->cB); free(w->used);
+    free(w->ft); free(w->sB); free(w->dcum);
+    free(w->escbuf); free(w->escpos);
+}
+static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
+                         uint8_t *out, uint64_t *h, int mb, uint64_t *hesc, DltWs *w) {
+    uint8_t *o = out, *scr = w->scr;
+    uint16_t *ft = w->ft;
+    uint32_t *dcum = w->dcum;
+    uint16_t *sB = w->sB; uint8_t *cB = w->cB, *used = w->used;
+    uint64_t esc_cap = w->esc_cap, esc_n = 0;
+    uint16_t *escbuf = w->escbuf;
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         /* fused forward pass: sym + refctx per elem, used-ctx mask, escapes */
@@ -896,17 +942,26 @@ static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
     }
     memcpy(o, &esc_n, 8); o += 8;
     o += f16_enc(escbuf, esc_n, mb, o, hesc);  /* escapes through FIELD channel */
-    free(scr); free(escbuf); free(ft); free(dcum); free(sB); free(cB); free(used);
+    w->escbuf = escbuf; w->esc_cap = esc_cap;
     return o - out;
 }
-static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
-                    uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc) {
+static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
+                      uint8_t *out, uint64_t *h, int mb, uint64_t *hesc) {
+    DltWs w; dltws_init(&w);
+    size_t r = dlt_enc_ws(cur, ref, n, out, h, mb, hesc, &w);
+    dltws_free(&w);
+    return r;
+}
+static void dlt_dec_ws(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
+                       uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc, DltWs *w) {
     const uint8_t *rp = in;
-    uint16_t *ft = xm(DCTX * DSYMS * 2);
-    uint32_t *cum = xm(DCTX * (DSYMS + 1) * 4);
-    uint8_t *used = xm(DCTX);
+    uint16_t *ft = w->ft;
+    uint32_t *cum = w->dcum;
+    uint8_t *used = w->used;
     /* first pass: decode symbols; record ESC positions */
-    uint64_t *escpos = xm((n / 8 + 1024) * 8); uint64_t escn = 0, escap = n / 8 + 1024;
+    uint64_t escn = 0, escap = w->escap ? w->escap : 1024;
+    if (!w->escpos) { w->escap = escap; w->escpos = xm(escap * 8); }
+    uint64_t *escpos = w->escpos;
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         memset(used, 0, DCTX);
@@ -927,7 +982,7 @@ static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, 
             uint64_t gi = b0 + i;
             h[c * DSYMS + sym]++;
             if (sym == DESC) {
-                if (escn >= escap) { escap *= 2; escpos = realloc(escpos, escap * 8); if (!escpos) die("oom"); }
+                if (escn >= escap) { escap *= 2; escpos = realloc(escpos, escap * 8); if (!escpos) die("oom"); w->escpos = escpos; w->escap = escap; }
                 escpos[escn++] = gi;
                 cur[gi] = 0;
             } else {
@@ -946,7 +1001,12 @@ static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, 
         for (uint64_t i = 0; i < escn; i++) cur[escpos[i]] = eb[i];
         free(eb);
     }
-    free(escpos); free(ft); free(cum); free(used);
+}
+static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
+                    uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc) {
+    DltWs w; dltws_init(&w);
+    dlt_dec_ws(in, lim, ref, n, cur, h, mb, hesc, &w);
+    dltws_free(&w);
 }
 
 /* ============ DELTA32: xor byte planes (f32 pairs) ============
@@ -1297,22 +1357,24 @@ static int delta_ok(const uint8_t *cur, const uint8_t *ref, uint64_t nbytes, int
  * tensor's natural channel instead — identical counting on both sides,
  * so encode and decode stay in lockstep. Runs AFTER winner commit on the
  * encode side / after payload decode on the decode side. */
-static void teach(const Tensor *t) {
+static void teach(const Tensor *t, const uint8_t *d) {
+    /* d may point into the unaligned archive mmap (zero-copy RAW path) —
+       all typed loads must go through memcpy */
     int bsz = dtb(t->dtype);
     uint64_t ne = bsz > 1 ? t->len / bsz : 0;
     if (ne && is_flt16(t->dtype)) {
         int mb = mbits_of(t->dtype), ew = 1 << (15 - mb), mw = 1 << mb;
         uint64_t *h = H(is_bf(t->dtype) ? CBF : CFP);
-        const uint16_t *s = (const uint16_t *)t->data;
         for (uint64_t i = 0; i < ne; i++) {
-            uint32_t v = s[i], S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
+            uint16_t v; memcpy(&v, d + i * 2, 2);
+            uint32_t S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
             h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
         }
     } else if (ne && is_f32(t->dtype)) {
         uint64_t *h = H(C32);
-        const uint32_t *s = (const uint32_t *)t->data;
         for (uint64_t i = 0; i < ne; i++) {
-            uint32_t v = s[i], S = v >> 31, E = (v >> 23) & 255;
+            uint32_t v; memcpy(&v, d + i * 4, 4);
+            uint32_t S = v >> 31, E = (v >> 23) & 255;
             size_t se = S * 256 + E;
             h[S]++; h[2 + S * 256 + E]++;
             h[2 + 512 + se * 128 + ((v >> 16) & 127)]++;
@@ -1321,8 +1383,52 @@ static void teach(const Tensor *t) {
         }
     } else {
         uint64_t *h = H(C8);
-        for (uint64_t i = 0; i < t->len; i++) h[t->data[i]]++;
+        for (uint64_t i = 0; i < t->len; i++) h[d[i]]++;
     }
+}
+
+/* ============ PREVROW: intra-tensor previous-row delta ============
+ * Row i is coded as an ordered kmap16 residual against row i-1 — the
+   self-referential analog of DELTA16 for smooth-row tensors (embeddings,
+   norm layers, low-rank structure). Payload: [u32 len1][FIELD(row0)] then
+   per row [u32 len][DELTA16 stream(row)]. Rows are SEPARATE dlt streams:
+   a single stream over the whole tensor would make dlt_dec's block-level
+   used-mask read not-yet-written self-referential positions (and deferred
+   escape values would still be 0 placeholders when read as refs).
+   Per-row calls guarantee the referent row is fully final before use. */
+static size_t prw_enc(const uint16_t *s, uint64_t n, uint64_t cols, int mb,
+                      uint8_t *out, uint64_t *hf, uint64_t *hd) {
+    DltWs w; dltws_init(&w);
+    uint8_t *o = out + 4;
+    uint32_t l1 = (uint32_t)f16_enc(s, cols, mb, o, hf);
+    memcpy(out, &l1, 4); o += l1;
+    for (uint64_t r = 1; r * cols < n; r++) {
+        uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
+        uint8_t *hdr = o; o += 4;
+        uint32_t lr = (uint32_t)dlt_enc_ws(s + r * cols, s + (r - 1) * cols, rn, o, hd, mb, hf, &w);
+        memcpy(hdr, &lr, 4); o += lr;
+    }
+    dltws_free(&w);
+    return o - out;
+}
+static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t cols,
+                    int mb, uint16_t *s, uint64_t *hf, uint64_t *hd) {
+    if ((uint64_t)(lim - in) < 4) die("corrupt prw");
+    uint32_t l1; memcpy(&l1, in, 4); in += 4;
+    if ((uint64_t)l1 > (uint64_t)(lim - in)) die("corrupt prw");
+    f16_dec(in, in + l1, cols, mb, s, hf);
+    in += l1;
+    DltWs w; dltws_init(&w);
+    for (uint64_t r = 1; r * cols < n; r++) {
+        uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
+        if ((uint64_t)(lim - in) < 4) die("corrupt prw");
+        uint32_t lr; memcpy(&lr, in, 4); in += 4;
+        if ((uint64_t)lr > (uint64_t)(lim - in)) { dltws_free(&w); die("corrupt prw"); }
+        dlt_dec_ws(in, in + lr, s + (r - 1) * cols, rn, s + r * cols, hd, mb, hf, &w);
+        in += lr;
+    }
+    dltws_free(&w);
+    if (in != lim) die("corrupt prw");   /* exact payload consumption */
 }
 
 static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri) {
@@ -1413,8 +1519,39 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
             return sz;
         }
     }
+    case M_PRW: {
+        if (!is_flt16(t->dtype) || !ne || t->nd < 2) return 0;
+        uint64_t cols = (uint64_t)t->shape[t->nd - 1];
+        /* row>=64 elems keeps the per-row header negligible; row count cap
+           keeps per-row stream overhead inside ebound's slack; cols cap
+           keeps each row's stream under the u32 length field
+           (worst DELTA16 row is ~8*cols bytes) */
+        if (cols < 64 || cols > (1u << 28) || ne < 2 * cols || ne > cols * 65536) return 0;
+        int mb = mbits_of(t->dtype), ec = is_bf(t->dtype) ? CBF : CFP;
+        uint64_t *hd = hclone(CD), *hf = hclone(ec);
+        uint64_t sz = prw_enc((const uint16_t *)t->data, ne, cols, mb, scr, hf, hd);
+        hout[0] = hd; chout[0] = CD; hout[1] = hf; chout[1] = ec;
+        return sz;
+    }
     }
     return 0;
+}
+
+/* cheap pre-check for PRW: sample row-adjacent kmap16 residuals and estimate
+   the residual stream's bits/elem (escapes cost a FIELD recode each; in-range
+   residuals ~log2|d|). Skip the encode when the estimate can't plausibly beat
+   FIELD's ~12b/elem. Candidate pruning only; winner chosen by real size. */
+static int prw_gain(const uint16_t *s, uint64_t n, uint64_t cols) {
+    uint64_t tot = n - cols, cnt = 0;
+    uint64_t st = tot / 8192; if (st < 1) st = 1;
+    double est = 0;
+    for (uint64_t i = 0; i < tot; i += st) {
+        int64_t d = kmap16(s[i + cols]) - kmap16(s[i]);
+        uint64_t a = d < 0 ? (uint64_t)(-d) : (uint64_t)d;
+        est += (d < -DR || d >= DR) ? 14.0 : 2.0 + (double)(64 - __builtin_clzll(a | 1));
+        cnt++;
+    }
+    return cnt && est / cnt < 9.0;
 }
 
 /* cheap pre-check: estimate H(SE) - H(SE|pos) on a sample; used to prune
@@ -1567,6 +1704,11 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
             cand[nc++] = M_FIELDPOS;
         if (t->nd >= 2 && pos_gain((uint16_t *)t->data, ne, mb, t->shape[0], 1) > 0.06)
             cand[nc++] = M_FIELDROW;
+        if (t->nd >= 2) {
+            uint64_t cl = (uint64_t)t->shape[t->nd - 1];
+            if (cl >= 64 && cl <= (1u << 28) && ne >= 2 * cl && ne <= cl * 65536 &&
+                prw_gain((uint16_t *)t->data, ne, cl)) cand[nc++] = M_PRW;
+        }
     }
     else if (is_f32(t->dtype)) { cand[nc++] = M_F32; cand[nc++] = M_U8; }
     else cand[nc++] = M_U8;
@@ -1618,7 +1760,7 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
     free(jb); free(th);
     /* RAW/PACK write no rANS streams — feed the natural channel anyway so
        short tensors still train the model (decode replays the same count) */
-    if (t->method == M_RAW || t->method == M_PACK) teach(t);
+    if (t->method == M_RAW || t->method == M_PACK) teach(t, t->data);
     t->data = aorig; free(ahold);
 }
 
@@ -1664,6 +1806,8 @@ static void hsnap(uint64_t *snap[NCH]) {
 
 /* ================= decode ================= */
 static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
+    if (__sync_add_and_fetch(&g_dlive, t->len) > g_dlim)
+        die("decoded set exceeds available memory");
     t->data = xc(t->len ? t->len : 1, 1);   /* zeroed: malformed short decodes can't leave indeterminate bytes */
     int bsz = dtb(t->dtype);
     uint64_t ne = t->len / bsz;
@@ -1712,8 +1856,16 @@ static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
         free(xh);
         break;
     }
+    case M_PRW: {
+        if (bsz != 2 || t->nd < 2) die("bad prw dtype");
+        uint64_t cols = (uint64_t)t->shape[t->nd - 1];
+        if (cols < 64 || cols > (1u << 28) || ne < 2 * cols || ne > cols * 65536) die("bad prw shape");
+        prw_dec(payload, lim, ne, cols, mbits_of(t->dtype), (uint16_t *)t->data,
+                H(is_bf(t->dtype) ? CBF : CFP), H(CD));
+        break;
     }
-    if (t->method == M_RAW || t->method == M_PACK) teach(t);
+    }
+    if (t->method == M_RAW || t->method == M_PACK) teach(t, t->data);
 }
 
 typedef struct {
@@ -1721,20 +1873,30 @@ typedef struct {
     uint64_t **snp;
     uint64_t *ch[NCH];
     int spawned;
+    int keep;                       /* tensor must stay resident for REF/DELTA */
 } DJob;
 static void *djob_run(void *a) {
     DJob *j = a;
     uint64_t **oh = gh, **os = gsnp;
     gh = j->ch; gsnp = j->snp;
-    dec_tensor(j->t, j->pl, j->all);
-    if (crc32_of(j->t->data, j->t->len) != j->t->crc)
-        die("crc mismatch: archive corrupt");
+    if (j->t->method == M_RAW && !j->keep) {
+        /* zero-copy: payload is the tensor; t->data stays NULL */
+        if (j->t->plen != j->t->len) die("corrupt raw");
+        if (crc32_of(j->pl, j->t->len) != j->t->crc)
+            die("crc mismatch: archive corrupt");
+        teach(j->t, j->pl);
+    } else {
+        dec_tensor(j->t, j->pl, j->all);
+        if (crc32_of(j->t->data, j->t->len) != j->t->crc)
+            die("crc mismatch: archive corrupt");
+    }
     gh = oh; gsnp = os;
     return 0;
 }
 /* decode a flagged batch run all[i..j): members decode against the
    batch-start snapshot in parallel; hist deltas merge order-free. */
-static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf) {
+static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf,
+                      const uint8_t *keep) {
     for (uint32_t k = i; k < j; k++)
         if ((all[k].method == M_REF || all[k].method == M_DELTA) && all[k].ref >= i)
             die("batch ref into open batch");
@@ -1746,7 +1908,7 @@ static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf) {
         pthread_t *th = xc(cnt, sizeof(pthread_t));
         for (uint32_t m = 0; m < cnt; m++) {
             dj[m].t = &all[k + m]; dj[m].pl = buf + all[k + m].off;
-            dj[m].all = all; dj[m].snp = snap;
+            dj[m].all = all; dj[m].snp = snap; dj[m].keep = keep[k + m];
             if (pthread_create(&th[m], 0, djob_run, &dj[m])) djob_run(&dj[m]);
             else dj[m].spawned = 1;
         }
@@ -1907,20 +2069,21 @@ int main(int argc, char **argv) {
             i++;
         }
         if (ferror(of) || fclose(of)) die("write failed (disk full?)");
-        static const char *mn[] = {"RAW","PACK","REF","FIELD","FIELDPOS","DELTA","U8","F32","FIELDROW","DELTAX"};
-        uint64_t mc[10] = {0}, mb2[10] = {0};
+        static const char *mn[] = {"RAW","PACK","REF","FIELD","FIELDPOS","DELTA","U8","F32","FIELDROW","DELTAX","PRW"};
+        uint64_t mc[11] = {0}, mb2[11] = {0};
         for (int ti = 0; ti < NT; ti++) { mc[all[ti].method]++; mb2[all[ti].method] += all[ti].plen; }
         fprintf(stderr, "in=%llu out=%llu ratio=%.3f\n",
                 (unsigned long long)tin, (unsigned long long)tout,
                 tin ? (double)tout / tin : 0);
-        for (int m = 0; m < 10; m++) if (mc[m])
+        for (int m = 0; m < 11; m++) if (mc[m])
             fprintf(stderr, "  %-8s n=%-5llu payload=%.1fMB\n", mn[m],
                     (unsigned long long)mc[m], (double)mb2[m] / 1048576);
         return 0;
     }
     if (!strcmp(argv[1], "d")) {
         if (argc < 4) die("caiw d out.caiw outdir/");
-        mkdir(argv[3], 0755);
+        mkpath(argv[3]);
+        dlim_init();
         uint64_t fsz; uint8_t *buf = slurp(argv[2], &fsz);
         const uint8_t *p = buf, *bend = buf + fsz;
 #define BND(q, need) do { if ((uint64_t)(need) > (uint64_t)(bend - (q))) die("truncated archive"); } while (0)
@@ -1979,7 +2142,7 @@ int main(int argc, char **argv) {
             if ((mraw & MF_BH) && !(mraw & MF_BAT)) die("bad method flags");
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
-            if (t->method > M_DELTAX) die("bad method");
+            if (t->method > M_PRW) die("bad method");
             BND(q, 8); t->len = r64(&q);
             ck_shape_len(t);
             t->ref = 0xFFFFFFFFu;
@@ -2035,14 +2198,15 @@ int main(int argc, char **argv) {
                 first = 0;
             }
             jl += snprintf(j + jl, hcap - jl, "}");
-            int wr = snprintf(tmp, sizeof tmp, "%s/%s", argv[3], fnames[i]);
+            /* write to .caiwtmp then rename: a crash mid-run must never
+               leave a complete-looking truncated .st behind */
+            int wr = snprintf(tmp, sizeof tmp, "%s/%s.caiwtmp", argv[3], fnames[i]);
             if (wr < 0 || (size_t)wr >= sizeof tmp) die("output path too long");
             g_outp[i] = xstrdup(tmp);
             ofs[i] = fopen(tmp, "wb");
             if (!ofs[i]) die("out file");
             w64(ofs[i], jl); fwrite(j, 1, jl, ofs[i]);
             hbase[i] = 8 + jl;
-            fprintf(stderr, "wrote %s (%lluB data)\n", tmp, (unsigned long long)foff[i]);
             free(j);
         }
         /* keep flags: tensors referenced by REF/DELTA must stay resident */
@@ -2056,35 +2220,64 @@ int main(int argc, char **argv) {
             if (all[i].bat) {
                 if (all[i].bat != 1) die("orphan batch member");
                 uint32_t j = i + 1; while (j < NT && all[j].bat == 2) j++;
-                dec_batch(all, i, j, buf);
+                dec_batch(all, i, j, buf, keep);
                 for (uint32_t k = i; k < j; k++) {
                     Tensor *t = &all[k];
+                    /* streamed RAW members never materialized t->data —
+                       the payload IS the tensor bytes */
+                    const uint8_t *wd = t->data ? t->data : buf + t->off;
                     FILE *of = ofs[t->file];
                     if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
-                    if (t->len && fwrite(t->data, 1, t->len, of) != t->len) die("write");
+                    if (t->len && fwrite(wd, 1, t->len, of) != t->len) die("write");
                     drop_pages(buf + t->off, t->plen, g_amap);
-                    if (!keep[k]) { free(t->data); t->data = 0; }
+                    if (!keep[k] && t->data) {
+                        __sync_sub_and_fetch(&g_dlive, t->len);
+                        free(t->data); t->data = 0;
+                    }
                 }
                 i = j; continue;
             }
             Tensor *t = &all[i];
+            if (t->method == M_RAW && !keep[i]) {
+                /* zero-copy: payload bytes are the tensor — no alloc */
+                if (t->plen != t->len) die("corrupt raw");
+                const uint8_t *pd = buf + t->off;
+                if (crc32_of(pd, t->len) != t->crc) die("crc mismatch: archive corrupt");
+                teach(t, pd);
+                FILE *of = ofs[t->file];
+                if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
+                if (t->len && fwrite(pd, 1, t->len, of) != t->len) die("write");
+                drop_pages(pd, t->plen, g_amap);
+                i++; continue;
+            }
             dec_tensor(t, buf + t->off, all);
             if (crc32_of(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
             FILE *of = ofs[t->file];
             if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
             if (t->len && fwrite(t->data, 1, t->len, of) != t->len) die("write");
             drop_pages(buf + t->off, t->plen, g_amap);
-            if (!keep[i]) { free(t->data); t->data = 0; }
+            if (!keep[i] && t->data) {
+                __sync_sub_and_fetch(&g_dlive, t->len);
+                free(t->data); t->data = 0;
+            }
             i++;
         }
         for (uint32_t i = 0; i < nf; i++)
             if (ferror(ofs[i]) || fclose(ofs[i])) die("write");
+        for (uint32_t i = 0; i < nf; i++) {
+            char fin[4096];
+            int wr = snprintf(fin, sizeof fin, "%s/%s", argv[3], fnames[i]);
+            if (wr < 0 || (size_t)wr >= sizeof fin || rename(g_outp[i], fin))
+                die("rename failed");
+            fprintf(stderr, "wrote %s\n", fin);
+        }
         g_outok = 1;
         return 0;
     }
     if (!strcmp(argv[1], "v")) {
         /* verify: decode archive in-memory, memcmp each tensor vs source files */
         if (argc < 4) die("caiw v out.caiw in.st...");
+        dlim_init();
         uint64_t fsz; uint8_t *buf = slurp(argv[2], &fsz);
         int nf = argc - 3;
         InFile **ins = xc(nf, sizeof(InFile *));
@@ -2113,7 +2306,7 @@ int main(int argc, char **argv) {
         }
         /* completeness: file set must match positionally (archives store
            positional file indices) */
-        int bad = 0;
+        uint64_t bad = 0;
         if ((int)nfa != nf) { fprintf(stderr, "FILECOUNT archive=%u source=%d\n", nfa, nf); bad++; }
         for (uint32_t i = 0; i < nfa && i < (uint32_t)nf; i++) {
             if (strcmp(fnames[i], bname(ins[i]->path))) {
@@ -2157,7 +2350,7 @@ int main(int argc, char **argv) {
             if ((mraw & MF_BH) && !(mraw & MF_BAT)) die("bad method flags");
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
-            if (t->method > M_DELTAX) die("bad method");
+            if (t->method > M_PRW) die("bad method");
             BND(q, 8); t->len = r64(&q);
             ck_shape_len(t);
             t->ref = 0xFFFFFFFFu;
@@ -2178,17 +2371,25 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < NT; i++)
             if ((all[i].method == M_REF || all[i].method == M_DELTA) && all[i].ref < NT)
                 keep[all[i].ref] = 1;
-        int checked = 0;
+        uint64_t checked = 0;
         for (uint32_t i = 0; i < NT;) {
             uint32_t i0 = i, i1 = i + 1;
             if (all[i].bat) {
                 if (all[i].bat != 1) die("orphan batch member");
                 i1 = i + 1; while (i1 < NT && all[i1].bat == 2) i1++;
-                dec_batch(all, i, i1, buf);
+                dec_batch(all, i, i1, buf, keep);
             } else {
                 Tensor *t = &all[i];
-                dec_tensor(t, buf + t->off, all);
-                if (crc32_of(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
+                if (t->method == M_RAW && !keep[i]) {
+                    /* zero-copy: payload IS the tensor; compare direct */
+                    if (t->plen != t->len) die("corrupt raw");
+                    if (crc32_of(buf + t->off, t->len) != t->crc)
+                        die("crc mismatch: archive corrupt");
+                    teach(t, buf + t->off);
+                } else {
+                    dec_tensor(t, buf + t->off, all);
+                    if (crc32_of(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
+                }
             }
             /* post: compare each decoded tensor against the source */
             for (uint32_t k = i0; k < i1; k++) {
@@ -2206,13 +2407,18 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "META %s\n", t->name);
                     bad++;
                 }
-                if (st->len != t->len || memcmp(st->data, t->data, t->len)) {
+                /* streamed RAW: t->data is NULL, payload holds the bytes */
+                const uint8_t *dd = t->data ? t->data : buf + t->off;
+                if (st->len != t->len || memcmp(st->data, dd, t->len)) {
                     fprintf(stderr, "DIFF %s method=%d\n", t->name, t->method);
                     bad++;
                 }
                 drop_pages(buf + t->off, t->plen, g_amap);
                 drop_pages(st->data, st->len, src->mapped);
-                if (!keep[k]) { free(t->data); t->data = 0; }
+                if (!keep[k] && t->data) {
+                    __sync_sub_and_fetch(&g_dlive, t->len);
+                    free(t->data); t->data = 0;
+                }
             }
             i = i1;
         }
@@ -2223,7 +2429,8 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "MISS-SRC %s\n", ins[i]->t[j].name);
                     bad++;
                 }
-        fprintf(stderr, "verify: %d tensors, %d bad\n", checked, bad);
+        fprintf(stderr, "verify: %llu tensors, %llu bad\n",
+                (unsigned long long)checked, (unsigned long long)bad);
         return bad ? 1 : 0;
     }
     die("unknown cmd");

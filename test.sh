@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 set -u; fail=0
 [ -f out/edgeA.st ] || python3 gen_fixtures.py
 for t in "edgeA.st edgeB.st" "chA.st chB.st chC.st" "f32A.st f32B.st" "exp.st" \
-         "pack1.st" "escname.st" "ndim9.st" "meta.st" "split.st"; do
+         "pack1.st" "escname.st" "ndim9.st" "meta.st" "split.st" "rows.st"; do
     for j in 1 4; do
         ok=1; args=""
         set -- $t; for a in "$@"; do args="$args out/$a"; done
@@ -19,6 +19,17 @@ done
 # cold-start: split tensors must compress near single-tensor ratio (teach)
 sz=$("$BIN" c /tmp/split.caiw out/split.st -j1 2>&1 | grep -o 'ratio=[0-9.]*' | cut -d= -f2)
 awk "BEGIN{exit !($sz < 0.75)}" || { echo "COLD-START FAIL: split ratio $sz"; fail=1; }
+# PREVROW: smooth-row embedding must trigger the PRW method and round-trip
+"$BIN" c /tmp/rows.caiw out/rows.st -j1 2>&1 | grep -q "PRW" || { echo "PRW NOT SELECTED"; fail=1; }
+rm -rf /tmp/rowsd && "$BIN" d /tmp/rows.caiw /tmp/rowsd -j4 >/dev/null 2>&1 || { echo "PRW DECODE FAIL"; fail=1; }
+python3 - <<'PYEOF'
+import struct, json
+def data_region(p):
+    d = open(p, 'rb').read(); hl = struct.unpack('<Q', d[:8])[0]
+    return d[8 + hl:]
+assert data_region('out/rows.st') == data_region('/tmp/rowsd/rows.st'), "PRW data mismatch"
+PYEOF
+[ $? -eq 0 ] || { echo "PRW DATA MISMATCH"; fail=1; }
 # v completeness: dropping a source file must fail (MISS-SRC / FILECOUNT)
 "$BIN" c /tmp/tst2.caiw out/pack1.st out/meta.st -j1 >/dev/null 2>&1
 "$BIN" v /tmp/tst2.caiw out/pack1.st 2>&1 | grep -q "0 bad" && { echo "V-COMPLETENESS FAIL"; fail=1; }
