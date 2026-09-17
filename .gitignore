@@ -1,0 +1,10 @@
+caiw
+*.o
+out/
+models/
+research/
+dumped/
+.venv/
+__pycache__/
+*.log
+*.caiw
