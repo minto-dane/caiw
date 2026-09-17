@@ -1,0 +1,94 @@
+# caiw — Compressor for AI Weights
+
+**Lossless, byte-exact archiver for safetensors model weights.**
+One C file. No dependencies beyond libc + pthread. Multithreaded.
+
+Generic compressors see model weights as opaque bytes. caiw understands
+the bit structure of `F16`/`BF16`/`F32` tensors — sign, exponent and
+mantissa fields — plus cross-tensor structure: duplicates, checkpoint
+deltas, external reference weights. Every tensor is compressed with
+whichever method *actually produces the fewest bytes*, and every archive
+reconstructs its inputs bit-for-bit (CRC32-verified).
+
+## Results
+
+Qwen3-4B shard 3 (BF16, 99.6 MB), `-j8`, this machine:
+
+| tool | size | ratio | wall time |
+|---|---|---|---|
+| **caiw** | **65.78 MB** | **0.660** | **3.2 s** |
+| xz -9e | 70.15 MB | 0.704 | 85.9 s |
+| zstd -19 -T8 | 76.52 MB | 0.768 | 26.4 s |
+| gzip -9 | 79.22 MB | 0.795 | 7.8 s |
+
+Full Qwen3-4B (8.0 GB, 3 shards, 398 tensors): **5.32 GB (0.662)**,
+encoded in 4m05s, verified byte-exact in 2m04s.
+
+MoE shard (4.0 GB, 1063 tensors): **2.65 GB (0.663)**, 80 s encode.
+
+## Quick start
+
+```console
+$ make                      # cc -O3 -march=native, pthread + libm only
+$ ./caiw c model.caiw model.st -j8        # compress
+$ ./caiw v model.caiw model.st -j8        # verify byte-exact
+$ ./caiw d model.caiw outdir/ -j8         # decompress to safetensors
+```
+
+Checkpoint deltas (e.g. store a fine-tune against its base):
+
+```console
+$ ./caiw c tune.caiw --ref base.st tune.st -j8
+$ ./caiw d tune.caiw outdir/ --ref base.st   # same --ref set, same order
+```
+
+`make test` generates deterministic fixtures and runs the full
+regression; `make fuzz` mutation-fuzzes the decoder.
+
+## How it works
+
+**Competition, not heuristics.** Every candidate encoder runs against a
+clone of the same entropy-model state; the smallest *real* output wins.
+There are no size estimates and no method is trusted blindly — if nothing
+helps, RAW wins.
+
+| method | exploits |
+|---|---|
+| `FIELD` | sign/exponent/mantissa of f16-family, context-conditioned rANS |
+| `FIELDPOS`/`FIELDROW` | + column/row-position context (embeddings, rotary tables) |
+| `F32` | 5-plane field decomposition for f32 |
+| `DELTA` | residual vs an earlier same-name/family tensor (checkpoint chains) |
+| `DELTAX` | residual vs an external `--ref` checkpoint |
+| `REF` | content-hash exact dedup |
+| `PACK` | restricted alphabets (≤256 distinct atoms → bit-packed indices) |
+| `U8` | per-byte entropy fallback |
+| `RAW` | store — the honest floor |
+
+**Parallelism without nondeterminism.** Candidate trials and consecutive
+tensors encode in parallel (batches, `CAI4`): each worker sees a snapshot
+of the committed histogram state, histogram deltas merge commutatively,
+and the archive records batch boundaries so *any* `-j` reproduces — and
+decodes — the identical byte stream.
+
+**Rolling context models.** Each channel keeps a cumulative histogram;
+per-block tables are normalized only over contexts the block actually
+uses (used-mask), which the decoder reconstructs identically from the
+already-decoded reference tensor.
+
+## Correctness and robustness
+
+- **Byte-exact by construction** — `v` re-derives every tensor and
+  compares bytes + CRC32; `d` output data regions compare equal to input.
+- **Hostile-input safe** — every malformed archive or truncated
+  safetensors file exits(1) through `die()`; the decoder validates every
+  field, method/dtype pair, payload bound, and batch reference before
+  touching memory.
+- **Verified** — ASan/UBSan/MSan/TSan clean; AFL++ coverage fuzzing
+  (crash corpus kept in `tests/corpus/`); CBMC proves the `kmap16`
+  bijection; the rANS core is covered by an exhaustive
+  boundary sweep (524,537 cases — every frequency × every 256-power
+  transition) and `dsym` by 3,264 tables × all 32,768 symbol values.
+- **Deterministic** — identical archives across runs and thread counts.
+
+See `AGENTS.md` for the format specification, the decoder trust-boundary
+checklist, and the full verification log.
