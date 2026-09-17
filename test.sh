@@ -69,6 +69,9 @@ a = b'CAI5' + w32(2)
 for nm in (b'same.st', b'same.st'): a += w32(len(nm)) + nm + w32(0)
 a += w32(0)
 open('/tmp/h_dupf.caiw','wb').write(a)
+# member whose output path is the archive itself
+a = b'CAI5' + w32(1) + w32(11) + b'h_self.caiw' + w32(0) + w32(0)
+open('/tmp/h_self.caiw','wb').write(a)
 PYEOF
 "$BIN" c /tmp/hz.caiw /tmp/h_dup.st >/dev/null 2>&1 && { echo "DUPNAME ACCEPTED"; fail=1; }
 "$BIN" c /tmp/hz.caiw /tmp/h_meta.st >/dev/null 2>&1 && { echo "BADMETA ACCEPTED"; fail=1; }
@@ -79,6 +82,15 @@ PYEOF
 "$BIN" d /tmp/h_dtype.caiw /tmp/hzout >/dev/null 2>&1 && { echo "BADDTYPE ACCEPTED"; fail=1; }
 "$BIN" v /tmp/h_dtype.caiw out/pack1.st >/dev/null 2>&1 && { echo "BADDTYPE-V ACCEPTED"; fail=1; }
 "$BIN" d /tmp/h_dupf.caiw /tmp/hzout >/dev/null 2>&1 && { echo "DUPFNAME ACCEPTED"; fail=1; }
+"$BIN" d /tmp/h_self.caiw /tmp >/dev/null 2>&1 && { echo "SELFD ACCEPTED"; fail=1; }
+[ -f /tmp/h_self.caiw ] || { echo "ARCHIVE CLOBBERED"; fail=1; }
+cp out/pack1.st /tmp/tcself.st
+"$BIN" c /tmp/tcself.st /tmp/tcself.st >/dev/null 2>&1 && { echo "SELF-C ACCEPTED"; fail=1; }
+"$BIN" c /tmp/tcself.st --ref out/f32A.st out/f32B.st >/dev/null 2>&1 || { echo "LEGIT-REF FAILED"; fail=1; }
+cp out/f32A.st /tmp/tcref.st
+"$BIN" c /tmp/tcref.st --ref /tmp/tcref.st out/f32B.st >/dev/null 2>&1 && { echo "SELF-REF ACCEPTED"; fail=1; }
+cp out/pack1.st /tmp/tcA; cp out/pack1.st /tmp/tcA.caiwtmp
+"$BIN" c /tmp/tcc.caiw /tmp/tcA /tmp/tcA.caiwtmp >/dev/null 2>&1 && { echo "ENCTMP ACCEPTED"; fail=1; }
 for f in tests/corpus/*; do
     [ -e "$f" ] || continue
     timeout 10 "$BIN" c /tmp/tz.caiw "$f" -j2 >/dev/null 2>&1; rc=$?
