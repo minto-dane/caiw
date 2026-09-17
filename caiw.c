@@ -52,7 +52,7 @@ static void die(const char *m) __attribute__((noreturn));
 static void die(const char *m) { fprintf(stderr, "caiw: %s\n", m); exit(1); }
 /* d-mode: remove partial outputs if we exit on any failure */
 static char **g_outp; static int g_outn, g_outok;
-static void out_cleanup(void) { if (!g_outok) for (int i = 0; i < g_outn; i++) unlink(g_outp[i]); }
+static void out_cleanup(void) { if (!g_outok) for (int i = 0; i < g_outn; i++) if (g_outp[i]) unlink(g_outp[i]); }
 
 /* ================= CRC32 (integrity) ================= */
 static uint32_t crc_tab[256], crc_ready = 0;
@@ -72,6 +72,7 @@ static uint32_t crc32_of(const uint8_t *p, uint64_t n) {
 }
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("oom"); return p; }
 static void *xc(size_t a, size_t b) { void *p = calloc(a ? a : 1, b ? b : 1); if (!p) die("oom"); return p; }
+static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
 
 static uint64_t fnv(const void *d, size_t n) {
     const uint8_t *p = d; uint64_t h = 1469598103934665603ull;
@@ -142,6 +143,7 @@ static const char *jstr(const char *p, char *buf, size_t bs) {
                     }
                 }
                 if (i + 4 >= bs) return 0;
+                if (!cp) return 0;              /* embedded NUL: C-string names can't carry it */
                 if (cp < 0x80) buf[i++] = (char)cp;
                 else if (cp < 0x800) {
                     buf[i++] = (char)(0xC0 | (cp >> 6));
@@ -190,46 +192,36 @@ static const char *jspan(const char *p) {
         else if (*p == close && --depth == 0) return p + 1;
     }
 }
-/* fetch key's value within flat object [obj,oend); string values are
-   unescaped, arrays/objects copied verbatim. key given WITHOUT quotes. */
-static const char *jget(const char *obj, const char *oend, const char *key, char *buf, int bs) {
+static int dtb(const char *d);
+static void ck_shape_len(const Tensor *t);
+static void ck_meta(const uint8_t *m, uint32_t ml);
+static void ck_dupname(char **seen, const char *name, int file, uint32_t n, uint32_t cap);
+/* locate key's value within flat object [obj,oend); returns value start
+   (guaranteed inside oend) or NULL. Value contents are never copied. */
+static const char *jkey(const char *obj, const char *oend, const char *key) {
     const char *p = obj;
-    char kb[600];
+    char *kb = xm((size_t)(oend - obj) + 1);   /* decoded key <= object span */
     while (p < oend) {
         const char *q = memchr(p, '"', oend - p);
         if (!q) return 0;
-        const char *e = jstr(q, kb, sizeof kb);
-        if (!e || e > oend) return 0;
+        const char *e = jstr(q, kb, (size_t)(oend - obj) + 1);
+        if (!e || e > oend) { free(kb); return 0; }
         const char *np = e;
         while (np < oend && (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r')) np++;
         p = e;
         if (np >= oend || *np != ':') continue;
         np++;
         while (np < oend && (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r')) np++;
-        if (np >= oend) return 0;
-        if (!strcmp(kb, key)) {
-            if (*np == '"') return jstr(np, buf, bs) ? buf : 0;
-            if (*np == '[' || *np == '{') {
-                const char *ve = jspan(np);
-                if (!ve || ve > oend || (size_t)(ve - np) >= (size_t)bs) return 0;
-                memcpy(buf, np, (size_t)(ve - np));
-                buf[ve - np] = 0;
-                return buf;
-            }
-            int i = 0;
-            while (np < oend && *np != ',' && *np != '}' && i < bs - 1) buf[i++] = *np++;
-            buf[i] = 0;
-            return buf;
-        }
-        /* skip the value so its contents can't fake a key */
+        if (np >= oend) { free(kb); return 0; }
+        if (!strcmp(kb, key)) { free(kb); return np; }
         if (*np == '"') { const char *ve = jstr_skip(np); p = ve ? ve : oend; }
         else if (*np == '{' || *np == '[') { const char *ve = jspan(np); p = ve ? ve : oend; }
         else { while (np < oend && *np != ',') np++; p = np; }
     }
+    free(kb);
     return 0;
 }
 
-static int dtb(const char *d);
 static InFile *st_load(const char *path, int fidx) {
     FILE *f = fopen(path, "rb");
     if (!f) die("cannot open input");
@@ -239,84 +231,126 @@ static InFile *st_load(const char *path, int fidx) {
     char *hdr = xm(hl + 1);
     if (fread(hdr, 1, hl, f) != hl) die("hdr2");
     hdr[hl] = 0;
-    int nt = 0;
-    for (char *p = hdr; (p = strstr(p, "\"data_offsets\"")); p++) nt++;
     InFile *inf = xc(1, sizeof(InFile));
-    inf->path = strdup(path);
-    inf->t = xc(nt ? nt : 1, sizeof(Tensor));
-    const char *p = hdr; char kb[600], vb[4200];
+    inf->path = xstrdup(path);
+    int tcap = 0;   /* grow-on-demand: escaped keys can't be precounted by strstr */
+    uint32_t scap = 128; char **seen = xc(scap, sizeof(char *));   /* dup-name hash (file=0) */
+    const char *p = hdr; char *kb = xm(hl + 1);   /* decoded names <= raw header len */
     while ((p = strchr(p, '"'))) {
-        const char *e = jstr(p, kb, sizeof kb);
+        const char *e = jstr(p, kb, hl + 1);
         if (!e) die("bad header string");
         const char *np = e;
         while (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r') np++;
         if (*np != ':') { p = e; continue; }
         np++;
         while (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r') np++;
+        if (!strcmp(kb, "__metadata__")) {   /* keep value verbatim for byte-faithful replay */
+            const char *ve;
+            if (*np == '{' || *np == '[') ve = jspan(np);
+            else if (*np == '"') ve = jstr_skip(np);
+            else { ve = np; while (ve < hdr + hl && *ve != ',' && *ve != '}') ve++; }
+            if (!ve || ve > hdr + hl) die("bad metadata");
+            if (memchr(np, 0, (size_t)(ve - np))) die("bad metadata");
+            free(inf->meta);
+            inf->meta = xm((size_t)(ve - np) + 1);
+            memcpy(inf->meta, np, (size_t)(ve - np));
+            inf->meta[ve - np] = 0;
+            ck_meta((const uint8_t *)inf->meta, (uint32_t)(ve - np));
+            p = ve; continue;
+        }
         if (*np == '"') {           /* plain string value: skip whole string */
             const char *ve = jstr_skip(np);
             if (!ve) die("bad header string");
             p = ve; continue;
         }
+        if (*np == '[') {           /* top-level array: skip whole, never descend */
+            const char *ve = jspan(np);
+            if (!ve) die("bad header array");
+            p = ve; continue;
+        }
         if (*np != '{') { p = np; continue; }
         const char *oend = jspan(np);   /* char past matching '}' */
         if (!oend) die("bad header object");
-        if (!strcmp(kb, "__metadata__")) {   /* keep verbatim for byte-faithful replay */
-            free(inf->meta);
-            inf->meta = xm((size_t)(oend - np) + 1);
-            memcpy(inf->meta, np, (size_t)(oend - np));
-            inf->meta[oend - np] = 0;
-            p = oend; continue;
-        }
-        if (!jget(np, oend, "data_offsets", vb, sizeof vb)) { p = oend; continue; }
-        if (inf->n >= nt) die("tensor count overflow");
-        for (int k = 0; k < inf->n; k++)
-            if (!strcmp(inf->t[k].name, kb)) die("dup tensor name");
-        Tensor *t = &inf->t[inf->n];
-        t->name = strdup(kb);
-        t->file = fidx;
-        char dbuf[64];
-        t->dtype = jget(np, oend, "dtype", dbuf, sizeof dbuf) ? strdup(dbuf) : strdup("?");
-        char sbuf[4200];
-        t->nd = 0;
-        if (!jget(np, oend, "shape", sbuf, sizeof sbuf)) die("bad shape");
-        {
-            char *q = sbuf;
-            while (*q && t->nd < 64) {
-                while (*q && (*q < '0' || *q > '9')) q++;
-                if (!*q) break;
-                t->shape[t->nd++] = strtoll(q, &q, 10);
+        const char *offs = jkey(np, oend, "data_offsets");
+        if (!offs) { p = oend; continue; }
+        if (inf->n >= tcap) {
+            tcap = tcap ? tcap * 2 : 64;
+            inf->t = realloc(inf->t, (size_t)tcap * sizeof(Tensor));
+            if (!inf->t) die("oom");
+            memset(inf->t + inf->n, 0, (size_t)(tcap - inf->n) * sizeof(Tensor));
+            if ((uint32_t)tcap * 2 > scap) {   /* keep seen-table load < 1/2 */
+                uint32_t ncap = scap * 2;
+                char **ns = xc(ncap, sizeof(char *));
+                for (uint32_t s = 0; s < scap; s++) if (seen[s]) {
+                    const char *nm = seen[s] + 2;
+                    uint64_t h = 1469598103934665603ull;
+                    for (const char *pp = nm; *pp; pp++) { h ^= (uint8_t)*pp; h *= 1099511628211ull; }
+                    uint64_t m2 = ncap - 1, sl = h & m2;
+                    while (ns[sl]) sl = (sl + 1) & m2;
+                    ns[sl] = seen[s];
+                }
+                free(seen); seen = ns; scap = ncap;
             }
-            while (*q && *q != ']' && (*q < '0' || *q > '9')) q++;
-            if (*q >= '0' && *q <= '9') die("too many dims");
+        }
+        ck_dupname(seen, kb, 0, (uint32_t)inf->n, scap);
+        if (strlen(kb) > 65535) die("name too long");   /* record field is u16 */
+        Tensor *t = &inf->t[inf->n];
+        t->name = xstrdup(kb);
+        t->file = fidx;
+        const char *dv = jkey(np, oend, "dtype");
+        char dbuf[64];
+        if (!dv || *dv != '"' || !jstr(dv, dbuf, sizeof dbuf)) die("bad dtype");
+        t->dtype = xstrdup(dbuf);
+        const char *sv = jkey(np, oend, "shape");
+        if (!sv) die("bad shape");
+        t->nd = 0;
+        {   /* strict: shape must be an array of nonneg integers */
+            const char *q = sv;
+            if (*q++ != '[') die("bad shape");
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q == ']') q++;
+            else for (;;) {
+                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+                if (*q < '0' || *q > '9') die("bad shape");
+                if (t->nd >= 64) die("too many dims");
+                char *e2;
+                t->shape[t->nd++] = strtoll(q, &e2, 10);
+                q = e2;
+                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+                if (*q == ']') { q++; break; }
+                if (*q != ',') die("bad shape");
+                q++;
+            }
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q != ',' && *q != '}') die("bad shape");
         }
         uint64_t a = 0, b = 0;
         {
-            char *q = strchr(vb, '['), *e2;
-            if (!q) die("bad data_offsets");
-            a = strtoull(q + 1, &e2, 10);
+            const char *q = offs; char *e2;
+            if (*q != '[') die("bad data_offsets");
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            a = strtoull(q, &e2, 10);
             for (q = e2; *q == ' ' || *q == '\t'; q++) ;
             if (*q != ',') die("bad data_offsets");
-            b = strtoull(q + 1, &e2, 10);
-            for (q = e2; *q == ' ' || *q == '\t'; q++) ;
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            b = strtoull(q, &e2, 10);
+            for (q = e2; *q == ' ' || *q == '\t' || *q == '\n' || *q == '\r'; q++) ;
             if (*q != ']') die("bad data_offsets");
+            q++;
+            for (; *q == ' ' || *q == '\t' || *q == '\n' || *q == '\r'; q++) ;
+            if (*q != ',' && *q != '}') die("bad data_offsets");
         }
         if (b < a) die("bad data_offsets");
         t->off = a; t->len = b - a;
-        /* safetensors invariant: len == product(shape) * dtype size */
-        {
-            unsigned __int128 prod = 1;
-            for (int d = 0; d < t->nd; d++) {
-                if (t->shape[d] < 0) die("bad shape");
-                prod *= (uint64_t)t->shape[d];
-                if (prod > UINT64_MAX / 8) die("bad shape");
-            }
-            if ((uint64_t)prod * (uint64_t)dtb(t->dtype) != t->len) die("shape/len mismatch");
-        }
+        ck_shape_len(t);
         inf->n++;
         p = oend;
     }
-    free(hdr);
+    free(hdr); free(kb);
+    for (uint32_t s = 0; s < scap; s++) free(seen[s]);
+    free(seen);
     uint64_t dsz = 0;
     for (int i = 0; i < inf->n; i++) {
         if (inf->t[i].len > UINT64_MAX - inf->t[i].off) die("bad data_offsets");
@@ -347,7 +381,7 @@ static InFile *st_load(const char *path, int fidx) {
         }
     }
     if (!inf->base) {
-        fseeko(f, 8 + hl, SEEK_SET);
+        if (fseeko(f, (off_t)(8 + hl), SEEK_SET)) die("seek");
         inf->base = xm(dsz ? dsz : 1);
         if (dsz && fread(inf->base, 1, dsz, f) != dsz) die("data");
     }
@@ -362,6 +396,30 @@ static int dtb(const char *d) {
     if (!strcmp(d, "F32") || !strcmp(d, "I32") || !strcmp(d, "U32")) return 4;
     if (!strcmp(d, "BF16") || !strcmp(d, "F16") || !strcmp(d, "I16") || !strcmp(d, "U16")) return 2;
     return 1;
+}
+/* dtype width in BITS (packed sub-byte dtypes exist in the spec); -1 = unknown */
+static int dbits(const char *d) {
+    if (!strcmp(d, "F64") || !strcmp(d, "I64") || !strcmp(d, "U64")) return 64;
+    if (!strcmp(d, "F32") || !strcmp(d, "I32") || !strcmp(d, "U32")) return 32;
+    if (!strcmp(d, "BF16") || !strcmp(d, "F16") || !strcmp(d, "I16") || !strcmp(d, "U16")) return 16;
+    if (!strcmp(d, "BOOL") || !strcmp(d, "U8") || !strcmp(d, "I8") ||
+        !strcmp(d, "F8_E4M3") || !strcmp(d, "F8_E5M2") || !strcmp(d, "F8_E8M0")) return 8;
+    if (!strcmp(d, "F6_E2M3") || !strcmp(d, "F6_E3M2")) return 6;
+    if (!strcmp(d, "F4") || !strcmp(d, "I4") || !strcmp(d, "U4")) return 4;
+    return -1;
+}
+/* safetensors invariant: prod(shape) * dtype_bits == len * 8.
+   Also bounds pos_dec's ctx index (po*K/P) to < K. Unknown dtypes are
+   treated as opaque bytes (round-trip is still byte-exact). */
+static void ck_shape_len(const Tensor *t) {
+    int bits = dbits(t->dtype); if (bits < 0) bits = 8;
+    unsigned __int128 prod = 1;
+    for (int d = 0; d < t->nd; d++) {
+        if (t->shape[d] < 0) die("bad shape");
+        prod *= (uint64_t)t->shape[d];
+        if (prod > UINT64_MAX) die("bad shape");
+    }
+    if (prod * (unsigned)bits != (unsigned __int128)t->len * 8) die("shape/len mismatch");
 }
 static int is_bf(const char *d) { return !strcmp(d, "BF16"); }
 static int is_f16(const char *d) { return !strcmp(d, "F16"); }
@@ -879,6 +937,7 @@ static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, 
         }
         rp = end;
     }
+    if ((uint64_t)(lim - rp) < 8) die("corrupt delta");
     uint64_t ne; memcpy(&ne, rp, 8); rp += 8;
     if (ne != escn) die("delta esc count mismatch");
     if (escn) {
@@ -1039,6 +1098,67 @@ static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz,
 }
 
 /* ================= archive ================= */
+/* archive-stored __metadata__ is replayed verbatim into regenerated headers;
+   it must be a single self-contained JSON value with no NUL bytes (strlen/
+   strcmp would silently truncate at one). */
+static void ck_meta(const uint8_t *m, uint32_t ml) {
+    if (!ml) return;
+    if (memchr(m, 0, ml)) die("bad metadata");
+    const char *p = (const char *)m, *e = p + ml, *ve = 0;
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p >= e) die("bad metadata");
+    if (*p == '{' || *p == '[') ve = jspan(p);
+    else if (*p == '"') ve = jstr_skip(p);
+    else {   /* scalar: only a real JSON literal is safe to replay verbatim */
+        ve = p;
+        while (ve < e && *ve != ' ' && *ve != '\t' && *ve != '\n' && *ve != '\r') ve++;
+        size_t sl = (size_t)(ve - p);
+        int lit = (sl == 4 && !memcmp(p, "true", 4)) ||
+                  (sl == 5 && !memcmp(p, "false", 5)) ||
+                  (sl == 4 && !memcmp(p, "null", 4));
+        if (!lit) {   /* JSON number: -? (0 | [1-9][0-9]*) (\.[0-9]+)? ([eE][+-]?[0-9]+)? */
+            const char *s = p;
+            if (s < ve && *s == '-') s++;
+            if (s >= ve || (*s != '0' && (*s < '1' || *s > '9'))) die("bad metadata");
+            if (*s == '0') s++; else while (s < ve && *s >= '0' && *s <= '9') s++;
+            if (s < ve && *s == '.') {
+                s++;
+                if (s >= ve || *s < '0' || *s > '9') die("bad metadata");
+                while (s < ve && *s >= '0' && *s <= '9') s++;
+            }
+            if (s < ve && (*s == 'e' || *s == 'E')) {
+                s++;
+                if (s < ve && (*s == '+' || *s == '-')) s++;
+                if (s >= ve || *s < '0' || *s > '9') die("bad metadata");
+                while (s < ve && *s >= '0' && *s <= '9') s++;
+            }
+            if (s != ve) die("bad metadata");
+        }
+    }
+    if (!ve) die("bad metadata");
+    while (ve < e && (*ve == ' ' || *ve == '\t' || *ve == '\n' || *ve == '\r')) ve++;
+    if (ve != e) die("bad metadata");
+}
+
+/* duplicate (file,name) records would emit duplicate JSON keys in `d` output */
+static void ck_dupname(char **seen, const char *name, int file, uint32_t n, uint32_t cap) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char *p = name; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ull; }
+    h ^= (uint64_t)file * 0x9E3779B97F4A7C15ull;
+    uint64_t mask = cap - 1, i = h & mask, i0 = i;
+    while (seen[i]) {
+        const char *s = seen[i];
+        if (s[0] == (char)(file & 255) && s[1] == (char)(file >> 8) && !strcmp(s + 2, name))
+            die("dup tensor in archive");
+        i = (i + 1) & mask;
+        if (i == i0) die("dup table full");
+    }
+    char *e = xm(strlen(name) + 3);
+    e[0] = (char)(file & 255); e[1] = (char)(file >> 8); strcpy(e + 2, name);
+    seen[i] = e;
+    (void)n;
+}
+
 /* archive integers are explicitly little-endian (portable format) */
 static void w64(FILE *f, uint64_t v) { uint8_t b[8]; for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (8 * i)); fwrite(b, 8, 1, f); }
 static void w32(FILE *f, uint32_t v) { uint8_t b[4]; for (int i = 0; i < 4; i++) b[i] = (uint8_t)(v >> (8 * i)); fwrite(b, 4, 1, f); }
@@ -1050,7 +1170,9 @@ static uint16_t r16(const uint8_t **p) { uint16_t v = (uint16_t)((*p)[0] | ((uin
 static uint8_t r8(const uint8_t **p) { return *(*p)++; }
 
 static void emit_rec(FILE *of, Tensor *t, int bat) {   /* bat: 0 solo, 1 head, 2 member */
-    uint16_t nl = (uint16_t)strlen(t->name), dl = (uint16_t)strlen(t->dtype);
+    size_t nl_ = strlen(t->name), dl_ = strlen(t->dtype);
+    if (nl_ > 65535 || dl_ > 65535) die("name too long for record");
+    uint16_t nl = (uint16_t)nl_, dl = (uint16_t)dl_;
     w16(of, nl); fwrite(t->name, 1, nl, of);
     w16(of, dl); fwrite(t->dtype, 1, dl, of);
     w8(of, (uint8_t)t->nd);
@@ -1077,7 +1199,12 @@ static uint8_t *slurp(const char *path, uint64_t *sz) {
     void *m = mmap(NULL, *sz ? *sz : 1, PROT_READ, MAP_PRIVATE, fd, 0);
     if (m != MAP_FAILED) { close(fd); g_amap = 1; madvise(m, *sz, MADV_SEQUENTIAL); return m; }
     uint8_t *b = xm(*sz ? *sz : 1);
-    if (pread(fd, b, *sz, 0) != (ssize_t)*sz) die("read");
+    uint64_t got = 0;
+    while (got < *sz) {          /* pread may return short on huge files */
+        ssize_t r = pread(fd, b + got, *sz - got, (off_t)got);
+        if (r <= 0) die("read");
+        got += (uint64_t)r;
+    }
     close(fd);
     return b;
 }
@@ -1392,6 +1519,7 @@ typedef struct {
     uint64_t **ghs, **snp;               /* owner channel state (read-only here) */
     uint64_t sz; uint8_t *buf;
     uint64_t *ho[2]; int ch[2];
+    int spawned;                          /* pthread_create succeeded -> join required */
 } TJob;
 /* worst-case payload for method m on a len-byte tensor. Every enc() call
    emits <=2B (x<2^39 vs XMAX>=2^24). Per-element call counts: FIELD 3
@@ -1405,9 +1533,12 @@ static uint64_t ebound(uint64_t len) {
 }
 static void *tjob_run(void *a) {
     TJob *j = a;
+    uint64_t **oh = gh, **os = gsnp;   /* restore on inline fallback so the
+                                        caller's channel pointers survive */
     gh = j->ghs; gsnp = j->snp;
     j->buf = xm(ebound(j->t->len));
     j->sz = try_method(j->m, j->t, j->all, j->buf, j->ho, j->ch, j->ri);
+    gh = oh; gsnp = os;
     return 0;
 }
 
@@ -1462,8 +1593,9 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
             j->ghs = gh; j->snp = gsnp;
             if (nsp == 1) tjob_run(j);
             else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
+            else j->spawned = 1;
         }
-        for (int k2 = k; k2 < e; k2++) if (nsp > 1) pthread_join(th[k2], 0);
+        for (int k2 = k; k2 < e; k2++) if (jb[k2].spawned) pthread_join(th[k2], 0);
         for (int k2 = k; k2 < e; k2++) {
             TJob *j = &jb[k2];
             if (j->sz && j->sz < best) {   /* promote: free old best, keep this */
@@ -1506,11 +1638,14 @@ typedef struct {
     uint64_t **snp;
     uint64_t *ch[NCH];
     uint8_t *out;
+    int spawned;
 } EJob;
 static void *ejob_run(void *a) {
     EJob *j = a;
+    uint64_t **oh = gh, **os = gsnp;
     gh = j->ch; gsnp = j->snp;
     compete(j->t, j->all, j->refcut, &j->out, 1);
+    gh = oh; gsnp = os;
     return 0;
 }
 
@@ -1585,13 +1720,16 @@ typedef struct {
     Tensor *t; const uint8_t *pl; Tensor *all;
     uint64_t **snp;
     uint64_t *ch[NCH];
+    int spawned;
 } DJob;
 static void *djob_run(void *a) {
     DJob *j = a;
+    uint64_t **oh = gh, **os = gsnp;
     gh = j->ch; gsnp = j->snp;
     dec_tensor(j->t, j->pl, j->all);
     if (crc32_of(j->t->data, j->t->len) != j->t->crc)
         die("crc mismatch: archive corrupt");
+    gh = oh; gsnp = os;
     return 0;
 }
 /* decode a flagged batch run all[i..j): members decode against the
@@ -1610,8 +1748,9 @@ static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf) {
             dj[m].t = &all[k + m]; dj[m].pl = buf + all[k + m].off;
             dj[m].all = all; dj[m].snp = snap;
             if (pthread_create(&th[m], 0, djob_run, &dj[m])) djob_run(&dj[m]);
+            else dj[m].spawned = 1;
         }
-        for (uint32_t m = 0; m < cnt; m++) pthread_join(th[m], 0);
+        for (uint32_t m = 0; m < cnt; m++) if (dj[m].spawned) pthread_join(th[m], 0);
         for (uint32_t m = 0; m < cnt; m++) hmerge(dj[m].ch, snap);
         free(dj); free(th);
     }
@@ -1636,6 +1775,7 @@ int main(int argc, char **argv) {
                    (!argv[i][2] || (argv[i][2] >= '0' && argv[i][2] <= '9'))) {
             const char *v = argv[i] + 2; int eat = 1;
             if (!*v) { if (i + 1 >= argc) die("-j needs a count"); v = argv[i + 1]; eat = 2; }
+            for (const char *d = v; *d; d++) if (*d < '0' || *d > '9') die("-j needs digits");
             g_threads = atoi(v);
             if (g_threads < 1) g_threads = 1;
             if (g_threads > 64) g_threads = 64;
@@ -1649,9 +1789,12 @@ int main(int argc, char **argv) {
         FILE *of = fopen(argv[2], "wb");
         if (!of) die("out");
         int nf = argc - 3;
+        if (nf > 65535) die("too many inputs");   /* file_idx field is u16 */
         InFile **ins = xc(nf, sizeof(InFile *));
-        int NT = 0;
-        for (int i = 0; i < nf; i++) { ins[i] = st_load(argv[3 + i], i); NT += ins[i]->n; }
+        int64_t NT64 = 0;
+        for (int i = 0; i < nf; i++) { ins[i] = st_load(argv[3 + i], i); NT64 += ins[i]->n; }
+        if (NT64 > 0xFFFFFFFFll) die("too many tensors");   /* NT field is u32 */
+        int NT = (int)NT64;
         Tensor *all = xc(NT, sizeof(Tensor));
         int ti = 0;
         for (int i = 0; i < nf; i++)
@@ -1704,6 +1847,7 @@ int main(int argc, char **argv) {
         w32(of, nf);
         for (int i = 0; i < nf; i++) {
             const char *bn = bname(ins[i]->path);
+            if (!*bn || strlen(bn) > 3000) die("bad input basename");   /* d-side cap */
             for (int j = 0; j < i; j++)
                 if (!strcmp(bn, bname(ins[j]->path))) die("duplicate input basename");
             w32(of, strlen(bn)); fwrite(bn, 1, strlen(bn), of);
@@ -1732,8 +1876,9 @@ int main(int argc, char **argv) {
                     ej[k].t = &all[i + k]; ej[k].all = all;
                     ej[k].refcut = i; ej[k].snp = snap;
                     if (pthread_create(&th[k], 0, ejob_run, &ej[k])) ejob_run(&ej[k]);
+                    else ej[k].spawned = 1;
                 }
-                for (uint32_t k = 0; k < nm; k++) pthread_join(th[k], 0);
+                for (uint32_t k = 0; k < nm; k++) if (ej[k].spawned) pthread_join(th[k], 0);
                 for (uint32_t k = 0; k < nm; k++) hmerge(ej[k].ch, snap);
                 for (uint32_t k = 0; k < nm; k++) {
                     Tensor *t = ej[k].t;
@@ -1792,19 +1937,25 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < nf; i++) {
             BND(p, 4); uint32_t l = r32(&p); BND(p, l);
             fnames[i] = xm(l + 1); memcpy(fnames[i], p, l); fnames[i][l] = 0; p += l;
-            /* output filename must not escape outdir */
-            if (!l || strchr(fnames[i], '/') || strchr(fnames[i], '\\') ||
+            /* output filename must not escape outdir or overflow the path buf */
+            if (!l || l > 3000 || memchr(fnames[i], 0, l) ||
+                strchr(fnames[i], '/') || strchr(fnames[i], '\\') ||
                 !strcmp(fnames[i], ".") || !strcmp(fnames[i], ".."))
                 die("bad filename");
             for (uint32_t j = 0; j < i; j++) if (!strcmp(fnames[i], fnames[j])) die("dup filename");
             if (cver >= 5) {   /* CAI5: verbatim __metadata__ per file */
                 BND(p, 4); uint32_t ml = r32(&p); BND(p, ml);
-                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; }
+                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; ck_meta(p, ml); }
                 p += ml;
             }
         }
         BND(p, 4); uint32_t NT = r32(&p);
+        BND(p, (uint64_t)NT * 28);  /* minimum record size */
         Tensor *all = xc(NT, sizeof(Tensor));
+        uint64_t dc64 = 64; while (dc64 < (uint64_t)NT * 2) dc64 *= 2;
+        if (dc64 > (1ull << 32)) die("too many tensors");
+        uint32_t dcap = (uint32_t)dc64;   /* open-addressed set, pow2, load<0.5 */
+        char **dseen = xc(dcap, sizeof(char *));
         /* pass 1: metadata walk — no decode */
         const uint8_t *q = p;
         uint32_t bstart = 0;   /* head index of currently open batch */
@@ -1813,30 +1964,24 @@ int main(int argc, char **argv) {
             uint16_t nl = 0, dl = 0;
             BND(q, 2); memcpy(&nl, q, 2); q += 2;
             BND(q, nl); t->name = xm(nl + 1); memcpy(t->name, q, nl); t->name[nl] = 0; q += nl;
+            if (memchr(t->name, 0, nl)) die("bad name");
             BND(q, 2); memcpy(&dl, q, 2); q += 2;
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
+            if (memchr(t->dtype, 0, dl)) die("bad dtype");
             BND(q, 1); t->nd = r8(&q);
             if (t->nd > 64) die("bad nd");
             BND(q, 8 * t->nd);
             for (int d = 0; d < t->nd; d++) t->shape[d] = (int64_t)r64(&q);
             BND(q, 2); t->file = r16(&q);
             if (t->file >= (int)nf) die("bad file idx");
+            ck_dupname(dseen, t->name, t->file, i, dcap);
             BND(q, 1); int mraw = r8(&q);
+            if ((mraw & MF_BH) && !(mraw & MF_BAT)) die("bad method flags");
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
             if (t->method > M_DELTAX) die("bad method");
             BND(q, 8); t->len = r64(&q);
-            /* safetensors invariant: len == product(shape) * dtype size —
-               also bounds pos_dec's ctx index (po*K/P) to < K */
-            {
-                unsigned __int128 prod = 1;
-                for (int d = 0; d < t->nd; d++) {
-                    if (t->shape[d] < 0) die("bad shape");
-                    prod *= (uint64_t)t->shape[d];
-                    if (prod > UINT64_MAX / 8) die("bad shape");
-                }
-                if ((uint64_t)prod * (uint64_t)dtb(t->dtype) != t->len) die("shape/len mismatch");
-            }
+            ck_shape_len(t);
             t->ref = 0xFFFFFFFFu;
             if (t->method == M_REF || t->method == M_DELTA) {
                 BND(q, 4); t->ref = r32(&q);
@@ -1850,6 +1995,7 @@ int main(int argc, char **argv) {
             if (t->bat == 1) bstart = i;
             else if (!t->bat) bstart = i + 1;
         }
+        if (q != bend) die("trailing data after last record");
         /* per-file offsets + write headers + open outfiles */
         uint64_t *foff = xc(nf, 8), *hbase = xc(nf, 8);
         FILE **ofs = xc(nf, sizeof(FILE *));
@@ -1868,8 +2014,12 @@ int main(int argc, char **argv) {
             for (uint32_t k = 0; k < NT; k++) {
                 Tensor *t = &all[k];
                 if (t->file != (int)i) continue;
-                /* names/dtypes are arbitrary bytes -> worst-case 6x escape growth */
-                size_t need = 7 * (strlen(t->name) + strlen(t->dtype)) + 512;
+                /* whole-record bound: 6x escape growth + dims + fixed fields;
+                   must cover EVERYTHING the snprintf calls below emit, since a
+                   truncated snprintf returns its full would-be length and jl
+                   would overflow hcap on the next call. */
+                size_t need = 7 * (strlen(t->name) + strlen(t->dtype)) +
+                              24 * ((size_t)t->nd + 1) + 128;
                 while (jl + need > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
                 t->dataoff = foff[i];
                 char *en = xm(6 * strlen(t->name) + 1), *ed = xm(6 * strlen(t->dtype) + 1);
@@ -1885,8 +2035,9 @@ int main(int argc, char **argv) {
                 first = 0;
             }
             jl += snprintf(j + jl, hcap - jl, "}");
-            snprintf(tmp, sizeof tmp, "%s/%s", argv[3], fnames[i]);
-            g_outp[i] = strdup(tmp);
+            int wr = snprintf(tmp, sizeof tmp, "%s/%s", argv[3], fnames[i]);
+            if (wr < 0 || (size_t)wr >= sizeof tmp) die("output path too long");
+            g_outp[i] = xstrdup(tmp);
             ofs[i] = fopen(tmp, "wb");
             if (!ofs[i]) die("out file");
             w64(ofs[i], jl); fwrite(j, 1, jl, ofs[i]);
@@ -1909,7 +2060,7 @@ int main(int argc, char **argv) {
                 for (uint32_t k = i; k < j; k++) {
                     Tensor *t = &all[k];
                     FILE *of = ofs[t->file];
-                    fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET);
+                    if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
                     if (t->len && fwrite(t->data, 1, t->len, of) != t->len) die("write");
                     drop_pages(buf + t->off, t->plen, g_amap);
                     if (!keep[k]) { free(t->data); t->data = 0; }
@@ -1920,7 +2071,7 @@ int main(int argc, char **argv) {
             dec_tensor(t, buf + t->off, all);
             if (crc32_of(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
             FILE *of = ofs[t->file];
-            fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET);
+            if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
             if (t->len && fwrite(t->data, 1, t->len, of) != t->len) die("write");
             drop_pages(buf + t->off, t->plen, g_amap);
             if (!keep[i]) { free(t->data); t->data = 0; }
@@ -1933,6 +2084,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "v")) {
         /* verify: decode archive in-memory, memcmp each tensor vs source files */
+        if (argc < 4) die("caiw v out.caiw in.st...");
         uint64_t fsz; uint8_t *buf = slurp(argv[2], &fsz);
         int nf = argc - 3;
         InFile **ins = xc(nf, sizeof(InFile *));
@@ -1946,13 +2098,16 @@ int main(int argc, char **argv) {
         else die("bad magic");
         p += 4;
         BND(p, 4); uint32_t nfa = r32(&p);
+        if (nfa > 65535) die("too many files");
+        BND(p, (uint64_t)nfa * 4);
         char **fnames = xc(nfa ? nfa : 1, sizeof(char *)), **fmeta = xc(nfa ? nfa : 1, sizeof(char *));
         for (uint32_t i = 0; i < nfa; i++) {
             BND(p, 4); uint32_t l = r32(&p); BND(p, l);
             fnames[i] = xm(l + 1); memcpy(fnames[i], p, l); fnames[i][l] = 0; p += l;
+            if (memchr(fnames[i], 0, l)) die("bad filename");
             if (cver >= 5) {
                 BND(p, 4); uint32_t ml = r32(&p); BND(p, ml);
-                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; }
+                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; ck_meta(p, ml); }
                 p += ml;
             }
         }
@@ -1972,8 +2127,13 @@ int main(int argc, char **argv) {
             }
         }
         BND(p, 4); uint32_t NT = r32(&p);
+        BND(p, (uint64_t)NT * 28);
         model_init();
         Tensor *all = xc(NT, sizeof(Tensor));
+        uint64_t dc64 = 64; while (dc64 < (uint64_t)NT * 2) dc64 *= 2;
+        if (dc64 > (1ull << 32)) die("too many tensors");
+        uint32_t dcap = (uint32_t)dc64;
+        char **dseen = xc(dcap, sizeof(char *));
         /* pass 1: metadata + payload offsets, keep flags */
         const uint8_t *q = p;
         uint32_t bstart = 0;   /* head index of currently open batch */
@@ -1982,30 +2142,24 @@ int main(int argc, char **argv) {
             uint16_t nl, dl;
             BND(q, 2); memcpy(&nl, q, 2); q += 2;
             BND(q, nl); t->name = xm(nl + 1); memcpy(t->name, q, nl); t->name[nl] = 0; q += nl;
+            if (memchr(t->name, 0, nl)) die("bad name");
             BND(q, 2); memcpy(&dl, q, 2); q += 2;
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
+            if (memchr(t->dtype, 0, dl)) die("bad dtype");
             BND(q, 1); t->nd = r8(&q);
             if (t->nd > 64) die("bad nd");
             BND(q, 8 * t->nd);
             for (int d = 0; d < t->nd; d++) t->shape[d] = (int64_t)r64(&q);
             BND(q, 2); t->file = r16(&q);
             if (t->file >= (int)nfa) die("bad file idx");
+            ck_dupname(dseen, t->name, t->file, i, dcap);
             BND(q, 1); int mraw = r8(&q);
+            if ((mraw & MF_BH) && !(mraw & MF_BAT)) die("bad method flags");
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
             if (t->method > M_DELTAX) die("bad method");
             BND(q, 8); t->len = r64(&q);
-            /* safetensors invariant: len == product(shape) * dtype size —
-               also bounds pos_dec's ctx index (po*K/P) to < K */
-            {
-                unsigned __int128 prod = 1;
-                for (int d = 0; d < t->nd; d++) {
-                    if (t->shape[d] < 0) die("bad shape");
-                    prod *= (uint64_t)t->shape[d];
-                    if (prod > UINT64_MAX / 8) die("bad shape");
-                }
-                if ((uint64_t)prod * (uint64_t)dtb(t->dtype) != t->len) die("shape/len mismatch");
-            }
+            ck_shape_len(t);
             t->ref = 0xFFFFFFFFu;
             if (t->method == M_REF || t->method == M_DELTA) {
                 BND(q, 4); t->ref = r32(&q);
@@ -2019,6 +2173,7 @@ int main(int argc, char **argv) {
             if (t->bat == 1) bstart = i;
             else if (!t->bat) bstart = i + 1;
         }
+        if (q != bend) die("trailing data after last record");
         uint8_t *keep = xc(NT ? NT : 1, 1);
         for (uint32_t i = 0; i < NT; i++)
             if ((all[i].method == M_REF || all[i].method == M_DELTA) && all[i].ref < NT)

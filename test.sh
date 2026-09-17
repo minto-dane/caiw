@@ -25,6 +25,28 @@ awk "BEGIN{exit !($sz < 0.75)}" || { echo "COLD-START FAIL: split ratio $sz"; fa
 # metadata must survive a d round-trip
 rm -rf /tmp/tstd && "$BIN" d /tmp/tst2.caiw /tmp/tstd -j1 >/dev/null 2>&1 &&
 grep -q '__metadata__' /tmp/tstd/meta.st || { echo "META FAIL"; fail=1; }
+# hardening: malformed inputs must die(1), never pass silently
+python3 - <<'PYEOF'
+import struct
+# dup tensor name inside one file
+hdr = b'{"a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},"a":{"dtype":"U8","shape":[2],"data_offsets":[2,4]}}'
+open('/tmp/h_dup.st','wb').write(struct.pack('<Q', len(hdr)) + hdr + b'ABCD')
+# malformed scalar __metadata__
+hdr = b'{"__metadata__":12x,"t":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}'
+open('/tmp/h_meta.st','wb').write(struct.pack('<Q', len(hdr)) + hdr + b'ABCD')
+# archive with NUL inside filename field
+a = bytearray(open('/tmp/tst2.caiw','rb').read())
+nl = struct.unpack('<I', a[8:12])[0]
+a[12] = 0
+open('/tmp/h_nul.caiw','wb').write(a)
+# archive with trailing garbage
+open('/tmp/h_trail.caiw','wb').write(open('/tmp/tst2.caiw','rb').read() + b'GARBAGE')
+PYEOF
+"$BIN" c /tmp/hz.caiw /tmp/h_dup.st >/dev/null 2>&1 && { echo "DUPNAME ACCEPTED"; fail=1; }
+"$BIN" c /tmp/hz.caiw /tmp/h_meta.st >/dev/null 2>&1 && { echo "BADMETA ACCEPTED"; fail=1; }
+"$BIN" d /tmp/h_nul.caiw /tmp/hzout >/dev/null 2>&1 && { echo "NULNAME ACCEPTED"; fail=1; }
+"$BIN" v /tmp/h_trail.caiw out/pack1.st out/meta.st >/dev/null 2>&1 && { echo "TRAILING ACCEPTED"; fail=1; }
+"$BIN" c /tmp/hz.caiw -j 1x out/pack1.st >/dev/null 2>&1 && { echo "BAD-J ACCEPTED"; fail=1; }
 for f in tests/corpus/*; do
     [ -e "$f" ] || continue
     timeout 10 "$BIN" c /tmp/tz.caiw "$f" -j2 >/dev/null 2>&1; rc=$?
