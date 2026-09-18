@@ -11,7 +11,10 @@ test: caiw
 fuzz: caiw
 	./fuzz.sh
 
+verify:
+	./verify/verify.sh
+
 clean:
 	rm -f caiw
 
-.PHONY: test fuzz clean
+.PHONY: test fuzz verify clean

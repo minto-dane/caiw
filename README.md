@@ -89,10 +89,16 @@ already-decoded reference tensor.
   field, method/dtype pair, payload bound, and batch reference before
   touching memory.
 - **Verified** — ASan/UBSan/MSan/TSan clean; AFL++ coverage fuzzing
-  (crash corpus kept in `tests/corpus/`); CBMC proves the `kmap16`
-  bijection; the rANS core is covered by an exhaustive
-  boundary sweep (524,537 cases — every frequency × every 256-power
-  transition) and `dsym` by 3,264 tables × all 32,768 symbol values.
+  (crash corpus kept in `tests/corpus/`). Formal layer under `verify/`
+  (`verify/verify.sh`): TLA+ model-checks the batch-merge and
+  tmp→rename protocols (flawed variants produce the expected
+  counterexamples), Alloy checks archive structural invariants at
+  scope 8, CBMC proves kmap16/dsym/norm_ctx/rANS (fixed-frequency)
+  plus the parser boundary (utf8_ok/hex4/jstr/jstr_skip/jspan), and
+  Frama-C EVA+RTE screens the codec kernels (0 invalid). Bounded
+  results and solver limits are documented honestly; the rANS core is
+  additionally covered by an exhaustive boundary sweep (524,537 cases)
+  and `dsym` by 3,264 tables × all 32,768 symbol values.
 - **Deterministic** — encode decisions are integer-only, so a fixed `-j`
   reproduces bit-identical archives across machines; archives are
   `-j`-independent on the decode side.
