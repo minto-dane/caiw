@@ -8,3 +8,6 @@ dumped/
 __pycache__/
 *.log
 *.caiw
+verify/states/
+verify/CaiwArchive/
+verify/CaiwArchiveFlawed/

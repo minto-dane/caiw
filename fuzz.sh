@@ -32,6 +32,11 @@ open('/tmp/fz.caiw','wb').write(d)
     rc=$?
     if [ $rc -ge 128 ]; then echo "CRASH seed=$i rc=$rc"; cp /tmp/fz.caiw /tmp/crash_$i.caiw; crash=$((crash+1));
     elif [ $rc -eq 0 ]; then vb=$((vb+1)); else clean=$((clean+1)); fi
+    # d-mode path too: malformed archives must die cleanly there as well
+    rm -rf /tmp/fzd; mkdir -p /tmp/fzd
+    timeout 10 "$BIN" d /tmp/fz.caiw /tmp/fzd -j4 >/dev/null 2>&1
+    rc=$?
+    if [ $rc -ge 128 ]; then echo "D-CRASH seed=$i rc=$rc"; cp /tmp/fz.caiw /tmp/dcrash_$i.caiw; crash=$((crash+1)); fi
 done
 echo "fuzz done: $N iters, crashes=$crash, clean_die=$clean, verified_ok=$vb"
 [ $crash -eq 0 ]

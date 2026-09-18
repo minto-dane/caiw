@@ -17,6 +17,14 @@ for t in "edgeA.st edgeB.st" "chA.st chB.st chC.st" "f32A.st f32B.st" "exp.st" \
 done
 "$BIN" c /tmp/tst.caiw --ref out/f32A.st out/f32B.st -j4 >/dev/null 2>&1 &&
 "$BIN" v /tmp/tst.caiw --ref out/f32A.st out/f32B.st -j4 2>&1 | grep -q "0 bad" || { echo "DELTAX FAIL"; fail=1; }
+# d-mode with --ref: DELTAX records must resolve through the ref files
+rm -rf /tmp/rfxout && "$BIN" d /tmp/tst.caiw /tmp/rfxout --ref out/f32A.st -j4 >/dev/null 2>&1 || { echo "DELTAX-D FAIL"; fail=1; }
+python3 - <<'PYEOF' || { echo "DELTAX-D DIFF"; fail=1; }
+import struct, sys
+a = open('/tmp/rfxout/f32B.st','rb').read(); b = open('out/f32B.st','rb').read()
+la, lb = struct.unpack('<Q', a[:8])[0], struct.unpack('<Q', b[:8])[0]
+sys.exit(0 if a[8+la:] == b[8+lb:] else 1)
+PYEOF
 # cold-start: split tensors must compress near single-tensor ratio (teach)
 sz=$("$BIN" c /tmp/split.caiw out/split.st -j1 2>&1 | grep -o 'ratio=[0-9.]*' | cut -d= -f2)
 awk "BEGIN{exit !($sz < 0.75)}" || { echo "COLD-START FAIL: split ratio $sz"; fail=1; }
@@ -151,6 +159,41 @@ cp out/f32A.st /tmp/rfout/base.st 2>/dev/null || { mkdir -p /tmp/rfout; cp out/f
 cp out/f32A.st /tmp/base.st && "$BIN" c /tmp/rf2.caiw --ref /tmp/rfout/base.st /tmp/base.st >/dev/null 2>&1
 "$BIN" d /tmp/rf2.caiw /tmp/rfout --ref /tmp/rfout/base.st >/dev/null 2>&1 && { echo "D-REF ACCEPTED"; fail=1; }
 [ -s /tmp/rfout/base.st ] || { echo "D-REF CLOBBERED"; fail=1; }
+# strict-JSON metadata: brace-balanced but ungrammatical values must die
+python3 - <<'PYEOF'
+import struct
+def w32(v): return struct.pack('<I', v)
+for tag, meta in (('nogram', b'{"a" 1}'), ('badesc', b'{"k":"\\q"}'),
+                  ('deep', b'[' * 200 + b']' * 200), ('junk', b'{"a":1}x'),
+                  ('escnul', b'"\\'), ('tinyf', b'f'), ('tinysp', b' ')):
+    a = b'CAI5' + w32(1) + w32(1) + b'x' + w32(len(meta)) + meta + w32(0)
+    open('/tmp/mg_%s.caiw' % tag, 'wb').write(a)
+# non-utf8 tensor name in a record (raw 0x80 byte) — regenerated JSON
+# would be invalid UTF-8; the walk must reject it
+a = b'CAI5' + w32(1) + w32(1) + b'x' + w32(0) + w32(1)
+a += struct.pack('<H', 3) + b'A\x80B'
+open('/tmp/mg_utf.caiw', 'wb').write(a)
+# non-utf8 tensor name in a source safetensors header
+h = b'{"a\x80b":{"dtype":"U8","shape":[2],"data_offsets":[0,2]}}'
+open('/tmp/mg_utf.st', 'wb').write(struct.pack('<Q', len(h)) + h + b'AB')
+PYEOF
+for t in nogram badesc deep junk escnul tinyf tinysp; do
+    "$BIN" d /tmp/mg_$t.caiw /tmp/hzout >/dev/null 2>&1 && { echo "META-GRAMMAR-$t ACCEPTED"; fail=1; }
+    "$BIN" d /tmp/mg_$t.caiw /tmp/hzout >/dev/null 2>&1; [ $? -ge 128 ] && { echo "META-GRAMMAR-$t CRASH"; fail=1; }
+done
+# tmp-path self-destruction: archive IS <outdir>/<member>.caiwtmp —
+# must die, not O_TRUNC its own mmap'd input mid-decode
+mkdir -p /tmp/tatk
+python3 - <<'PYEOF'
+import struct
+def w32(v): return struct.pack('<I', v)
+a = b'CAI5' + w32(1) + w32(1) + b'x' + w32(0) + w32(0)
+open('/tmp/tatk/x.caiwtmp', 'wb').write(a)
+PYEOF
+"$BIN" d /tmp/tatk/x.caiwtmp /tmp/tatk >/dev/null 2>&1 && { echo "TMPSELF-D ACCEPTED"; fail=1; }
+[ -s /tmp/tatk/x.caiwtmp ] || { echo "TMPSELF-D CLOBBERED ARCHIVE"; fail=1; }
+"$BIN" d /tmp/mg_utf.caiw /tmp/hzout >/dev/null 2>&1 && { echo "UTF8-NAME ACCEPTED"; fail=1; }
+"$BIN" c /tmp/hz.caiw /tmp/mg_utf.st >/dev/null 2>&1 && { echo "UTF8-SRC ACCEPTED"; fail=1; }
 # unterminated __metadata__ string at a page boundary — must die, not run
 # off the mmap end (the ck_meta buffer is the terminated copy now)
 python3 - <<'PYEOF'
@@ -170,6 +213,48 @@ h = json.dumps({'w': {'dtype': 'F4', 'shape': [3], 'data_offsets': [0, 1]}}).enc
 open('/tmp/f4x.st', 'wb').write(struct.pack('<Q', len(h)) + h + b'\xAB')
 PYEOF
 "$BIN" c /tmp/f4x.caiw /tmp/f4x.st >/dev/null 2>&1 && "$BIN" v /tmp/f4x.caiw /tmp/f4x.st 2>&1 | grep -q "0 bad" || { echo "F4 SUBBYTE FAILED"; fail=1; }
+# DELTA on a zero-copy RAW referent at an ODD archive offset — the referent
+# pointer is unaligned; decode must alview-copy it (UBSan alignment check)
+python3 - <<'PYEOF'
+import json, struct, random
+random.seed(7)
+n = 4096
+w1 = [random.randrange(65536) for _ in range(n)]
+w2 = list(w1)
+for i in range(0, n, 64): w2[i] ^= 0x0100
+for pth, vals in (('/tmp/mA.st', w1), ('/tmp/mB.st', w2)):
+    h = json.dumps({'ww': {'dtype':'F16','shape':[n],'data_offsets':[0,2*n]}}).encode()
+    open(pth,'wb').write(struct.pack('<Q', len(h)) + h + struct.pack(f'<{n}H', *vals))
+PYEOF
+"$BIN" c /tmp/mAB.caiw /tmp/mA.st /tmp/mB.st -j1 >/dev/null 2>&1 && \
+"$BIN" v /tmp/mAB.caiw /tmp/mA.st /tmp/mB.st -j1 2>&1 | grep -q "0 bad" || { echo "UNALIGNED-DELTA FAILED"; fail=1; }
+python3 - <<'PYEOF'
+# the test is only meaningful if rec0's RAW payload sits at an odd offset —
+# fail loudly if the format layout ever shifts parity
+import struct, sys
+d = open('/tmp/mAB.caiw','rb').read()
+q = 4; nf = struct.unpack('<I', d[q:q+4])[0]; q += 4
+for _ in range(nf):
+    l = struct.unpack('<I', d[q:q+4])[0]; q += 4 + l
+    ml = struct.unpack('<I', d[q:q+4])[0]; q += 4 + ml
+nt = struct.unpack('<I', d[q:q+4])[0]; q += 4
+nl = struct.unpack('<H', d[q:q+2])[0]; q += 2 + nl
+dl = struct.unpack('<H', d[q:q+2])[0]; q += 2 + dl
+nd = d[q]; q += 1 + 8*nd + 2 + 1 + 8
+q += 8 + 4                      # plen + crc
+sys.exit(0 if (q & 1) else 1)   # q = rec0 payload offset; must be odd
+PYEOF
+[ $? -eq 0 ] || { echo "UNALIGNED-DELTA: payload offset is even (test vacuous)"; fail=1; }
+rm -rf /tmp/mdout && "$BIN" d /tmp/mAB.caiw /tmp/mdout -j2 >/dev/null 2>&1 || { echo "UNALIGNED-DELTA-D FAILED"; fail=1; }
+# zero-element tensor with nonzero last dim — pos_gain(0)/flog2(0) was UB
+python3 - <<'PYEOF'
+import json, struct
+h = json.dumps({'z': {'dtype':'F16','shape':[0,5],'data_offsets':[0,0]},
+                'w': {'dtype':'F16','shape':[4],'data_offsets':[0,8]}}).encode()
+open('/tmp/zerodim.st','wb').write(struct.pack('<Q', len(h)) + h + struct.pack('<4H',1,2,3,4))
+PYEOF
+"$BIN" c /tmp/zd.caiw /tmp/zerodim.st -j1 >/dev/null 2>&1 && \
+"$BIN" v /tmp/zd.caiw /tmp/zerodim.st -j1 2>&1 | grep -q "0 bad" || { echo "ZERODIM FAILED"; fail=1; }
 for f in tests/corpus/*; do
     [ -e "$f" ] || continue
     timeout 10 "$BIN" c /tmp/tz.caiw "$f" -j2 >/dev/null 2>&1; rc=$?
