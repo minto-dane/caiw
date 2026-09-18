@@ -11,3 +11,6 @@ __pycache__/
 verify/states/
 verify/CaiwArchive/
 verify/CaiwArchiveFlawed/
+verify/.frama-c/
+verify/.tmp/
+verify/.wp-out/

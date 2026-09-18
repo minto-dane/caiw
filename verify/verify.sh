@@ -10,7 +10,8 @@
 #   TLA+ (TLC)  — design-level protocol model checking (finite-state)
 #   Alloy       — design-level structural invariant checking (bounded scope)
 #   CBMC        — implementation-level bounded proofs on the real caiw.c
-#   Frama-C     — implementation-level static analysis (EVA/RTE), optional
+#   Frama-C     — implementation-level static analysis (EVA/RTE) and
+#                 deductive contract proofs (WP), optional
 #
 # Proven ≠ modeled: TLA+/Alloy validate the DESIGN abstraction; CBMC proves
 # properties of the compiled C semantics within the stated bounds; none of
@@ -151,6 +152,30 @@ if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/framac_eva.c" ]; then
     fi
 else
     skip=$((skip+1)); note "SKIP Frama-C — not installed"
+fi
+
+# Frama-C WP — deductive (unbounded) proofs of the ACSL contracts that live
+# in caiw.c on hex4/utf8_ok/dsym/kmap16/kmap16_inv, incl. RTE-generated
+# safety goals.  PASS iff every scheduled goal is proven ("Proved goals: N/N").
+# Needs why3-registered provers (alt-ergo, z3) — see ~/.why3.conf.
+if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
+    out=$(PATH="$(dirname "$FRAMAC"):/home/nia/devbox/tools/usr/bin:$PATH" \
+        timeout 600 "$FRAMAC" -wp -wp-rte \
+        -wp-fct hex4,utf8_ok,dsym,kmap16,kmap16_inv \
+        -wp-timeout 60 -wp-prover z3,alt-ergo -machdep gcc_x86_64 "$V/wp.c" 2>&1)
+    got=$(echo "$out" | grep -oE "[0-9]+ / [0-9]+" | tail -1)
+    if [ -n "$got" ]; then
+        set -- $got; p=$1; t=$3
+        if [ "$p" = "$t" ]; then
+            ok "Frama-C WP kernel contracts ($p/$t goals proved)"
+        else
+            bad "Frama-C WP ($p/$t proved)"; echo "$out" | tail -8
+        fi
+    else
+        bad "Frama-C WP (no summary)"; echo "$out" | tail -8
+    fi
+else
+    skip=$((skip+1)); note "SKIP Frama-C WP — not installed"
 fi
 
 echo "----------------------------------------------------------------"
