@@ -124,8 +124,17 @@ typedef struct {
 static InFile **g_refs = NULL; static int g_nref = 0;
 
 /* ---- minimal JSON for safetensors headers ---- */
+/*@ requires \valid_read(p + (0 .. 3));
+    requires \valid(out);
+    assigns *out;
+    ensures \result == 0 || \result == 1;
+*/
 static int hex4(const char *p, unsigned *out) {
     unsigned v = 0;
+    /*@ loop invariant 0 <= k <= 4;
+        loop assigns v, k;
+        loop variant 4 - k;
+    */
     for (int k = 0; k < 4; k++) {
         char c = p[k]; v <<= 4;
         if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
@@ -221,7 +230,16 @@ static void ck_dupname(char **seen, const char *name, int file, uint32_t n, uint
    Names/dtype strings are replayed raw into regenerated JSON (jesc passes
    bytes >=0x80 through), so a non-UTF-8 name would produce a header that
    strict parsers reject. Validate on decode AND on archive load. */
+/*@ requires n <= 1073741824;
+    requires \valid_read(s + (0 .. n - 1));
+    assigns \nothing;
+    ensures \result == 0 || \result == 1;
+*/
 static int utf8_ok(const char *s, size_t n) {
+    /*@ loop invariant 0 <= i <= n;
+        loop assigns i;
+        loop variant n - i;
+    */
     for (size_t i = 0; i < n;) {
         uint8_t c = (uint8_t)s[i];
         if (c < 0x80) { i++; continue; }
@@ -232,6 +250,11 @@ static int utf8_ok(const char *s, size_t n) {
         else if (c < 0xF5) { cp = c & 7; w = 4; }
         else return 0;
         if (i + w > n) return 0;
+        /*@ loop invariant 1 <= k <= w;
+            loop invariant w <= n - i;
+            loop assigns k, cp;
+            loop variant w - k;
+        */
         for (int k = 1; k < w; k++) {
             uint8_t t = (uint8_t)s[i + k];
             if ((t & 0xC0) != 0x80) return 0;
@@ -618,11 +641,33 @@ static inline uint64_t dec(uint64_t x, uint32_t f, uint32_t c, const uint8_t **r
     while (x < LOWER && *rp < end) x = (x << 8) | *(*rp)++;
     return x;
 }
+/* decode-side symbol lookup: binary search for the unique cell with
+   cum[s] <= v < cum[s+1].  fc>0 is load-bearing: dec() divides by it. */
+/*@ requires 1 <= aw <= 65536;
+    requires \valid_read(f + (0 .. aw - 1));
+    requires \valid_read(cum + (0 .. aw));
+    requires \valid(fc);
+    requires cum[0] == 0;
+    requires v < cum[aw];
+    requires \forall integer i; 0 <= i < aw ==> cum[i] <= cum[i + 1];
+    requires \forall integer i; 0 <= i < aw && cum[i] < cum[i + 1] ==> f[i] > 0;
+    assigns *fc;
+    ensures 0 <= \result < aw;
+    ensures *fc == f[\result];
+*/
 static inline uint32_t dsym(const uint16_t *f, const uint32_t *cum, int aw, uint32_t v, uint32_t *fc) {
     int lo = 0, hi = aw - 1;
+    /*@ loop invariant 0 <= lo <= hi <= aw - 1;
+        loop invariant cum[lo] <= v < cum[hi + 1];
+        loop assigns lo, hi;
+        loop variant hi - lo;
+    */
     while (lo < hi) { int m = (lo + hi) >> 1; if (v >= cum[m + 1]) lo = m + 1; else hi = m; }
-    *fc = f[lo];
-    return lo;
+    uint32_t r = lo;
+    //@ assert cum[r] <= v < cum[r + 1];
+    //@ assert cum[r] < cum[r + 1] ==> f[r] > 0;
+    *fc = f[r];
+    return r;
 }
 /* emit one rANS block: [u32 len][8B state][bytes] */
 static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) {
@@ -956,9 +1001,19 @@ static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, 
 }
 
 /* ============ DELTA (16-bit K-residual) ============ */
+/*@ assigns \nothing;
+    ensures 0 <= \result <= 0xFFFF;
+    ensures \result == ((u & 0x8000) != 0 ?
+                        (int64_t)(uint16_t)(~u) : (int64_t)(u ^ 0x8000));
+*/
 static inline int64_t kmap16(uint16_t u) {
     return (u & 0x8000) ? (int64_t)(uint16_t)(~u) : (int64_t)(u ^ 0x8000);
 }
+/*@ assigns \nothing;
+    ensures \result == (((\at(k,Pre) & 0xFFFF) & 0x8000) != 0 ?
+                        (uint16_t)((\at(k,Pre) & 0xFFFF) ^ 0x8000)
+                        : (uint16_t)(~(\at(k,Pre) & 0xFFFF)));
+*/
 static inline uint16_t kmap16_inv(int64_t k) {
     k &= 0xFFFF;
     return (k & 0x8000) ? (uint16_t)(k ^ 0x8000) : (uint16_t)(~k);
