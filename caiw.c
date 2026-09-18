@@ -36,10 +36,19 @@
 #include <sys/mman.h>
 #include <libgen.h>
 #include <errno.h>
+#include <ctype.h>
+#include <stdarg.h>
 #include <pthread.h>
 
 /* length arithmetic is u64 throughout; size_t must not truncate it */
 typedef char caiw_needs_64bit_size_t[(sizeof(size_t) >= 8) ? 1 : -1];
+
+/* every archive field is explicitly little-endian — the format must not
+   depend on host byte order */
+static void p32le(uint8_t *o, uint32_t v) { for (int i = 0; i < 4; i++) o[i] = (uint8_t)(v >> (8 * i)); }
+static void p64le(uint8_t *o, uint64_t v) { for (int i = 0; i < 8; i++) o[i] = (uint8_t)(v >> (8 * i)); }
+static uint32_t g32le(const uint8_t *p) { uint32_t v = 0; for (int i = 0; i < 4; i++) v |= (uint32_t)p[i] << (8 * i); return v; }
+static uint64_t g64le(const uint8_t *p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v; }
 
 #define BS 17
 #define BLK (1u << BS)
@@ -208,6 +217,34 @@ static void ck_shape_len(const Tensor *t);
 static void ck_meta(const uint8_t *m, uint32_t ml);
 static uint64_t nfh(const char *name, int file);
 static void ck_dupname(char **seen, const char *name, int file, uint32_t n, uint32_t cap);
+/* strict UTF-8: no overlongs, no surrogates, <=U+10FFFF, no truncation.
+   Names/dtype strings are replayed raw into regenerated JSON (jesc passes
+   bytes >=0x80 through), so a non-UTF-8 name would produce a header that
+   strict parsers reject. Validate on decode AND on archive load. */
+static int utf8_ok(const char *s, size_t n) {
+    for (size_t i = 0; i < n;) {
+        uint8_t c = (uint8_t)s[i];
+        if (c < 0x80) { i++; continue; }
+        uint32_t cp; int w;
+        if (c < 0xC0) return 0;
+        else if (c < 0xE0) { cp = c & 0x1F; w = 2; if (cp < 2) return 0; }
+        else if (c < 0xF0) { cp = c & 0x0F; w = 3; }
+        else if (c < 0xF5) { cp = c & 7; w = 4; }
+        else return 0;
+        if (i + w > n) return 0;
+        for (int k = 1; k < w; k++) {
+            uint8_t t = (uint8_t)s[i + k];
+            if ((t & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (t & 0x3F);
+        }
+        if (cp >= 0xD800 && cp <= 0xDFFF) return 0;      /* lone surrogate */
+        if (w == 3 && cp < 0x800) return 0;            /* overlong */
+        if (w == 4 && (cp < 0x10000 || cp > 0x10FFFF)) return 0;  /* overlong / >U+10FFFF */
+        i += w;
+    }
+    return 1;
+}
+
 /* locate key's value within flat object [obj,oend); returns value start
    (guaranteed inside oend) or NULL. Value contents are never copied. */
 static const char *jkey(const char *obj, const char *oend, const char *key) {
@@ -256,6 +293,7 @@ static InFile *st_load(const char *path, int fidx) {
         if (*np != ':') { p = e; continue; }
         np++;
         while (*np == ' ' || *np == '\t' || *np == '\n' || *np == '\r') np++;
+        if (!utf8_ok(kb, strlen(kb))) die("non-utf8 key");
         if (!strcmp(kb, "__metadata__")) {   /* keep value verbatim for byte-faithful replay */
             const char *ve;
             if (*np == '{' || *np == '[') ve = jspan(np);
@@ -315,6 +353,7 @@ static InFile *st_load(const char *path, int fidx) {
         const char *dv = jkey(np, oend, "dtype");
         char dbuf[64];
         if (!dv || *dv != '"' || !jstr(dv, dbuf, sizeof dbuf)) die("bad dtype");
+        if (!utf8_ok(dbuf, strlen(dbuf))) die("non-utf8 dtype");
         t->dtype = xstrdup(dbuf);
         const char *sv = jkey(np, oend, "shape");
         if (!sv) die("bad shape");
@@ -568,6 +607,9 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
 
 /* ================= rANS ================= */
 static inline uint64_t enc(uint64_t x, uint32_t f, uint32_t c, uint8_t **pp) {
+    /* f==0 (a zeroed cell) would loop forever marching pp below the scratch
+       buffer — impossible under the all-ones model invariant; guard anyway */
+    if (!f) die("zero freq");
     while (x >= XMAX(f)) { *--(*pp) = (uint8_t)x; x >>= 8; }
     return ((x / f) << SB) + (x % f) + c;
 }
@@ -586,13 +628,13 @@ static inline uint32_t dsym(const uint16_t *f, const uint32_t *cum, int aw, uint
 static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) {
     for (int b = 0; b < 8; b++) o[4 + b] = (uint8_t)(x >> (8 * (7 - b)));
     uint32_t bl = (uint32_t)(scr_end - pp);
-    memcpy(o, &bl, 4);
+    p32le(o, bl);
     memcpy(o + 12, pp, bl);
     return o + 12 + bl;
 }
 static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *x, const uint8_t **end) {
     if (rp > lim || (uint64_t)(lim - rp) < 12) die("corrupt archive");
-    uint32_t bl; memcpy(&bl, rp, 4); rp += 4;
+    uint32_t bl = g32le(rp); rp += 4;
     *x = 0; for (int b = 0; b < 8; b++) *x = (*x << 8) | rp[b]; rp += 8;
     if ((uint64_t)bl > (uint64_t)(lim - rp)) die("corrupt archive");
     *end = rp + bl;
@@ -683,7 +725,7 @@ static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, u
  */
 static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int rowwise,
                       uint8_t *out, uint64_t *h) {
-    if (P <= 0) return 0;   /* degenerate shape: not applicable */
+    if (P <= 0 || P > ((int64_t)1 << 40)) return 0;  /* degenerate/absurd; po*K must fit i64 */
     int ew = 1 << (15 - mb), mw = 1 << mb, sew = 2 * ew;
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
     int64_t D = n / P;
@@ -727,7 +769,7 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
 }
 static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, int64_t P, int rowwise,
                     uint16_t *s, uint64_t *h) {
-    if (P <= 0) die("bad shape");
+    if (P <= 0 || P > ((int64_t)1 << 40)) die("bad shape");
     int ew = 1 << (15 - mb), mw = 1 << mb, sew = 2 * ew;
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
     int64_t D = n / P;
@@ -988,7 +1030,7 @@ static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
         o = emit_blk(o, scr + SCRSZ, pp, x);
         for (uint64_t i = 0; i < bn; i++) h[cB[i] * DSYMS + sB[i]]++;
     }
-    memcpy(o, &esc_n, 8); o += 8;
+    p64le(o, esc_n); o += 8;
     o += f16_enc(escbuf, esc_n, mb, o, hesc);  /* escapes through FIELD channel */
     w->escbuf = escbuf; w->esc_cap = esc_cap;
     return o - out;
@@ -1041,7 +1083,7 @@ static void dlt_dec_ws(const uint8_t *in, const uint8_t *lim, const uint16_t *re
         rp = end;
     }
     if ((uint64_t)(lim - rp) < 8) die("corrupt delta");
-    uint64_t ne; memcpy(&ne, rp, 8); rp += 8;
+    uint64_t ne = g64le(rp); rp += 8;
     if (ne != escn) die("delta esc count mismatch");
     if (escn) {
         uint16_t *eb = xm(escn * 2);
@@ -1151,7 +1193,7 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
     if (bsz == 2) aw = 65536;
     else if (bsz == 1) aw = 256;
     else aw = 65536;   /* wider atoms: hash first 2 bytes — rare, fallback RAW anyway */
-    int *cnt = xc(aw, 4);
+    uint64_t *cnt = xc(aw, 8);   /* u64: a single atom can legitimately occur >2^32 times */
     uint64_t ne = n / bsz;
     if (bsz == 2) { const uint16_t *s = (const uint16_t *)data; for (uint64_t i = 0; i < ne; i++) cnt[s[i]]++; }
     else { for (uint64_t i = 0; i < ne; i++) cnt[data[i]]++; }
@@ -1160,7 +1202,7 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
     if (k < 1 || k > 256) { free(cnt); return 0; }
     int ib = 0; while ((1 << ib) < k) ib++;
     uint8_t *o = out;
-    memcpy(o, &k, 4); o += 4;
+    p32le(o, (uint32_t)k); o += 4;
     uint16_t dict[256] = { 0 }; int dk = 0;
     for (int i = 0; i < aw; i++) if (cnt[i]) dict[dk++] = (uint16_t)i;
     memcpy(o, dict, k * 2); o += k * 2;
@@ -1168,6 +1210,7 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
     int *rmap = xc(aw, 4);
     for (int i = 0; i < k; i++) rmap[dict[i]] = i;
     /* bitpack ib-bit indices, MSB-first */
+    if (ne > UINT64_MAX / 8) die("pack size");   /* ne*ib must not wrap */
     uint64_t nbits = ne * ib, nbytes = (nbits + 7) / 8;
     memset(o, 0, nbytes);
     uint64_t bit = 0;
@@ -1184,7 +1227,7 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
 }
 static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz, uint8_t *data) {
     if (lim - in < 4) die("corrupt pack");
-    int k; memcpy(&k, in, 4); in += 4;
+    int k = (int)g32le(in); in += 4;
     if (k < 1 || k > 256) die("corrupt pack");
     if ((uint64_t)(lim - in) < (uint64_t)k * 2) die("corrupt pack");
     uint16_t dict[256];
@@ -1210,45 +1253,97 @@ static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz,
 
 /* ================= archive ================= */
 /* archive-stored __metadata__ is replayed verbatim into regenerated headers;
-   it must be a single self-contained JSON value with no NUL bytes (strlen/
-   strcmp would silently truncate at one). */
+   it must be one complete, strictly valid JSON value on a NUL-terminated
+   buffer (all callers copy+terminate first). Balance-only checking is NOT
+   enough: `{"a" 1}` replayed verbatim would emit malformed output JSON. */
+static const char *jws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+/* strict JSON string: every escape must be valid (incl. 4-hex \uXXXX);
+   raw control bytes <0x20 are forbidden by RFC 8259 */
+static const char *jstrv(const char *p) {
+    if (*p != '"') return 0;
+    for (p++;; p++) {
+        uint8_t c = (uint8_t)*p;
+        if (!c) return 0;
+        if (c == '"') return p + 1;
+        if (c < 0x20) return 0;
+        if (c == '\\') {
+            p++;
+            if (!*p) return 0;   /* strchr would match the terminator itself */
+            if (*p == 'u') {
+                for (int k = 1; k <= 4; k++)
+                    if (!isxdigit((uint8_t)p[k])) return 0;
+                p += 4;
+            } else if (!strchr("\"\\/bfnrt", *p)) return 0;
+        }
+    }
+}
+/* JSON number: -? (0|[1-9][0-9]*) (\.[0-9]+)? ([eE][+-]?[0-9]+)? */
+static const char *jnum(const char *s) {
+    if (*s == '-') s++;
+    if (*s == '0') s++;
+    else if (*s >= '1' && *s <= '9') while (*s >= '0' && *s <= '9') s++;
+    else return 0;
+    if (*s == '.') {
+        s++;
+        if (*s < '0' || *s > '9') return 0;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        if (*s < '0' || *s > '9') return 0;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    return s;
+}
+static const char *jval(const char *p, int depth) {
+    if (depth > 128) return 0;          /* crafted nesting vs stack */
+    p = jws(p);
+    if (*p == '"') return jstrv(p);
+    if (*p == '{') {
+        p = jws(p + 1);
+        if (*p == '}') return p + 1;
+        for (;;) {
+            if (*p != '"') return 0;
+            const char *e = jstrv(p);
+            if (!e) return 0;
+            p = jws(e);
+            if (*p != ':') return 0;
+            p = jval(p + 1, depth + 1);
+            if (!p) return 0;
+            p = jws(p);
+            if (*p == '}') return p + 1;
+            if (*p != ',') return 0;
+            p = jws(p + 1);
+        }
+    }
+    if (*p == '[') {
+        p = jws(p + 1);
+        if (*p == ']') return p + 1;
+        for (;;) {
+            p = jval(p, depth + 1);
+            if (!p) return 0;
+            p = jws(p);
+            if (*p == ']') return p + 1;
+            if (*p != ',') return 0;
+            p = jws(p + 1);
+        }
+    }
+    /* strncmp stops at the NUL terminator — memcmp would read past it */
+    if (!strncmp(p, "true", 4)) return p + 4;
+    if (!strncmp(p, "false", 5)) return p + 5;
+    if (!strncmp(p, "null", 4)) return p + 4;
+    return jnum(p);
+}
 static void ck_meta(const uint8_t *m, uint32_t ml) {
     if (!ml) return;
     if (memchr(m, 0, ml)) die("bad metadata");
-    const char *p = (const char *)m, *e = p + ml, *ve = 0;
-    while (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
-    if (p >= e) die("bad metadata");
-    if (*p == '{' || *p == '[') ve = jspan(p);
-    else if (*p == '"') ve = jstr_skip(p);
-    else {   /* scalar: only a real JSON literal is safe to replay verbatim */
-        ve = p;
-        while (ve < e && *ve != ' ' && *ve != '\t' && *ve != '\n' && *ve != '\r') ve++;
-        size_t sl = (size_t)(ve - p);
-        int lit = (sl == 4 && !memcmp(p, "true", 4)) ||
-                  (sl == 5 && !memcmp(p, "false", 5)) ||
-                  (sl == 4 && !memcmp(p, "null", 4));
-        if (!lit) {   /* JSON number: -? (0 | [1-9][0-9]*) (\.[0-9]+)? ([eE][+-]?[0-9]+)? */
-            const char *s = p;
-            if (s < ve && *s == '-') s++;
-            if (s >= ve || (*s != '0' && (*s < '1' || *s > '9'))) die("bad metadata");
-            if (*s == '0') s++; else while (s < ve && *s >= '0' && *s <= '9') s++;
-            if (s < ve && *s == '.') {
-                s++;
-                if (s >= ve || *s < '0' || *s > '9') die("bad metadata");
-                while (s < ve && *s >= '0' && *s <= '9') s++;
-            }
-            if (s < ve && (*s == 'e' || *s == 'E')) {
-                s++;
-                if (s < ve && (*s == '+' || *s == '-')) s++;
-                if (s >= ve || *s < '0' || *s > '9') die("bad metadata");
-                while (s < ve && *s >= '0' && *s <= '9') s++;
-            }
-            if (s != ve) die("bad metadata");
-        }
-    }
-    if (!ve) die("bad metadata");
-    while (ve < e && (*ve == ' ' || *ve == '\t' || *ve == '\n' || *ve == '\r')) ve++;
-    if (ve != e) die("bad metadata");
+    const char *e = jval((const char *)m, 0);
+    if (!e) die("bad metadata");
+    if (jws(e) != (const char *)m + ml) die("bad metadata");  /* trailing junk */
 }
 
 /* duplicate (file,name) records would emit duplicate JSON keys in `d` output.
@@ -1277,6 +1372,16 @@ static void ck_dupname(char **seen, const char *name, int file, uint32_t n, uint
     if (nf_find(seen, cap - 1, name, file)) die("dup tensor in archive");
     nf_put(seen, cap - 1, name, file);
     (void)n;
+}
+
+/* append formatted text to a growing JSON header — guards the one
+   snprintf failure mode that matters: a negative return would wrap jl */
+static void jput(char *j, size_t *jl, size_t hcap, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = vsnprintf(j + *jl, hcap - *jl, fmt, ap);
+    va_end(ap);
+    if (r < 0) die("header emit");
+    *jl += (size_t)r;
 }
 
 /* name->source-index map: v looks up every archive tensor in its source
@@ -1518,12 +1623,12 @@ static size_t prw_enc(const uint16_t *s, uint64_t n, uint64_t cols, int mb,
     DltWs w; dltws_init(&w);
     uint8_t *o = out + 4;
     uint32_t l1 = (uint32_t)f16_enc(s, cols, mb, o, hf);
-    memcpy(out, &l1, 4); o += l1;
+    p32le(out, l1); o += l1;
     for (uint64_t r = 1; r * cols < n; r++) {
         uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
         uint8_t *hdr = o; o += 4;
         uint32_t lr = (uint32_t)dlt_enc_ws(s + r * cols, s + (r - 1) * cols, rn, o, hd, mb, hf, &w);
-        memcpy(hdr, &lr, 4); o += lr;
+        p32le(hdr, lr); o += lr;
     }
     dltws_free(&w);
     return o - out;
@@ -1531,7 +1636,7 @@ static size_t prw_enc(const uint16_t *s, uint64_t n, uint64_t cols, int mb,
 static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t cols,
                     int mb, uint16_t *s, uint64_t *hf, uint64_t *hd) {
     if ((uint64_t)(lim - in) < 4) die("corrupt prw");
-    uint32_t l1; memcpy(&l1, in, 4); in += 4;
+    uint32_t l1 = g32le(in); in += 4;
     if ((uint64_t)l1 > (uint64_t)(lim - in)) die("corrupt prw");
     f16_dec(in, in + l1, cols, mb, s, hf);
     in += l1;
@@ -1539,7 +1644,7 @@ static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t 
     for (uint64_t r = 1; r * cols < n; r++) {
         uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
         if ((uint64_t)(lim - in) < 4) die("corrupt prw");
-        uint32_t lr; memcpy(&lr, in, 4); in += 4;
+        uint32_t lr = g32le(in); in += 4;
         if ((uint64_t)lr > (uint64_t)(lim - in)) { dltws_free(&w); die("corrupt prw"); }
         dlt_dec_ws(in, in + lr, s + (r - 1) * cols, rn, s + r * cols, hd, mb, hf, &w);
         in += lr;
@@ -1675,8 +1780,11 @@ static int prw_gain(const uint16_t *s, uint64_t n, uint64_t cols) {
 /* floor(log2(n) * 2^20) — pure integer, so candidate pruning is
    deterministic across libm implementations/CPUs (a libm log2 differs in
    the last ulp and could flip a marginal gate → different archive bytes
-   for identical input on different machines). */
+   for identical input on different machines). Verified exact over the
+   entire reachable domain [1, 2^22] and at every 2^k boundary; deep-domain
+   values may underestimate by ~1 ulp (bounded, still deterministic). */
 static uint64_t flog2(uint64_t n) {
+    if (!n) return 0;                /* log2(0): defined as 0 here */
     int k = 63 - __builtin_clzll(n);
     uint64_t x = n << (63 - k);          /* m·2^63 for m = n/2^k ∈ [1,2) */
     uint64_t r = (uint64_t)k << 20;
@@ -1695,7 +1803,7 @@ static uint64_t flog2(uint64_t n) {
 /* cheap pre-check: estimate H(SE) - H(SE|pos) on a sample; used to prune
  * FIELDPOS/FIELDROW candidates so ordinary matrices skip the slow encodes */
 static double pos_gain(const uint16_t *s, uint64_t n, int mb, int64_t P, int rowwise) {
-    if (P <= 0) return 0;   /* degenerate shape: no positional gain */
+    if (P <= 0 || P > ((int64_t)1 << 40) || !n) return 0;  /* po*K must fit i64 */
     int ew = 1 << (15 - mb), sew = 2 * ew;
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
     int64_t D = n / P;
@@ -1813,6 +1921,9 @@ typedef struct {
    <=12B per emitted block and small fixed tails (esc_n, dict).
    4*len + len/1024 covers every method incl. DELTA's escape channel. */
 static uint64_t ebound(uint64_t len) {
+    /* 4*len + len/1024 + 64MB must not wrap u64 — len > 2^64/5 keeps the
+       total comfortably below 2^64 (unreachable on real files, off_t-bound) */
+    if (len > UINT64_MAX / 5) die("tensor too large");
     return 4 * len + (len >> 10) + (64u << 20);
 }
 static void *tjob_run(void *a) {
@@ -1868,7 +1979,8 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
     pthread_t *th = xc(nc, sizeof(pthread_t));
     int nsp = ntry < nc ? ntry : nc;
     uint64_t per = ebound(t->len);
-    if (nsp > 1 && per * (uint64_t)nsp > TRYBUD) nsp = (int)(TRYBUD / per);
+    /* division form — per*nsp itself could wrap u64 on absurd lens */
+    if (nsp > 1 && per > TRYBUD / (uint64_t)nsp) nsp = (int)(TRYBUD / per);
     if (nsp < 1) nsp = 1;
     /* rolling best: keep only the current winner's buffer+hist clones so peak
        memory is ~(nsp+1) x ebound, not nc x ebound */
@@ -2004,14 +2116,20 @@ static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
     case M_F32:
         if (!is_f32(t->dtype)) die("bad f32 dtype");
         f32_dec(payload, lim, ne, (uint32_t *)t->data, H(C32)); break;
-    case M_DELTA:
+    case M_DELTA: {
         if (all[t->ref].len != t->len) die("bad ref");
         if (!is_flt16(t->dtype) && !is_f32(t->dtype)) die("bad delta dtype");
+        /* the referent may be a zero-copy RAW pointer into the archive
+           mmap — not necessarily bsz-aligned; copy if misaligned */
+        uint8_t *rh = 0;
+        const uint8_t *rd = alview(all[t->ref].data, t->len, bsz, &rh);
         if (is_f32(t->dtype))
-            dlt32_dec(payload, lim, (uint32_t *)all[t->ref].data, ne, (uint32_t *)t->data, H(C32D));
+            dlt32_dec(payload, lim, (const uint32_t *)rd, ne, (uint32_t *)t->data, H(C32D));
         else
-            dlt_dec(payload, lim, (uint16_t *)all[t->ref].data, ne, (uint16_t *)t->data, H(CD), mbits_of(t->dtype), H(is_bf(t->dtype) ? CBF : CFP));
+            dlt_dec(payload, lim, (const uint16_t *)rd, ne, (uint16_t *)t->data, H(CD), mbits_of(t->dtype), H(is_bf(t->dtype) ? CBF : CFP));
+        free(rh);
         break;
+    }
     case M_DELTAX: {
         if (!is_flt16(t->dtype) && !is_f32(t->dtype)) die("bad delta dtype");
         Tensor *xr = ref_resolve(t);
@@ -2140,10 +2258,13 @@ int main(int argc, char **argv) {
             if (same_out_path(argv[2], g_refs[r]->path)) die("ref == output path");
             if (same_out_path(ctmp, g_refs[r]->path)) die("ref == output tmp path");
         }
+        /* g_outn stays 0 until the tmp is actually ours — a die on a
+           pre-existing foreign/unwritable tmp must not unlink it */
         g_outp = xc(1, sizeof(char *)); g_outp[0] = xstrdup(ctmp);
-        g_outn = 1; g_outok = 0; atexit(out_cleanup);
+        g_outn = 0; g_outok = 0; atexit(out_cleanup);
         FILE *of = xfopen_tmp(ctmp);
         if (!of) die("out");
+        g_outn = 1;
         InFile **ins = xc(nf, sizeof(InFile *));
         int64_t NT64 = 0;
         for (int i = 0; i < nf; i++) {
@@ -2221,6 +2342,11 @@ int main(int argc, char **argv) {
         /* header */
         fwrite("CAI5", 4, 1, of);
         w32(of, nf);
+        /* basename set: dup names and <name>.caiwtmp collisions become
+           membership tests — a pairwise scan is O(nf^2) on huge file lists */
+        uint32_t bcap = 64;
+        while (bcap < 2 * (uint32_t)nf + 1) bcap <<= 1;
+        char **bset = xc(bcap, sizeof(char *));
         for (int i = 0; i < nf; i++) {
             const char *bn = bname(ins[i]->path);
             /* keep enc-side names inside what `d` accepts: no escapes,
@@ -2228,24 +2354,28 @@ int main(int argc, char **argv) {
             if (!*bn || strlen(bn) > 3000 || strchr(bn, '\\') ||
                 !strcmp(bn, ".") || !strcmp(bn, ".."))
                 die("bad input basename");
+            if (nf_find(bset, bcap - 1, bn, 0)) die("duplicate input basename");
+            /* decoder writes <name>.caiwtmp then renames — a pair like
+               (a, a.caiwtmp) would clobber; refuse to emit it */
             char tmpn[3016];
-            snprintf(tmpn, sizeof tmpn, "%s.caiwtmp", bn);   /* bn's own tmp name */
-            for (int j = 0; j < i; j++) {
-                const char *bj = bname(ins[j]->path);
-                if (!strcmp(bn, bj)) die("duplicate input basename");
-                /* decoder writes <name>.caiwtmp then renames — a pair like
-                   (a, a.caiwtmp) would clobber; refuse to emit it */
-                char tj[3016];
-                size_t bl = strlen(bj);          /* <=3000: checked at j's turn */
-                memcpy(tj, bj, bl); memcpy(tj + bl, ".caiwtmp", 9);
-                if (!strcmp(bj, tmpn) || !strcmp(bn, tj))
+            size_t tl = strlen(bn);
+            memcpy(tmpn, bn, tl); memcpy(tmpn + tl, ".caiwtmp", 9);
+            if (nf_find(bset, bcap - 1, tmpn, 0))
+                die("basename collides with temp name");
+            if (tl > 8 && !memcmp(bn + tl - 8, ".caiwtmp", 8)) {
+                /* bn itself is "<pfx>.caiwtmp" — collides if pfx is a member */
+                memcpy(tmpn, bn, tl - 8); tmpn[tl - 8] = 0;
+                if (nf_find(bset, bcap - 1, tmpn, 0))
                     die("basename collides with temp name");
             }
+            nf_put(bset, bcap - 1, bn, 0);
             w32(of, strlen(bn)); fwrite(bn, 1, strlen(bn), of);
             uint32_t ml = ins[i]->meta ? (uint32_t)strlen(ins[i]->meta) : 0;
             w32(of, ml);
             if (ml) fwrite(ins[i]->meta, 1, ml, of);   /* verbatim __metadata__ object */
         }
+        for (uint32_t i = 0; i < bcap; i++) free(bset[i]);
+        free(bset);
         w32(of, NT);
         uint64_t tin = 0, tout = 0;
         uint32_t i = 0;
@@ -2359,6 +2489,18 @@ int main(int argc, char **argv) {
                    --ref source silently destroys a file the decoder is
                    still reading from */
                 int w = snprintf(tb, sizeof tb, "%s/%s", argv[3], fnames[i]);
+                /* truncation skips the check, but is unreachable in practice:
+                   the longer "%s/%s.caiwtmp" path dies at xfopen_tmp first */
+                if (w > 0 && (size_t)w < sizeof tb) {
+                    if (same_out_path(tb, argv[2])) die("output overwrites archive");
+                    for (int r = 0; r < g_nref; r++)
+                        if (same_out_path(tb, g_refs[r]->path))
+                            die("output overwrites --ref input");
+                }
+                /* the .caiwtmp path itself must also be checked: the archive
+                   could BE <outdir>/<name>.caiwtmp — O_TRUNC would destroy
+                   the mmap'd input mid-decode (SIGBUS, not a clean die) */
+                w = snprintf(tb, sizeof tb, "%s/%s.caiwtmp", argv[3], fnames[i]);
                 if (w > 0 && (size_t)w < sizeof tb) {
                     if (same_out_path(tb, argv[2])) die("output overwrites archive");
                     for (int r = 0; r < g_nref; r++)
@@ -2387,12 +2529,13 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < NT; i++) {
             Tensor *t = &all[i];
             uint16_t nl = 0, dl = 0;
-            BND(q, 2); memcpy(&nl, q, 2); q += 2;
+            BND(q, 2); nl = r16(&q);
             BND(q, nl); t->name = xm(nl + 1); memcpy(t->name, q, nl); t->name[nl] = 0; q += nl;
-            if (memchr(t->name, 0, nl) || !strcmp(t->name, "__metadata__")) die("bad name");
-            BND(q, 2); memcpy(&dl, q, 2); q += 2;
+            if (memchr(t->name, 0, nl) || !utf8_ok(t->name, nl) ||
+                !strcmp(t->name, "__metadata__")) die("bad name");
+            BND(q, 2); dl = r16(&q);
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
-            if (memchr(t->dtype, 0, dl)) die("bad dtype");
+            if (memchr(t->dtype, 0, dl) || !utf8_ok(t->dtype, dl)) die("bad dtype");
             BND(q, 1); t->nd = r8(&q);
             if (t->nd > 64) die("bad nd");
             BND(q, 8 * t->nd);
@@ -2441,7 +2584,7 @@ int main(int argc, char **argv) {
         atexit(out_cleanup);
         for (uint32_t i = 0; i < nf; i++) {
             size_t hcap = 1 << 20; char *j = xm(hcap); size_t jl = 0;
-            jl += snprintf(j + jl, hcap - jl, "{");
+            jput(j, &jl, hcap, "{");
             int first = 1;
             if (fmeta[i]) {   /* CAI5: replay __metadata__ verbatim */
                 while (jl + strlen(fmeta[i]) + 64 > hcap) {
@@ -2450,7 +2593,7 @@ int main(int argc, char **argv) {
                         silently misplace all following bytes */
                     hcap *= 2; j = realloc(j, hcap); if (!j) die("oom");
                 }
-                jl += snprintf(j + jl, hcap - jl, "\"__metadata__\":%s", fmeta[i]);
+                jput(j, &jl, hcap, "\"__metadata__\":%s", fmeta[i]);
                 first = 0;
             }
             for (uint32_t k = head[i]; k != 0xFFFFFFFFu; k = nxt[k]) {
@@ -2473,16 +2616,16 @@ int main(int argc, char **argv) {
                 char *en = xm(6 * strlen(t->name) + 1), *ed = xm(6 * strlen(t->dtype) + 1);
                 jesc(en, 6 * strlen(t->name) + 1, t->name);
                 jesc(ed, 6 * strlen(t->dtype) + 1, t->dtype);
-                jl += snprintf(j + jl, hcap - jl, "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[",
-                               first ? "" : ",", en, ed);
+                jput(j, &jl, hcap, "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[",
+                     first ? "" : ",", en, ed);
                 free(en); free(ed);
-                for (int d = 0; d < t->nd; d++) jl += snprintf(j + jl, hcap - jl, "%s%lld", d ? "," : "", (long long)t->shape[d]);
-                jl += snprintf(j + jl, hcap - jl, "],\"data_offsets\":[%llu,%llu]}",
-                               (unsigned long long)foff[i], (unsigned long long)(foff[i] + t->len));
+                for (int d = 0; d < t->nd; d++) jput(j, &jl, hcap, "%s%lld", d ? "," : "", (long long)t->shape[d]);
+                jput(j, &jl, hcap, "],\"data_offsets\":[%llu,%llu]}",
+                     (unsigned long long)foff[i], (unsigned long long)(foff[i] + t->len));
                 foff[i] += t->len;
                 first = 0;
             }
-            jl += snprintf(j + jl, hcap - jl, "}");
+            jput(j, &jl, hcap, "}");
             /* dataoff keeps 2^40 of headroom under INT64_MAX for exactly
                this header — enforce it so hbase+dataoff stays a valid
                positive off_t at every fseeko */
@@ -2559,8 +2702,9 @@ int main(int argc, char **argv) {
             if (wr < 0 || (size_t)wr >= sizeof fin || rename(g_outp[i], fin))
                 die("rename failed");
             /* track the final name too: a later failure unlinks it, so the
-               output set stays all-or-nothing */
-            free(g_outp[i]); g_outp[i] = xstrdup(fin);
+               output set stays all-or-nothing. strdup FIRST — if it dies,
+               g_outp[i] must not be left dangling for out_cleanup's unlink */
+            { char *n2 = xstrdup(fin); free(g_outp[i]); g_outp[i] = n2; }
             fprintf(stderr, "wrote %s\n", fin);
         }
         g_outok = 1;
@@ -2635,12 +2779,13 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < NT; i++) {
             Tensor *t = &all[i];
             uint16_t nl, dl;
-            BND(q, 2); memcpy(&nl, q, 2); q += 2;
+            BND(q, 2); nl = r16(&q);
             BND(q, nl); t->name = xm(nl + 1); memcpy(t->name, q, nl); t->name[nl] = 0; q += nl;
-            if (memchr(t->name, 0, nl) || !strcmp(t->name, "__metadata__")) die("bad name");
-            BND(q, 2); memcpy(&dl, q, 2); q += 2;
+            if (memchr(t->name, 0, nl) || !utf8_ok(t->name, nl) ||
+                !strcmp(t->name, "__metadata__")) die("bad name");
+            BND(q, 2); dl = r16(&q);
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
-            if (memchr(t->dtype, 0, dl)) die("bad dtype");
+            if (memchr(t->dtype, 0, dl) || !utf8_ok(t->dtype, dl)) die("bad dtype");
             BND(q, 1); t->nd = r8(&q);
             if (t->nd > 64) die("bad nd");
             BND(q, 8 * t->nd);

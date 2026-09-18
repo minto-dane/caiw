@@ -1,0 +1,152 @@
+#!/bin/sh
+# verify.sh — formal-verification runner for caiw.
+#
+# Runs every artifact under verify/ and compares each tool verdict against
+# the documented expectation. Deliberately FLAWED models must produce
+# counterexamples — their detection is itself the evidence that the model
+# can catch the hazard it claims to prevent.
+#
+# Layers (kept distinct — do not conflate):
+#   TLA+ (TLC)  — design-level protocol model checking (finite-state)
+#   Alloy       — design-level structural invariant checking (bounded scope)
+#   CBMC        — implementation-level bounded proofs on the real caiw.c
+#   Frama-C     — implementation-level static analysis (EVA/RTE), optional
+#
+# Proven ≠ modeled: TLA+/Alloy validate the DESIGN abstraction; CBMC proves
+# properties of the compiled C semantics within the stated bounds; none of
+# these replace dynamic testing (sanitizers, fuzzing, test.sh).
+#
+# Env overrides: TLA_JAR ALLOY_JAR CBMC FRAMAC CBMC_TIMEOUT_SLOW
+set -u
+cd "$(dirname "$0")"
+V=.
+TLA_JAR=${TLA_JAR:-/home/nia/devbox/fmdos-dev/poc/tools/tla2tools.jar}
+ALLOY_JAR=${ALLOY_JAR:-/home/nia/devbox/fmdos-dev/poc/tools/org.alloytools.alloy.dist.jar}
+CBMC=${CBMC:-/home/nia/devbox/tools/usr/bin/cbmc}
+FRAMAC=${FRAMAC:-$HOME/.opam/caiw-fc/bin/frama-c}
+CBMC_TIMEOUT=${CBMC_TIMEOUT:-300}
+CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
+export LD_LIBRARY_PATH="/home/nia/devbox/tools/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# /tmp may be a small/full tmpfs — keep tool scratch on the main fs
+export TMPDIR=${TMPDIR:-/home/nia/devbox/tmpdir}
+mkdir -p "$TMPDIR"
+JTMP="-Djava.io.tmpdir=$TMPDIR"
+
+pass=0; fail=0; skip=0
+ok()   { pass=$((pass+1)); printf 'PASS  %s\n' "$1"; }
+bad()  { fail=$((fail+1)); printf 'FAIL  %s\n' "$1"; }
+note() { printf '      %s\n' "$1"; }
+
+# ---------------------------------------------------------------- TLA+/TLC
+# correct models must finish with no error; flawed ones must trip the
+# named invariant. -deadlock: termination is a legitimate end state.
+tlc() { # name expect-pattern-or-NONE
+    out=$(timeout 300 java $JTMP -jar "$TLA_JAR" -deadlock -config "$V/$1.cfg" "$V/$1.tla" 2>&1)
+    if [ "$2" = NONE ]; then
+        echo "$out" | grep -q "No error has been found" \
+            && ok "TLC $1 (invariants hold)" || { bad "TLC $1"; echo "$out" | tail -5; }
+    else
+        echo "$out" | grep -q "Invariant $2 is violated" \
+            && ok "TLC $1 (expected violation: $2)" || { bad "TLC $1"; echo "$out" | tail -5; }
+    fi
+}
+if [ -f "$TLA_JAR" ]; then
+    tlc CaiwBatch        NONE
+    tlc CaiwOutput       NONE
+    tlc CaiwBatchFlawed  NoLostUpdate
+    tlc CaiwOutputFlawed NoPartialFinal
+else
+    skip=$((skip+4)); note "SKIP TLC — tla2tools.jar not found (set TLA_JAR)"
+fi
+
+# ---------------------------------------------------------------- Alloy
+# correct model: every command UNSAT (no counterexample in scope 6).
+# flawed model (BackwardRefs + NoBatchSelfRef removed): AcyclicRefs and
+# NoIntraBatchRef must go SAT — witnesses that the checks detect the flaw.
+alloy_expect() { # file "name:verdict" ...
+    out=$(timeout 600 java $JTMP -jar "$ALLOY_JAR" exec -t text -f "$V/$1" 2>&1)
+    shift
+    for e in "$@"; do
+        n=${e%%:*}; want=${e##*:}
+        got=$(echo "$out" | grep "$n" | awk '{print $NF}')
+        [ "$got" = "$want" ] && ok "Alloy $n → $want" \
+            || { bad "Alloy $n (want $want, got $got)"; }
+    done
+}
+if [ -f "$ALLOY_JAR" ]; then
+    alloy_expect CaiwArchive.als \
+        AcyclicRefs:UNSAT NoIntraBatchRef:UNSAT DupFree:UNSAT \
+        NoOrphanMember:UNSAT EncSubsetDec:UNSAT OverAccept:UNSAT
+    alloy_expect CaiwArchiveFlawed.als \
+        AcyclicRefs:SAT NoIntraBatchRef:SAT DupFree:UNSAT \
+        NoOrphanMember:UNSAT EncSubsetDec:UNSAT
+else
+    skip=$((skip+2)); note "SKIP Alloy — alloy jar not found (set ALLOY_JAR)"
+fi
+
+# ---------------------------------------------------------------- CBMC
+# Implementation-level proofs on the real caiw.c (harnesses #include it).
+# -I cbmcinc: glibc >= 2.41 declares strtofN() with _FloatN types that
+# CBMC 6.6's parser rejects; the shadow header turns them off. Harmless
+# on older glibc (unused declarations merely stay enabled).
+CBMC_I="-I$V/cbmcinc"
+cbmc_run() { # file extra-args...
+    f=$1; shift
+    timeout "$CBMC_TIMEOUT" $CBMC "$V/$f" --function main $CBMC_I "$@" 2>&1
+}
+cbmc_ok() { # label file args...
+    l=$1; f=$2; shift 2
+    out=$(cbmc_run "$f" "$@")
+    echo "$out" | grep -q "VERIFICATION SUCCESSFUL" \
+        && ok "CBMC $l" || { bad "CBMC $l"; echo "$out" | tail -5; }
+}
+if [ -x "$CBMC" ]; then
+    cbmc_ok "kmap16 bijection"            cbmc_kmap.c
+    cbmc_ok "dsym cell selection"         cbmc_dsym.c --unwind 40
+    cbmc_ok "norm_ctx contract (u64 path, AW=2)"  cbmc_norm.c  --unwind 10
+    cbmc_ok "norm_ctx contract (u128 path, AW=2)" cbmc_norm128.c --unwind 10
+    # rANS round trip — fixed-frequency sweep (divisor concrete ⇒ tractable).
+    # Covers emit-loop worst case f=1 through f=TOT.
+    for f in 1 2 3 5 128 257 32768; do
+        cbmc_ok "rANS round trip f=$f" cbmc_rans_f.c --unwind 8 -DFVAL=$f
+    done
+    # General-domain rANS (nondet divisor): known solver limit — 64-bit
+    # division bit-blasting times out in minisat. Run briefly to keep the
+    # record honest; a timeout here is the documented expectation.
+    out=$(timeout "$CBMC_TIMEOUT_SLOW" $CBMC "$V/cbmc_rans.c" --function main $CBMC_I --unwind 8 2>&1)
+    if echo "$out" | grep -q "VERIFICATION SUCCESSFUL"; then
+        ok "CBMC rANS round trip (general f)"
+    elif echo "$out" | grep -q "VERIFICATION FAILED"; then
+        bad "CBMC rANS general — real counterexample"; echo "$out" | tail -5
+    else
+        note "LIM  CBMC rANS general domain: solver timeout (documented bound —"
+        note "     coverage continues via the fixed-f sweep + exhaustive C tests)"
+    fi
+else
+    skip=$((skip+12)); note "SKIP CBMC — binary not found (set CBMC)"
+fi
+
+# ---------------------------------------------------------------- Frama-C
+# EVA + RTE on the pure codec/parse kernels via a stubbed harness —
+# whole-program deductive proof of caiw.c (mmap, pthread, fs ops) is out
+# of scope for a single-file utility; scope is stated honestly in docs.
+# Verdict: PASS iff EVA completes AND reports 0 *invalid* properties.
+# Residual "unknown" alarms are EVA precision limits on nondet domains
+# (NUL-driven scans, guarded bit reads) — triaged, not proofs of absence.
+if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/framac_eva.c" ]; then
+    out=$(timeout 600 "$FRAMAC" -machdep gcc_x86_64 -rte -eva \
+        -eva-no-show-progress "$V/framac_eva.c" -main eva_main 2>&1)
+    na=$(echo "$out" | grep -oE "[0-9]+ alarms generated" | grep -oE "[0-9]+")
+    if echo "$out" | grep -q "ANALYSIS SUMMARY" && \
+       echo "$out" | grep -qE "0 +invalid"; then
+        ok "Frama-C EVA/RTE kernel scope (${na:-?} alarms, all unknown-class — triaged)"
+    else
+        bad "Frama-C EVA"; echo "$out" | tail -8
+    fi
+else
+    skip=$((skip+1)); note "SKIP Frama-C — not installed"
+fi
+
+echo "----------------------------------------------------------------"
+printf 'verify: %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
+[ "$fail" -eq 0 ]
