@@ -103,6 +103,12 @@ cbmc_ok() { # label file args...
 if [ -x "$CBMC" ]; then
     cbmc_ok "kmap16 bijection"            cbmc_kmap.c
     cbmc_ok "dsym cell selection"         cbmc_dsym.c --unwind 40
+    # parser trust boundary — per-function bounded instances
+    cbmc_ok "utf8_ok bounded scan (n<=16)"  cbmc_parse.c --unwind 40 -DPICK=1
+    cbmc_ok "hex4 exactly-4 reads"          cbmc_parse.c --unwind 10 -DPICK=2
+    cbmc_ok "jstr bounded dst (S=12)"       cbmc_parse.c --unwind 30 -DPICK=3
+    cbmc_ok "jstr_skip NUL scan (J=16)"     cbmc_parse.c --unwind 30 -DPICK=4
+    cbmc_ok "jspan balanced scan (J=8)"     cbmc_parse.c --unwind 20 -DPICK=5
     cbmc_ok "norm_ctx contract (u64 path, AW=2)"  cbmc_norm.c  --unwind 10
     cbmc_ok "norm_ctx contract (u128 path, AW=2)" cbmc_norm128.c --unwind 10
     # rANS round trip — fixed-frequency sweep (divisor concrete ⇒ tractable).
