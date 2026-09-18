@@ -119,10 +119,10 @@ assert NoOrphanMember {
         (some r.bhead and r.bhead.bat = Head and ord/lt[r.bhead, r])
 }
 
-check AcyclicRefs for 6
-check NoIntraBatchRef for 6
-check DupFree for 6
-check NoOrphanMember for 6
+check AcyclicRefs for 8
+check NoIntraBatchRef for 8
+check DupFree for 8
+check NoOrphanMember for 8
 
 -- ------------------------- emittable subset -------------------------------
 
@@ -150,7 +150,7 @@ assert EncSubsetDec {
     all r: Record | Emittable[r] implies
         (r.meth in (FIELD + FIELDPOS + FIELDROW) implies r.dtype.width = W2)
 }
-check EncSubsetDec for 6
+check EncSubsetDec for 8
 
 -- find over-acceptance surface: archives the decoder accepts that the
 -- encoder would never emit (informs the attack-surface documentation)
