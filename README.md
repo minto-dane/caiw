@@ -51,8 +51,8 @@ regression; `make fuzz` mutation-fuzzes the decoder.
 
 **Competition, not heuristics.** Every candidate encoder runs against a
 clone of the same entropy-model state; the smallest *real* output wins.
-There are no size estimates and no method is trusted blindly — if nothing
-helps, RAW wins.
+Cheap integer estimates may *prune* a hopeless candidate before it runs —
+they never pick the winner — and if nothing helps, RAW wins.
 
 | method | exploits |
 |---|---|
@@ -93,8 +93,9 @@ already-decoded reference tensor.
   bijection; the rANS core is covered by an exhaustive
   boundary sweep (524,537 cases — every frequency × every 256-power
   transition) and `dsym` by 3,264 tables × all 32,768 symbol values.
-- **Deterministic** — fixed `-j` reproduces identical archives;
-  archives are `-j`-independent on the decode side.
+- **Deterministic** — encode decisions are integer-only, so a fixed `-j`
+  reproduces bit-identical archives across machines; archives are
+  `-j`-independent on the decode side.
 
 See `AGENTS.md` for the format specification, the decoder trust-boundary
 checklist, and the full verification log.
