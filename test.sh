@@ -136,10 +136,51 @@ cp out/f32A.st /tmp/tcref.st
 "$BIN" c /tmp/tcref.st --ref /tmp/tcref.st out/f32B.st >/dev/null 2>&1 && { echo "SELF-REF ACCEPTED"; fail=1; }
 cp out/pack1.st /tmp/tcA; cp out/pack1.st /tmp/tcA.caiwtmp
 "$BIN" c /tmp/tcc.caiw /tmp/tcA /tmp/tcA.caiwtmp >/dev/null 2>&1 && { echo "ENCTMP ACCEPTED"; fail=1; }
+# input named exactly <out>.caiwtmp — the tmp fopen must not truncate it
+cp out/pack1.st /tmp/tself.caiw.caiwtmp
+"$BIN" c /tmp/tself.caiw /tmp/tself.caiw.caiwtmp >/dev/null 2>&1 && { echo "TMPSELF ACCEPTED"; fail=1; }
+[ -s /tmp/tself.caiw.caiwtmp ] || { echo "TMPSELF CLOBBERED"; fail=1; }
+# planted symlink at the tmp path — O_NOFOLLOW must refuse it
+rm -f /tmp/symt.caiw.caiwtmp && echo precious > /tmp/precious.txt
+ln -sf /tmp/precious.txt /tmp/symt.caiw.caiwtmp
+"$BIN" c /tmp/symt.caiw out/pack1.st >/dev/null 2>&1 && { echo "SYMTMP ACCEPTED"; fail=1; }
+[ "$(cat /tmp/precious.txt)" = precious ] || { echo "SYMTMP CLOBBERED"; fail=1; }
+# d-side member output landing on a --ref source must be refused
+cp out/f32A.st /tmp/rfout/base.st 2>/dev/null || { mkdir -p /tmp/rfout; cp out/f32A.st /tmp/rfout/base.st; }
+"$BIN" c /tmp/rf.caiw --ref /tmp/rfout/base.st out/f32A.st >/dev/null 2>&1
+cp out/f32A.st /tmp/base.st && "$BIN" c /tmp/rf2.caiw --ref /tmp/rfout/base.st /tmp/base.st >/dev/null 2>&1
+"$BIN" d /tmp/rf2.caiw /tmp/rfout --ref /tmp/rfout/base.st >/dev/null 2>&1 && { echo "D-REF ACCEPTED"; fail=1; }
+[ -s /tmp/rfout/base.st ] || { echo "D-REF CLOBBERED"; fail=1; }
+# unterminated __metadata__ string at a page boundary — must die, not run
+# off the mmap end (the ck_meta buffer is the terminated copy now)
+python3 - <<'PYEOF'
+import struct
+meta = b'"' + b'A' * 4000          # '"' then no closer -> unbounded jstr_skip on raw buf
+rec = struct.pack('<I', 1) + b'a' + struct.pack('<I', len(meta)) + meta
+body = b'CAI5' + struct.pack('<I', 1) + rec + struct.pack('<I', 0)
+body += b'B' * (4096 - len(body) % 4096)   # page-align fsz: scan hits unmapped page
+open('/tmp/metabad.caiw', 'wb').write(body)
+PYEOF
+"$BIN" d /tmp/metabad.caiw /tmp/hzout >/dev/null 2>&1; [ $? -ge 128 ] && { echo "META-SCAN CRASH"; fail=1; }
+"$BIN" v /tmp/metabad.caiw out/pack1.st >/dev/null 2>&1; [ $? -ge 128 ] && { echo "META-SCAN-V CRASH"; fail=1; }
+# sub-byte dtype (F4, non-multiple-of-8 product) — spec floor-div must accept
+python3 - <<'PYEOF'
+import struct, json
+h = json.dumps({'w': {'dtype': 'F4', 'shape': [3], 'data_offsets': [0, 1]}}).encode()
+open('/tmp/f4x.st', 'wb').write(struct.pack('<Q', len(h)) + h + b'\xAB')
+PYEOF
+"$BIN" c /tmp/f4x.caiw /tmp/f4x.st >/dev/null 2>&1 && "$BIN" v /tmp/f4x.caiw /tmp/f4x.st 2>&1 | grep -q "0 bad" || { echo "F4 SUBBYTE FAILED"; fail=1; }
 for f in tests/corpus/*; do
     [ -e "$f" ] || continue
     timeout 10 "$BIN" c /tmp/tz.caiw "$f" -j2 >/dev/null 2>&1; rc=$?
     [ $rc -ge 128 ] && { echo "CRASH on $f rc=$rc"; fail=1; }
+    case "$f" in *.caiw)
+        rm -rf /tmp/cdo; mkdir -p /tmp/cdo
+        timeout 10 "$BIN" d "$f" /tmp/cdo -j2 >/dev/null 2>&1; rc=$?
+        [ $rc -ge 128 ] && { echo "D-CRASH on $f rc=$rc"; fail=1; }
+        timeout 10 "$BIN" v "$f" out/edgeA.st -j2 >/dev/null 2>&1; rc=$?
+        [ $rc -ge 128 ] && { echo "V-CRASH on $f rc=$rc"; fail=1; }
+    ;; esac
 done
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit $fail

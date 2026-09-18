@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <libgen.h>
+#include <errno.h>
 #include <pthread.h>
 
 /* length arithmetic is u64 throughout; size_t must not truncate it */
@@ -100,6 +101,7 @@ typedef struct Tensor {
     uint64_t dataoff;           /* decode: output offset within file data region */
     int method; uint32_t ref; uint64_t plen; uint32_t crc;
     int bat;                    /* decoded: member of a parallel batch */
+    uint64_t dlivc;             /* decode: bytes charged against g_dlive */
     struct Tensor *xreft;       /* external --ref match, or NULL */
     int xfile;                  /* which --ref file xreft came from */
     uint32_t candref[4]; int ncand; /* intra DELTA ref candidates */
@@ -107,7 +109,7 @@ typedef struct Tensor {
 
 typedef struct {
     char *path; Tensor *t; int n;
-    uint8_t *base; uint64_t bsz_; int mapped;
+    uint8_t *base; int mapped;
     char *meta;                 /* verbatim __metadata__ object text or NULL */
 } InFile;
 static InFile **g_refs = NULL; static int g_nref = 0;
@@ -326,8 +328,12 @@ static InFile *st_load(const char *path, int fidx) {
                 while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
                 if (*q < '0' || *q > '9') die("bad shape");
                 if (t->nd >= 64) die("too many dims");
-                char *e2;
-                t->shape[t->nd++] = strtoll(q, &e2, 10);
+                char *e2; errno = 0;
+                t->shape[t->nd] = strtoll(q, &e2, 10);
+                if (errno == ERANGE) die("bad shape");  /* out-of-range digits
+                    would silently clamp to LLONG_MAX, corrupting the replayed
+                    header value */
+                t->nd++;
                 q = e2;
                 while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
                 if (*q == ']') { q++; break; }
@@ -343,12 +349,16 @@ static InFile *st_load(const char *path, int fidx) {
             if (*q != '[') die("bad data_offsets");
             q++;
             while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-            a = strtoull(q, &e2, 10);
-            for (q = e2; *q == ' ' || *q == '\t'; q++) ;
+            if (*q < '0' || *q > '9') die("bad data_offsets");   /* no +/-, no empty */
+            errno = 0; a = strtoull(q, &e2, 10);
+            if (errno == ERANGE) die("bad data_offsets");
+            for (q = e2; *q == ' ' || *q == '\t' || *q == '\n' || *q == '\r'; q++) ;
             if (*q != ',') die("bad data_offsets");
             q++;
             while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-            b = strtoull(q, &e2, 10);
+            if (*q < '0' || *q > '9') die("bad data_offsets");
+            errno = 0; b = strtoull(q, &e2, 10);
+            if (errno == ERANGE) die("bad data_offsets");
             for (q = e2; *q == ' ' || *q == '\t' || *q == '\n' || *q == '\r'; q++) ;
             if (*q != ']') die("bad data_offsets");
             q++;
@@ -378,12 +388,15 @@ static InFile *st_load(const char *path, int fidx) {
             die("truncated input");
     }
     /* mmap data region (handles >RAM inputs); fall back to fread.
+       Map the ALREADY-OPEN fileno(f): a second open(path) would let a
+       racing rename hand us a different inode than the one whose header
+       we just parsed (size mismatch → SIGBUS, or silent mis-read).
        NOTE: mmap offset must be page-aligned — map from the aligned
        boundary and shift base by the delta, else EINVAL always triggers
        the malloc+fread fallback and loads the whole file into RAM. */
-    int fd = open(path, O_RDONLY);
-    inf->mapped = 0; inf->bsz_ = dsz;
-    if (fd >= 0) {
+    int fd = fileno(f);
+    inf->mapped = 0;
+    {
         uint64_t dstart = 8 + hl;
         off_t aoff = (off_t)(dstart & ~4095ull);
         void *m = mmap(NULL, dsz + (dstart - (uint64_t)aoff), PROT_READ, MAP_PRIVATE, fd, aoff);
@@ -399,7 +412,6 @@ static InFile *st_load(const char *path, int fidx) {
         if (dsz && fread(inf->base, 1, dsz, f) != dsz) die("data");
     }
     fclose(f);
-    if (fd >= 0) close(fd);
     for (int i = 0; i < inf->n; i++) inf->t[i].data = inf->base + inf->t[i].off;
     return inf;
 }
@@ -421,7 +433,9 @@ static int dbits(const char *d) {
     if (!strcmp(d, "F4") || !strcmp(d, "I4") || !strcmp(d, "U4")) return 4;
     return -1;
 }
-/* safetensors invariant: prod(shape) * dtype_bits == len * 8.
+/* safetensors invariant: len == prod(shape) * dtype_bits / 8 — the spec
+   uses integer division, so sub-byte dtypes (F4/F6) whose product isn't a
+   multiple of 8 are still valid (the remainder bits are simply absent).
    Also bounds pos_dec's ctx index (po*K/P) to < K. Unknown dtypes are
    treated as opaque bytes (round-trip is still byte-exact). */
 static void ck_shape_len(const Tensor *t) {
@@ -432,7 +446,7 @@ static void ck_shape_len(const Tensor *t) {
         prod *= (uint64_t)t->shape[d];
         if (prod > UINT64_MAX) die("bad shape");
     }
-    if (prod * (unsigned)bits != (unsigned __int128)t->len * 8) die("shape/len mismatch");
+    if (prod * (unsigned)bits / 8 != (unsigned __int128)t->len) die("shape/len mismatch");
 }
 static int is_bf(const char *d) { return !strcmp(d, "BF16"); }
 static int is_f16(const char *d) { return !strcmp(d, "F16"); }
@@ -481,7 +495,9 @@ static void dlim_init(void) {
         char ln[256];
         while (fgets(ln, sizeof ln, f))
             if (!strncmp(ln, "MemAvailable:", 13)) {
-                g_dlim = strtoull(ln + 13, 0, 10) * 1024ull;
+                errno = 0;
+                uint64_t kb = strtoull(ln + 13, 0, 10);
+                if (!errno && kb <= UINT64_MAX / 1024) g_dlim = kb * 1024;
                 break;
             }
         fclose(f);
@@ -1263,6 +1279,24 @@ static void ck_dupname(char **seen, const char *name, int file, uint32_t n, uint
     (void)n;
 }
 
+/* name->source-index map: v looks up every archive tensor in its source
+   file — a per-tensor O(n) strcmp scan is quadratic on crafted archives */
+typedef struct { char **k; int32_t *v; uint64_t m; } NMap;
+static void nm_build(NMap *M, Tensor *t, int n) {
+    uint64_t c = 64; while (c < (uint64_t)n * 2) c *= 2;
+    M->m = c - 1; M->k = xc(c, 8); M->v = xc(c, 4);
+    for (int j = 0; j < n; j++) {
+        uint64_t i = nfh(t[j].name, 0) & M->m;
+        while (M->k[i]) i = (i + 1) & M->m;
+        M->k[i] = t[j].name; M->v[i] = j;
+    }
+}
+static int nm_get(const NMap *M, const char *name) {
+    for (uint64_t i = nfh(name, 0) & M->m; M->k[i]; i = (i + 1) & M->m)
+        if (!strcmp(M->k[i], name)) return M->v[i];
+    return -1;
+}
+
 /* archive integers are explicitly little-endian (portable format) */
 static void w64(FILE *f, uint64_t v) { uint8_t b[8]; for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (8 * i)); fwrite(b, 8, 1, f); }
 static void w32(FILE *f, uint32_t v) { uint8_t b[4]; for (int i = 0; i < 4; i++) b[i] = (uint8_t)(v >> (8 * i)); fwrite(b, 4, 1, f); }
@@ -1324,6 +1358,19 @@ static void drop_pages(const void *p, uint64_t n, int mapped) {
 static const char *bname(const char *p) {
     const char *s = strrchr(p, '/');
     return s ? s + 1 : p;
+}
+
+static FILE *xfopen_tmp(const char *p) {
+    /* Temp outputs must not follow a planted symlink (overwrite primitive
+       in a shared dir) or block on a planted FIFO: O_NOFOLLOW refuses
+       symlink finals (ELOOP), O_NONBLOCK fails an unreader'd FIFO (ENXIO)
+       and is then cleared so normal writes aren't affected. */
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (fd < 0) return 0;
+    fcntl(fd, F_SETFL, 0);
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
 }
 
 /* is `out` the same file as `in`?  Plain strcmp misses symlink/hardlink
@@ -1625,6 +1672,26 @@ static int prw_gain(const uint16_t *s, uint64_t n, uint64_t cols) {
     return cnt && est / cnt < 9.0;
 }
 
+/* floor(log2(n) * 2^20) — pure integer, so candidate pruning is
+   deterministic across libm implementations/CPUs (a libm log2 differs in
+   the last ulp and could flip a marginal gate → different archive bytes
+   for identical input on different machines). */
+static uint64_t flog2(uint64_t n) {
+    int k = 63 - __builtin_clzll(n);
+    uint64_t x = n << (63 - k);          /* m·2^63 for m = n/2^k ∈ [1,2) */
+    uint64_t r = (uint64_t)k << 20;
+    for (int i = 19; i >= 0; i--) {
+        __uint128_t x2 = (__uint128_t)x * x;   /* m² · 2^126 */
+        if (x2 >= ((__uint128_t)1 << 127)) {   /* m ≥ √2 → next bit is 1 */
+            r |= 1ull << i;
+            x = (uint64_t)(x2 >> 64);          /* (m²/2) · 2^63 */
+        } else {
+            x = (uint64_t)(x2 >> 63);          /* m² · 2^63 */
+        }
+    }
+    return r;
+}
+
 /* cheap pre-check: estimate H(SE) - H(SE|pos) on a sample; used to prune
  * FIELDPOS/FIELDROW candidates so ordinary matrices skip the slow encodes */
 static double pos_gain(const uint16_t *s, uint64_t n, int mb, int64_t P, int rowwise) {
@@ -1641,23 +1708,32 @@ static double pos_gain(const uint16_t *s, uint64_t n, int mb, int64_t P, int row
         uint32_t SE = s[i] >> mb;
         jh[ctx * sew + SE]++; mh[SE]++;
     }
-    double H0 = 0, H1 = 0;
-    for (int i = 0; i < sew; i++) if (mh[i]) { double p = (double)mh[i] / ns; H0 -= p * log2(p); }
+    /* H0 - H1 = [ns·log2 ns - Σmh·log2 mh - Σtot·log2 tot + Σjh·log2 jh]/ns
+       — all in Q20 fixed point via flog2; deterministic everywhere */
+    __int128_t sum = (__int128_t)ns * (__int128_t)flog2(ns);
+    for (int i = 0; i < sew; i++) if (mh[i]) sum -= (__int128_t)mh[i] * (__int128_t)flog2(mh[i]);
     for (int64_t c = 0; c < K; c++) {
         uint64_t tot = 0;
         for (int i = 0; i < sew; i++) tot += jh[c * sew + i];
         if (!tot) continue;
+        sum -= (__int128_t)tot * (__int128_t)flog2(tot);
         for (int i = 0; i < sew; i++)
-            if (jh[c * sew + i]) { double p = (double)jh[c * sew + i] / tot; H1 -= ((double)tot / ns) * p * log2(p); }
+            if (jh[c * sew + i]) sum += (__int128_t)jh[c * sew + i] * (__int128_t)flog2(jh[c * sew + i]);
     }
     free(jh); free(mh);
-    return H0 - H1;
+    /* IEEE double division is correctly rounded → still deterministic */
+    return sum > 0 ? (double)(uint64_t)sum / ((double)ns * 1048576.0) : 0;
 }
 
-static Tensor *ref_find(const char *name) {
+static Tensor *ref_find(const char *name, const Tensor *t) {
+    /* first name+len+dtype match — a same-named incompatible tensor must
+       not shadow a compatible one later in the file */
     for (int r = 0; r < g_nref; r++)
-        for (int j = 0; j < g_refs[r]->n; j++)
-            if (!strcmp(g_refs[r]->t[j].name, name)) return &g_refs[r]->t[j];
+        for (int j = 0; j < g_refs[r]->n; j++) {
+            Tensor *xr = &g_refs[r]->t[j];
+            if (!strcmp(xr->name, name) && xr->len == t->len &&
+                !strcmp(xr->dtype, t->dtype)) return xr;
+        }
     return NULL;
 }
 
@@ -1876,8 +1952,26 @@ static void hsnap(uint64_t *snap[NCH]) {
 }
 
 /* ================= decode ================= */
+/* Per-in-flight decode scratch the tensor buffer itself doesn't cover:
+   DELTA16 escape pos+value buffers ≈ 5x len, DELTA32 plane buffer ≈ len,
+   DELTAX aligned ref copy ≈ len, positional-ctx tables ≈ 17MB+.  Charged
+   alongside t->len so g_dlive reflects real peak RSS, not just outputs. */
+static uint64_t dec_aux(const Tensor *t) {
+    int bsz = dtb(t->dtype);
+    switch (t->method) {
+    case M_DELTA:  return (bsz == 2 ? 6 : 1) * t->len + (4u << 20);
+    case M_DELTAX: return (bsz == 2 ? 6 : 2) * t->len + (4u << 20);
+    case M_PRW:    return t->len / 4 + (4u << 20);
+    case M_FIELDPOS: case M_FIELDROW: return 34ull << 20;
+    case M_F32:    return 4ull << 20;
+    default:       return 1u << 20;
+    }
+}
+
 static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
-    if (__sync_add_and_fetch(&g_dlive, t->len) > g_dlim)
+    uint64_t ch = t->len + dec_aux(t);
+    t->dlivc = ch;
+    if (__sync_add_and_fetch(&g_dlive, ch) > g_dlim)
         die("decoded set exceeds available memory");
     t->data = xc(t->len ? t->len : 1, 1);   /* zeroed: malformed short decodes can't leave indeterminate bytes */
     int bsz = dtb(t->dtype);
@@ -1891,9 +1985,13 @@ static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
         if (bsz > 2) die("bad pack dtype");
         pack_dec(payload, lim, t->len, bsz, t->data); break;
     case M_REF:
+        if (t->plen) die("corrupt ref");
         if (all[t->ref].len != t->len) die("bad ref");
         memcpy(t->data, all[t->ref].data, t->len); break;
-    case M_U8: u8_dec(payload, lim, t->len, t->data, H(C8)); break;
+    case M_U8:
+        /* encoder only omits U8 for flt16 — reject that non-canonical pair */
+        if (is_flt16(t->dtype)) die("bad u8 dtype");
+        u8_dec(payload, lim, t->len, t->data, H(C8)); break;
     case M_FIELD:
         if (!is_flt16(t->dtype)) die("bad field dtype");
         f16_dec(payload, lim, ne, mbits_of(t->dtype), (uint16_t *)t->data, H(is_bf(t->dtype) ? CBF : CFP)); break;
@@ -2009,9 +2107,13 @@ int main(int argc, char **argv) {
             const char *v = argv[i] + 2; int eat = 1;
             if (!*v) { if (i + 1 >= argc) die("-j needs a count"); v = argv[i + 1]; eat = 2; }
             for (const char *d = v; *d; d++) if (*d < '0' || *d > '9') die("-j needs digits");
-            g_threads = atoi(v);
-            if (g_threads < 1) g_threads = 1;
-            if (g_threads > 64) g_threads = 64;
+            unsigned nj = 0;   /* atoi on an over-long digit string is UB —
+                                  accumulate with an early cap instead */
+            for (const char *d = v; *d; d++) {
+                nj = nj * 10 + (unsigned)(*d - '0');
+                if (nj > 64) { nj = 64; break; }
+            }
+            g_threads = nj < 1 ? 1 : (int)nj;
             memmove(&argv[i], &argv[i + eat], (argc - i - eat + 1) * sizeof(char *));
             argc -= eat; i--;
         }
@@ -2024,23 +2126,32 @@ int main(int argc, char **argv) {
         char ctmp[8192];
         int cw = snprintf(ctmp, sizeof ctmp, "%s.caiwtmp", argv[2]);
         if (cw < 0 || (size_t)cw >= sizeof ctmp) die("output path too long");
-        g_outp = xc(1, sizeof(char *)); g_outp[0] = xstrdup(ctmp);
-        g_outn = 1; g_outok = 0; atexit(out_cleanup);
-        FILE *of = fopen(ctmp, "wb");
-        if (!of) die("out");
         int nf = argc - 3;
         if (nf > 65535) die("too many inputs");   /* file_idx field is u16 */
+        /* path-identity checks BEFORE opening ctmp: fopen would truncate a
+           same-named input (c foo foo.caiwtmp), and a rename could later
+           clobber inputs/refs via aliases (links, "dir/../x", symlinked
+           parents). Both the final name and the temp name are checked. */
+        for (int i = 0; i < nf; i++) {
+            if (same_out_path(argv[2], argv[3 + i])) die("input == output path");
+            if (same_out_path(ctmp, argv[3 + i])) die("input == output tmp path");
+        }
+        for (int r = 0; r < g_nref; r++) {
+            if (same_out_path(argv[2], g_refs[r]->path)) die("ref == output path");
+            if (same_out_path(ctmp, g_refs[r]->path)) die("ref == output tmp path");
+        }
+        g_outp = xc(1, sizeof(char *)); g_outp[0] = xstrdup(ctmp);
+        g_outn = 1; g_outok = 0; atexit(out_cleanup);
+        FILE *of = xfopen_tmp(ctmp);
+        if (!of) die("out");
         InFile **ins = xc(nf, sizeof(InFile *));
         int64_t NT64 = 0;
         for (int i = 0; i < nf; i++) {
-            /* c a.st a.st would rename the archive over its own source;
-               aliases (links, "dir/../x") count too */
-            if (same_out_path(argv[2], argv[3 + i])) die("input == output path");
             ins[i] = st_load(argv[3 + i], i); NT64 += ins[i]->n;
         }
-        for (int r = 0; r < g_nref; r++)
-            if (same_out_path(argv[2], g_refs[r]->path)) die("ref == output path");
-        if (NT64 > 0x7FFFFFFFll) die("too many tensors");   /* NT is int below */
+        /* decoder caps NT at 2^29 (dseen pow2 table ≤ 2^30) — enforce the
+           same bound here so encode can't emit an archive it can't read */
+        if (NT64 > (1ll << 29)) die("too many tensors");
         int NT = (int)NT64;
         Tensor *all = xc(NT, sizeof(Tensor));
         int ti = 0;
@@ -2066,7 +2177,7 @@ int main(int argc, char **argv) {
             all[i].xreft = NULL; all[i].xfile = 0;
             if (g_nref) {
                 int ri = 0;
-                Tensor *xr = g_nref > 1 ? ref_find_best(&all[i], &ri) : ref_find(all[i].name);
+                Tensor *xr = g_nref > 1 ? ref_find_best(&all[i], &ri) : ref_find(all[i].name, &all[i]);
                 if (xr && xr->len == all[i].len && !strcmp(xr->dtype, all[i].dtype)) {
                     all[i].xreft = xr; all[i].xfile = ri;
                 }
@@ -2125,7 +2236,8 @@ int main(int argc, char **argv) {
                 /* decoder writes <name>.caiwtmp then renames — a pair like
                    (a, a.caiwtmp) would clobber; refuse to emit it */
                 char tj[3016];
-                snprintf(tj, sizeof tj, "%s.caiwtmp", bj);
+                size_t bl = strlen(bj);          /* <=3000: checked at j's turn */
+                memcpy(tj, bj, bl); memcpy(tj + bl, ".caiwtmp", 9);
                 if (!strcmp(bj, tmpn) || !strcmp(bn, tj))
                     die("basename collides with temp name");
             }
@@ -2230,7 +2342,7 @@ int main(int argc, char **argv) {
             nf_put(fset, fcap - 1, fnames[i], 0);
             if (cver >= 5) {   /* CAI5: verbatim __metadata__ per file */
                 BND(p, 4); uint32_t ml = r32(&p); BND(p, ml);
-                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; ck_meta(p, ml); }
+                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; ck_meta((const uint8_t *)fmeta[i], ml); }
                 p += ml;
             }
         }
@@ -2243,18 +2355,31 @@ int main(int argc, char **argv) {
                 snprintf(tb, sizeof tb, "%s.caiwtmp", fnames[i]);
                 if (nf_find(fset, fcap - 1, tb, 0)) die("filename collides with temp name");
                 /* a member whose output path IS the archive would clobber
-                   its own input mid-decode */
+                   its own input mid-decode; likewise a member landing on a
+                   --ref source silently destroys a file the decoder is
+                   still reading from */
                 int w = snprintf(tb, sizeof tb, "%s/%s", argv[3], fnames[i]);
-                if (w > 0 && (size_t)w < sizeof tb && same_out_path(tb, argv[2]))
-                    die("output overwrites archive");
+                if (w > 0 && (size_t)w < sizeof tb) {
+                    if (same_out_path(tb, argv[2])) die("output overwrites archive");
+                    for (int r = 0; r < g_nref; r++)
+                        if (same_out_path(tb, g_refs[r]->path))
+                            die("output overwrites --ref input");
+                }
             }
         }
         BND(p, 4); uint32_t NT = r32(&p);
         BND(p, (uint64_t)NT * 28);  /* minimum record size */
-        Tensor *all = xc(NT, sizeof(Tensor));
         uint64_t dc64 = 64; while (dc64 < (uint64_t)NT * 2) dc64 *= 2;
         if (dc64 > (1ull << 30)) die("too many tensors");
         uint32_t dcap = (uint32_t)dc64;   /* open-addressed set, pow2, load<0.5 */
+        /* the record table amplifies the archive ~22x (≈640B/Tensor +
+           names + the dup-name set) — count it against the residency cap
+           before allocating, else a small archive can calloc its way into
+           OOM territory */
+        uint64_t meta = (uint64_t)NT * (sizeof(Tensor) + 512) + (uint64_t)dcap * 16;
+        if (__sync_add_and_fetch(&g_dlive, meta) > g_dlim)
+            die("archive metadata exceeds memory");
+        Tensor *all = xc(NT, sizeof(Tensor));
         char **dseen = xc(dcap, sizeof(char *));
         /* pass 1: metadata walk — no decode */
         const uint8_t *q = p;
@@ -2264,7 +2389,7 @@ int main(int argc, char **argv) {
             uint16_t nl = 0, dl = 0;
             BND(q, 2); memcpy(&nl, q, 2); q += 2;
             BND(q, nl); t->name = xm(nl + 1); memcpy(t->name, q, nl); t->name[nl] = 0; q += nl;
-            if (memchr(t->name, 0, nl)) die("bad name");
+            if (memchr(t->name, 0, nl) || !strcmp(t->name, "__metadata__")) die("bad name");
             BND(q, 2); memcpy(&dl, q, 2); q += 2;
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
             if (memchr(t->dtype, 0, dl)) die("bad dtype");
@@ -2287,6 +2412,8 @@ int main(int argc, char **argv) {
                 BND(q, 4); t->ref = r32(&q);
                 if (t->ref >= i) die("bad ref");
                 if (t->bat == 2 && t->ref >= bstart) die("ref into open batch");
+                if (t->method == M_DELTA && strcmp(all[t->ref].dtype, t->dtype))
+                    die("bad delta ref");
             } else if (t->method == M_DELTAX) { BND(q, 4); t->ref = r32(&q); }
             BND(q, 8); t->plen = r64(&q);
             BND(q, 4); t->crc = r32(&q);
@@ -2296,6 +2423,16 @@ int main(int argc, char **argv) {
             else if (!t->bat) bstart = i + 1;
         }
         if (q != bend) die("trailing data after last record");
+        /* per-file record order: single pass buckets — an nf*NT scan would
+           be quadratic on crafted archives */
+        uint32_t *head = xc(nf ? nf : 1, 4), *tail = xc(nf ? nf : 1, 4),
+                 *nxt = xc(NT ? NT : 1, 4);
+        for (uint32_t i = 0; i < nf; i++) head[i] = tail[i] = 0xFFFFFFFFu;
+        for (uint32_t k = 0; k < NT; k++) {
+            uint32_t f = (uint32_t)all[k].file; nxt[k] = 0xFFFFFFFFu;
+            if (head[f] == 0xFFFFFFFFu) head[f] = k; else nxt[tail[f]] = k;
+            tail[f] = k;
+        }
         /* per-file offsets + write headers + open outfiles */
         uint64_t *foff = xc(nf, 8), *hbase = xc(nf, 8);
         FILE **ofs = xc(nf, sizeof(FILE *));
@@ -2307,20 +2444,27 @@ int main(int argc, char **argv) {
             jl += snprintf(j + jl, hcap - jl, "{");
             int first = 1;
             if (fmeta[i]) {   /* CAI5: replay __metadata__ verbatim */
-                while (jl + strlen(fmeta[i]) + 64 > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
+                while (jl + strlen(fmeta[i]) + 64 > hcap) {
+                    if (hcap >= (1u << 30)) die("header too large");   /* keep every
+                        snprintf under INT_MAX — an EOVERFLOW return of -1 would
+                        silently misplace all following bytes */
+                    hcap *= 2; j = realloc(j, hcap); if (!j) die("oom");
+                }
                 jl += snprintf(j + jl, hcap - jl, "\"__metadata__\":%s", fmeta[i]);
                 first = 0;
             }
-            for (uint32_t k = 0; k < NT; k++) {
+            for (uint32_t k = head[i]; k != 0xFFFFFFFFu; k = nxt[k]) {
                 Tensor *t = &all[k];
-                if (t->file != (int)i) continue;
                 /* whole-record bound: 6x escape growth + dims + fixed fields;
                    must cover EVERYTHING the snprintf calls below emit, since a
                    truncated snprintf returns its full would-be length and jl
                    would overflow hcap on the next call. */
                 size_t need = 7 * (strlen(t->name) + strlen(t->dtype)) +
                               24 * ((size_t)t->nd + 1) + 128;
-                while (jl + need > hcap) { hcap *= 2; j = realloc(j, hcap); if (!j) die("oom"); }
+                while (jl + need > hcap) {
+                    if (hcap >= (1u << 30)) die("header too large");
+                    hcap *= 2; j = realloc(j, hcap); if (!j) die("oom");
+                }
                 /* off_t is signed: data_offset + header base must stay <
                    INT64_MAX — leave 2^40 headroom for the JSON header */
                 if (t->len > (uint64_t)INT64_MAX - foff[i] - (1ull << 40))
@@ -2339,12 +2483,16 @@ int main(int argc, char **argv) {
                 first = 0;
             }
             jl += snprintf(j + jl, hcap - jl, "}");
+            /* dataoff keeps 2^40 of headroom under INT64_MAX for exactly
+               this header — enforce it so hbase+dataoff stays a valid
+               positive off_t at every fseeko */
+            if (jl > (1ull << 40) - 8) die("regenerated header too large");
             /* write to .caiwtmp then rename: a crash mid-run must never
                leave a complete-looking truncated .st behind */
             int wr = snprintf(tmp, sizeof tmp, "%s/%s.caiwtmp", argv[3], fnames[i]);
             if (wr < 0 || (size_t)wr >= sizeof tmp) die("output path too long");
             g_outp[i] = xstrdup(tmp);
-            ofs[i] = fopen(tmp, "wb");
+            ofs[i] = xfopen_tmp(tmp);
             if (!ofs[i]) die("out file");
             w64(ofs[i], jl); fwrite(j, 1, jl, ofs[i]);
             hbase[i] = 8 + jl;
@@ -2372,7 +2520,7 @@ int main(int argc, char **argv) {
                     if (t->len && fwrite(wd, 1, t->len, of) != t->len) die("write");
                     drop_pages(buf + t->off, t->plen, g_amap);
                     if (!keep[k] && t->data) {
-                        __sync_sub_and_fetch(&g_dlive, t->len);
+                        __sync_sub_and_fetch(&g_dlive, t->dlivc);
                         free(t->data); t->data = 0;
                     }
                 }
@@ -2398,7 +2546,7 @@ int main(int argc, char **argv) {
             if (t->len && fwrite(t->data, 1, t->len, of) != t->len) die("write");
             drop_pages(buf + t->off, t->plen, g_amap);
             if (!keep[i] && t->data) {
-                __sync_sub_and_fetch(&g_dlive, t->len);
+                __sync_sub_and_fetch(&g_dlive, t->dlivc);
                 free(t->data); t->data = 0;
             }
             i++;
@@ -2427,6 +2575,8 @@ int main(int argc, char **argv) {
         if (nf > 65535) die("too many inputs");   /* positional match to u16 file idx */
         InFile **ins = xc(nf, sizeof(InFile *));
         for (int i = 0; i < nf; i++) ins[i] = st_load(argv[3 + i], i);
+        NMap *nmap = xc(nf, sizeof(NMap));
+        for (int i = 0; i < nf; i++) nm_build(&nmap[i], ins[i]->t, ins[i]->n);
         const uint8_t *p = buf, *bend = buf + fsz;
         BND(p, 4);
         int cver;
@@ -2449,7 +2599,7 @@ int main(int argc, char **argv) {
             nf_put(fset, fcap - 1, fnames[i], 0);
             if (cver >= 5) {
                 BND(p, 4); uint32_t ml = r32(&p); BND(p, ml);
-                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; ck_meta(p, ml); }
+                if (ml) { fmeta[i] = xm(ml + 1); memcpy(fmeta[i], p, ml); fmeta[i][ml] = 0; ck_meta((const uint8_t *)fmeta[i], ml); }
                 p += ml;
             }
         }
@@ -2471,10 +2621,13 @@ int main(int argc, char **argv) {
         BND(p, 4); uint32_t NT = r32(&p);
         BND(p, (uint64_t)NT * 28);
         model_init();
-        Tensor *all = xc(NT, sizeof(Tensor));
         uint64_t dc64 = 64; while (dc64 < (uint64_t)NT * 2) dc64 *= 2;
         if (dc64 > (1ull << 30)) die("too many tensors");
         uint32_t dcap = (uint32_t)dc64;
+        uint64_t meta = (uint64_t)NT * (sizeof(Tensor) + 512) + (uint64_t)dcap * 16;
+        if (__sync_add_and_fetch(&g_dlive, meta) > g_dlim)
+            die("archive metadata exceeds memory");
+        Tensor *all = xc(NT, sizeof(Tensor));
         char **dseen = xc(dcap, sizeof(char *));
         /* pass 1: metadata + payload offsets, keep flags */
         const uint8_t *q = p;
@@ -2484,7 +2637,7 @@ int main(int argc, char **argv) {
             uint16_t nl, dl;
             BND(q, 2); memcpy(&nl, q, 2); q += 2;
             BND(q, nl); t->name = xm(nl + 1); memcpy(t->name, q, nl); t->name[nl] = 0; q += nl;
-            if (memchr(t->name, 0, nl)) die("bad name");
+            if (memchr(t->name, 0, nl) || !strcmp(t->name, "__metadata__")) die("bad name");
             BND(q, 2); memcpy(&dl, q, 2); q += 2;
             BND(q, dl); t->dtype = xm(dl + 1); memcpy(t->dtype, q, dl); t->dtype[dl] = 0; q += dl;
             if (memchr(t->dtype, 0, dl)) die("bad dtype");
@@ -2507,6 +2660,8 @@ int main(int argc, char **argv) {
                 BND(q, 4); t->ref = r32(&q);
                 if (t->ref >= i) die("bad ref");
                 if (t->bat == 2 && t->ref >= bstart) die("ref into open batch");
+                if (t->method == M_DELTA && strcmp(all[t->ref].dtype, t->dtype))
+                    die("bad delta ref");
             } else if (t->method == M_DELTAX) { BND(q, 4); t->ref = r32(&q); }
             BND(q, 8); t->plen = r64(&q);
             BND(q, 4); t->crc = r32(&q);
@@ -2545,8 +2700,8 @@ int main(int argc, char **argv) {
                 Tensor *t = &all[k];
                 if (t->file >= nf) { fprintf(stderr, "BADFILE %s\n", t->name); bad++; continue; }
                 InFile *src = ins[t->file];
-                Tensor *st = 0;
-                for (int j = 0; j < src->n; j++) if (!strcmp(src->t[j].name, t->name)) st = &src->t[j];
+                int ji = nm_get(&nmap[t->file], t->name);
+                Tensor *st = ji >= 0 ? &src->t[ji] : 0;
                 if (!st) { fprintf(stderr, "MISS %s\n", t->name); bad++; continue; }
                 if (st->matched) { fprintf(stderr, "DUP %s\n", t->name); bad++; }
                 st->matched = 1;
@@ -2565,7 +2720,7 @@ int main(int argc, char **argv) {
                 drop_pages(buf + t->off, t->plen, g_amap);
                 drop_pages(st->data, st->len, src->mapped);
                 if (!keep[k] && t->data) {
-                    __sync_sub_and_fetch(&g_dlive, t->len);
+                    __sync_sub_and_fetch(&g_dlive, t->dlivc);
                     free(t->data); t->data = 0;
                 }
             }
