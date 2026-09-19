@@ -91,7 +91,9 @@ already-decoded reference tensor.
 - **Verified** — ASan/UBSan/MSan/TSan clean; AFL++ coverage fuzzing
   (crash corpus kept in `tests/corpus/`). CI (`ci.yml`) rebuilds from a
   clean Ubuntu image and reruns `test.sh` under -O3/-Werror/ASan+UBSan
-  plus the TLA+/Alloy/CBMC layers of `verify.sh`. Formal layer under `verify/`
+  and on real aarch64, plus every `verify.sh` layer — TLA+/Alloy/CBMC
+  in the `verify` job, Frama-C EVA+WP in `verify-framac` (pinned opam
+  switch + pinned z3). Formal layer under `verify/`
   (`verify/verify.sh`): TLA+ model-checks the batch-merge and
   tmp→rename protocols (flawed variants produce the expected
   counterexamples), Alloy checks archive structural invariants at
