@@ -19,7 +19,7 @@ int main() {
     for (int i = 0; i < BL; i++) blob[i] = (uint8_t)nondet_u64();
     uint64_t n = nondet_u64(); __CPROVER_assume(n <= 24);
     int bsz = 1 + (int)(nondet_u64() & 1);
-    uint16_t d16[16]; uint8_t *data = (uint8_t *)d16;
+    uint8_t data[64];   /* >= n*bsz worst case (48B) — was undersized at 32B */
     pack_dec(blob, blob + BL, n, bsz, data);
     return 0;
 }

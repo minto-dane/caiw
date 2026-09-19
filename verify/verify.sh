@@ -10,6 +10,9 @@
 #   TLA+ (TLC)  — design-level protocol model checking (finite-state)
 #   Alloy       — design-level structural invariant checking (bounded scope)
 #   CBMC        — implementation-level bounded proofs on the real caiw.c
+#   ESBMC       — second BMC engine (SMT-encoded); proves the pack_dec
+#                 bit-index bound that CBMC/minisat cannot finish at any
+#                 tested bound — optional, local only (~600MB binary)
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -17,7 +20,7 @@
 # properties of the compiled C semantics within the stated bounds; none of
 # these replace dynamic testing (sanitizers, fuzzing, test.sh).
 #
-# Env overrides: TLA_JAR ALLOY_JAR CBMC FRAMAC CBMC_TIMEOUT_SLOW
+# Env overrides: TLA_JAR ALLOY_JAR CBMC ESBMC FRAMAC CBMC_TIMEOUT_SLOW
 # Tool discovery order: env override → verify/tools/ (CI download dir) →
 # PATH.  Nothing here depends on a developer machine layout.
 set -u
@@ -38,6 +41,11 @@ command -v "$CBMC"   >/dev/null 2>&1 || CBMC=/home/nia/devbox/tools/usr/bin/cbmc
 command -v "$FRAMAC" >/dev/null 2>&1 || FRAMAC=$HOME/.opam/caiw-fc/bin/frama-c
 CBMC=$(command -v "$CBMC"   2>/dev/null || echo "$CBMC")   # PATH name → absolute (-x test below needs a path)
 FRAMAC=$(command -v "$FRAMAC" 2>/dev/null || echo "$FRAMAC")
+ESBMC=${ESBMC:-esbmc}
+for e in "$V/tools/esbmc/bin/esbmc" /tmp/esbmc/release/bin/esbmc; do
+    command -v "$ESBMC" >/dev/null 2>&1 || { [ -x "$e" ] && ESBMC=$e; }
+done
+ESBMC=$(command -v "$ESBMC" 2>/dev/null || echo "$ESBMC")
 CBMC_TIMEOUT=${CBMC_TIMEOUT:-300}
 CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
 for d in "$V/tools/lib" /home/nia/devbox/tools/usr/lib; do
@@ -149,6 +157,26 @@ if [ -x "$CBMC" ]; then
     fi
 else
     skip=$((skip+12)); note "SKIP CBMC — binary not found (set CBMC)"
+fi
+
+# ---------------------------------------------------------------- ESBMC
+# Second BMC engine (SMT-encoded VCCs, default Bitwuzla). Its one job here
+# is the bound CBMC cannot reach: pack_dec symbolic bit indexing.
+# Non-vacuity: the run must report a nonzero property count AND the per-loop
+# unwinding assertions must pass (constraints active, paths complete).
+# Local-only layer — the binary is ~600MB, not pulled into CI.
+if [ -x "$ESBMC" ] && [ -f "$V/esbmc_pack.c" ]; then
+    out=$(timeout 240 "$ESBMC" "$V/esbmc_pack.c" --unwind 40 2>&1)
+    np=$(echo "$out" | grep -oE "[0-9]+ of [0-9]+ properties failed" | awk '{print $3}')
+    if echo "$out" | grep -q "VERIFICATION SUCCESSFUL" && [ "${np:-0}" -gt 0 ]; then
+        ok "ESBMC pack_dec bit-index bounds (BL=32, n<=24 — CBMC solver-limit area)"
+    elif echo "$out" | grep -q "VERIFICATION FAILED"; then
+        bad "ESBMC pack_dec — real counterexample"; echo "$out" | tail -5
+    else
+        bad "ESBMC pack_dec"; echo "$out" | tail -5
+    fi
+else
+    skip=$((skip+1)); note "SKIP ESBMC — binary not found (set ESBMC)"
 fi
 
 # ---------------------------------------------------------------- Frama-C
