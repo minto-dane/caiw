@@ -89,7 +89,9 @@ already-decoded reference tensor.
   field, method/dtype pair, payload bound, and batch reference before
   touching memory.
 - **Verified** — ASan/UBSan/MSan/TSan clean; AFL++ coverage fuzzing
-  (crash corpus kept in `tests/corpus/`). Formal layer under `verify/`
+  (crash corpus kept in `tests/corpus/`). CI (`ci.yml`) rebuilds from a
+  clean Ubuntu image and reruns `test.sh` under -O3/-Werror/ASan+UBSan
+  plus the TLA+/Alloy/CBMC layers of `verify.sh`. Formal layer under `verify/`
   (`verify/verify.sh`): TLA+ model-checks the batch-merge and
   tmp→rename protocols (flawed variants produce the expected
   counterexamples), Alloy checks archive structural invariants at
