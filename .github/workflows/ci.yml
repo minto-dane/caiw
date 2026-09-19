@@ -106,7 +106,7 @@ jobs:
         run: |
           if [ ! -x ~/.opam/caiw-fc/bin/frama-c ]; then
             opam init -y --bare --disable-sandboxing
-            opam switch create caiw-fc -y
+            opam switch create caiw-fc ocaml-base-compiler.5.3.0 -y
             eval $(opam env --switch=caiw-fc)
             opam install -y frama-c.33.0 why3.1.8.2 alt-ergo-free.2.4.3
           fi
