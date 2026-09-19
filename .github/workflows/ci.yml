@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '17 3 * * 1'   # weekly — keeps the opam cache entry alive
 
 jobs:
   test:
@@ -63,6 +65,70 @@ jobs:
             https://github.com/AlloyTools/org.alloytools.alloy/releases/download/v6.2.0/org.alloytools.alloy.dist.jar
 
       - name: Run verify.sh
-        # Frama-C is not packaged in CI (opam build is heavy) — verify.sh
-        # reports EVA/WP as SKIP rather than pretending they ran.
+        # Frama-C runs in verify-framac below; it reports SKIP here.
         run: ./verify/verify.sh
+
+  test-arm:
+    name: build + regression (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (documented flags)
+        run: gcc -O3 -march=native -Wall -Wextra -pthread -o caiw caiw.c -lm
+
+      - name: Regression suite
+        run: ./test.sh
+
+  verify-framac:
+    name: formal layers (Frama-C EVA+WP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache opam switch
+        # first uncached run builds OCaml+Frama-C from source (~40min);
+        # the weekly cron in `on:` keeps the cache entry alive
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: ${{ runner.os }}-opam-caiw-fc-framac33-v1
+
+      - name: Install opam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y opam unzip
+
+      - name: Build Frama-C switch (first run only)
+        # versions pinned to the locally proven set: frama-c 33.0,
+        # why3 1.8.2, alt-ergo-free 2.4.3
+        run: |
+          if [ ! -x ~/.opam/caiw-fc/bin/frama-c ]; then
+            opam init -y --bare --disable-sandboxing
+            opam switch create caiw-fc -y
+            eval $(opam env --switch=caiw-fc)
+            opam install -y frama-c.33.0 why3.1.8.2 alt-ergo-free.2.4.3
+          fi
+
+      - name: Pin z3 4.13.3 (matches local prover)
+        run: |
+          mkdir -p verify/tools/bin
+          curl -fsSL -o /tmp/z3.zip \
+            https://github.com/Z3Prover/z3/releases/download/z3-4.13.3/z3-4.13.3-x64-glibc-2.35.zip
+          unzip -o /tmp/z3.zip -d /tmp/z3x
+          cp /tmp/z3x/z3-4.13.3-x64-glibc-2.35/bin/z3 verify/tools/bin/z3
+          chmod +x verify/tools/bin/z3
+
+      - name: Register why3 provers
+        run: |
+          eval $(opam env --switch=caiw-fc)
+          export PATH="$PWD/verify/tools/bin:$PATH"
+          why3 config detect
+
+      - name: Run verify.sh
+        # verify.sh finds frama-c via PATH (opam env) and z3 via
+        # verify/tools/bin on the WP step's PATH prefix.
+        run: |
+          eval $(opam env --switch=caiw-fc)
+          ./verify/verify.sh
