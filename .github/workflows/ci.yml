@@ -98,7 +98,7 @@ jobs:
       - name: Install opam
         run: |
           sudo apt-get update
-          sudo apt-get install -y opam unzip
+          sudo apt-get install -y opam unzip graphviz
 
       - name: Build Frama-C switch (first run only)
         # versions pinned to the locally proven set: frama-c 33.0,
@@ -108,7 +108,7 @@ jobs:
             opam init -y --bare --disable-sandboxing
             opam switch create caiw-fc ocaml-base-compiler.5.3.0 -y
             eval $(opam env --switch=caiw-fc)
-            opam install -y frama-c.33.0 why3.1.8.2 alt-ergo-free.2.4.3
+            opam install -y --assume-depexts frama-c.33.0 why3.1.8.2 alt-ergo-free.2.4.3
           fi
 
       - name: Pin z3 4.13.3 (matches local prover)
