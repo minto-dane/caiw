@@ -13,6 +13,7 @@ CaiwArchive/
 *_TTrace_*
 verify/CaiwArchive/
 verify/CaiwArchiveFlawed/
+.frama-c/
 verify/.frama-c/
 verify/.tmp/
 verify/.wp-out/
