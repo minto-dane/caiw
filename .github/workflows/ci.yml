@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: build + regression (gcc, sanitizers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (documented flags)
+        run: gcc -O3 -march=native -Wall -Wextra -pthread -o caiw caiw.c -lm
+
+      - name: Build (-Werror)
+        # keeps "zero warnings" a CI gate
+        run: gcc -O3 -march=native -Wall -Wextra -Werror -pthread -o caiw_werr caiw.c -lm && rm caiw_werr
+
+      - name: Build (portable baseline, no -march=native)
+        # catches accidental ISA-specific assumptions
+        run: gcc -O2 -Wall -Wextra -Werror -pthread -o caiw_base caiw.c -lm && rm caiw_base
+
+      - name: Regression suite
+        run: ./test.sh
+
+      - name: Build (ASan+UBSan)
+        run: gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -o caiw_san caiw.c -lm
+
+      - name: Sanitizer regression
+        # exit-path allocations are a deliberate no-free-at-exit pattern —
+        # leak reporting is off; OOB/UB still fail the run
+        run: ASAN_OPTIONS=detect_leaks=0 ./test.sh ./caiw_san
+
+  verify:
+    name: formal layers (TLA+/Alloy/CBMC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install CBMC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cbmc || true
+          cbmc --version || echo "cbmc unavailable — verify.sh will SKIP that layer"
+
+      - name: Download TLA+ / Alloy jars
+        run: |
+          mkdir -p verify/tools
+          curl -fsSL -o verify/tools/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          curl -fsSL -o verify/tools/org.alloytools.alloy.dist.jar \
+            https://github.com/AlloyTools/org.alloytools.alloy/releases/download/v6.2.0/org.alloytools.alloy.dist.jar
+
+      - name: Run verify.sh
+        # Frama-C is not packaged in CI (opam build is heavy) — verify.sh
+        # reports EVA/WP as SKIP rather than pretending they ran.
+        run: ./verify/verify.sh

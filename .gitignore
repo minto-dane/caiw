@@ -14,3 +14,4 @@ verify/CaiwArchiveFlawed/
 verify/.frama-c/
 verify/.tmp/
 verify/.wp-out/
+verify/tools/

@@ -18,18 +18,31 @@
 # these replace dynamic testing (sanitizers, fuzzing, test.sh).
 #
 # Env overrides: TLA_JAR ALLOY_JAR CBMC FRAMAC CBMC_TIMEOUT_SLOW
+# Tool discovery order: env override → verify/tools/ (CI download dir) →
+# PATH.  Nothing here depends on a developer machine layout.
 set -u
 cd "$(dirname "$0")"
 V=.
-TLA_JAR=${TLA_JAR:-/home/nia/devbox/fmdos-dev/poc/tools/tla2tools.jar}
-ALLOY_JAR=${ALLOY_JAR:-/home/nia/devbox/fmdos-dev/poc/tools/org.alloytools.alloy.dist.jar}
-CBMC=${CBMC:-/home/nia/devbox/tools/usr/bin/cbmc}
-FRAMAC=${FRAMAC:-$HOME/.opam/caiw-fc/bin/frama-c}
+TLA_JAR=${TLA_JAR:-}
+for j in "$V/tools/tla2tools.jar" /home/nia/devbox/fmdos-dev/poc/tools/tla2tools.jar; do
+    [ -z "$TLA_JAR" ] && [ -f "$j" ] && TLA_JAR=$j
+done
+ALLOY_JAR=${ALLOY_JAR:-}
+for j in "$V/tools/org.alloytools.alloy.dist.jar" \
+         /home/nia/devbox/fmdos-dev/poc/tools/org.alloytools.alloy.dist.jar; do
+    [ -z "$ALLOY_JAR" ] && [ -f "$j" ] && ALLOY_JAR=$j
+done
+CBMC=${CBMC:-cbmc}
+FRAMAC=${FRAMAC:-frama-c}
+command -v "$CBMC"   >/dev/null 2>&1 || CBMC=/home/nia/devbox/tools/usr/bin/cbmc
+command -v "$FRAMAC" >/dev/null 2>&1 || FRAMAC=$HOME/.opam/caiw-fc/bin/frama-c
 CBMC_TIMEOUT=${CBMC_TIMEOUT:-300}
 CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
-export LD_LIBRARY_PATH="/home/nia/devbox/tools/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# /tmp may be a small/full tmpfs — keep tool scratch on the main fs
-export TMPDIR=${TMPDIR:-/home/nia/devbox/tmpdir}
+for d in "$V/tools/lib" /home/nia/devbox/tools/usr/lib; do
+    [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+done
+# /tmp may be a small/full tmpfs — keep tool scratch repo-local
+export TMPDIR=${TMPDIR:-$V/.tmp}
 mkdir -p "$TMPDIR"
 JTMP="-Djava.io.tmpdir=$TMPDIR"
 
@@ -159,7 +172,7 @@ fi
 # safety goals.  PASS iff every scheduled goal is proven ("Proved goals: N/N").
 # Needs why3-registered provers (alt-ergo, z3) — see ~/.why3.conf.
 if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
-    out=$(PATH="$(dirname "$FRAMAC"):/home/nia/devbox/tools/usr/bin:$PATH" \
+    out=$(PATH="$(dirname "$FRAMAC"):$V/tools/bin:/home/nia/devbox/tools/usr/bin:$PATH" \
         timeout 600 "$FRAMAC" -wp -wp-rte \
         -wp-fct hex4,utf8_ok,dsym,kmap16,kmap16_inv,g32le \
         -wp-timeout 60 -wp-prover z3,alt-ergo -machdep gcc_x86_64 "$V/wp.c" 2>&1)
