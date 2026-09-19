@@ -125,6 +125,9 @@ jobs:
           eval $(opam env --switch=caiw-fc)
           export PATH="$PWD/verify/tools/bin:$PATH"
           why3 config detect
+          echo "--- why3.conf ---"; cat ~/.why3.conf
+          echo "--- provers ---"; why3 config list-provers
+          echo "--- wp provers ---"; frama-c -wp-provers 2>&1 | tail -15
 
       - name: Run verify.sh
         # verify.sh finds frama-c via PATH (opam env) and z3 via
