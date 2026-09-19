@@ -129,9 +129,11 @@ jobs:
           echo "--- provers ---"; why3 config list-provers
           echo "--- z3 smt2 sanity ---"
           echo '(set-logic ALL)(assert (> 3 2))(check-sat)' | verify/tools/bin/z3 -smt2 -in
-          echo "--- WP single-function probe ---"
-          frama-c -wp -wp-rte -wp-fct kmap16 -wp-timeout 30 \
-            -wp-prover z3,alt-ergo -machdep gcc_x86_64 verify/wp.c 2>&1 | tail -25
+          echo "--- WP prover list ---"
+          frama-c -wp-list-provers 2>&1 | tail -15
+          echo "--- WP dsym probe (needs external prover) ---"
+          frama-c -wp -wp-rte -wp-fct dsym -wp-timeout 30 \
+            -wp-prover z3 -machdep gcc_x86_64 verify/wp.c 2>&1 | tail -30
 
       - name: Run verify.sh
         # verify.sh finds frama-c via PATH (opam env) and z3 via
