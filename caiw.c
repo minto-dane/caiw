@@ -45,9 +45,21 @@ typedef char caiw_needs_64bit_size_t[(sizeof(size_t) >= 8) ? 1 : -1];
 
 /* every archive field is explicitly little-endian — the format must not
    depend on host byte order */
+static void p16le(uint8_t *o, uint16_t v) { o[0] = (uint8_t)v; o[1] = (uint8_t)(v >> 8); }
 static void p32le(uint8_t *o, uint32_t v) { for (int i = 0; i < 4; i++) o[i] = (uint8_t)(v >> (8 * i)); }
 static void p64le(uint8_t *o, uint64_t v) { for (int i = 0; i < 8; i++) o[i] = (uint8_t)(v >> (8 * i)); }
-static uint32_t g32le(const uint8_t *p) { uint32_t v = 0; for (int i = 0; i < 4; i++) v |= (uint32_t)p[i] << (8 * i); return v; }
+/*@ requires \valid_read(p + (0 .. 3));
+    assigns \nothing;
+*/
+static uint32_t g32le(const uint8_t *p) {
+    uint32_t v = 0;
+    /*@ loop invariant 0 <= i <= 4;
+        loop assigns v, i;
+        loop variant 4 - i;
+    */
+    for (int i = 0; i < 4; i++) v |= (uint32_t)p[i] << (8 * i);
+    return v;
+}
 static uint64_t g64le(const uint8_t *p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v; }
 
 #define BS 17
@@ -62,6 +74,11 @@ enum { M_RAW = 0, M_PACK, M_REF, M_FIELD, M_FIELDPOS, M_DELTA, M_U8, M_F32, M_FI
 #define MF_BAT 0x80   /* method-byte flag: parallel batch member (CAI4) */
 #define MF_BH  0x40   /* batch head: first member opens a new batch */
 
+/*@ terminates \false;
+    assigns \exit_status \from \nothing;
+    exits \exit_status == 1;
+    ensures never_terminates: \false;
+*/
 static void die(const char *m) __attribute__((noreturn));
 static void die(const char *m) {
     static volatile int dying;
@@ -124,7 +141,7 @@ typedef struct {
 static InFile **g_refs = NULL; static int g_nref = 0;
 
 /* ---- minimal JSON for safetensors headers ---- */
-/*@ requires \valid_read(p + (0 .. 3));
+/*@ requires valid_read_string(p);
     requires \valid(out);
     assigns *out;
     ensures \result == 0 || \result == 1;
@@ -132,6 +149,7 @@ static InFile **g_refs = NULL; static int g_nref = 0;
 static int hex4(const char *p, unsigned *out) {
     unsigned v = 0;
     /*@ loop invariant 0 <= k <= 4;
+        loop invariant \forall integer j; 0 <= j < k ==> p[j] != 0;
         loop assigns v, k;
         loop variant 4 - k;
     */
@@ -1260,7 +1278,8 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
     p32le(o, (uint32_t)k); o += 4;
     uint16_t dict[256] = { 0 }; int dk = 0;
     for (int i = 0; i < aw; i++) if (cnt[i]) dict[dk++] = (uint16_t)i;
-    memcpy(o, dict, k * 2); o += k * 2;
+    for (int i = 0; i < k; i++) p16le(o + 2 * i, dict[i]);   /* dict is explicitly little-endian */
+    o += k * 2;
     /* build reverse map */
     int *rmap = xc(aw, 4);
     for (int i = 0; i < k; i++) rmap[dict[i]] = i;
@@ -1282,25 +1301,27 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
 }
 static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz, uint8_t *data) {
     if (lim - in < 4) die("corrupt pack");
-    int k = (int)g32le(in); in += 4;
+    uint32_t k = g32le(in); in += 4;
     if (k < 1 || k > 256) die("corrupt pack");
     if ((uint64_t)(lim - in) < (uint64_t)k * 2) die("corrupt pack");
-    uint16_t dict[256];
-    memcpy(dict, in, k * 2); in += k * 2;
-    int ib = 0; while ((1 << ib) < k) ib++;
+    uint8_t dict[512];              /* raw LE bytes — no host-order cast */
+    for (uint32_t di = 0; di < k * 2; di++) dict[di] = in[di];
+    in += k * 2;
+    uint64_t ib = 0;
+    while (((uint64_t)1 << ib) < k) ib++;
     uint64_t ne = n / bsz, bit = 0, nb = (uint64_t)(lim - in);
     for (uint64_t i = 0; i < ne; i++) {
         uint32_t idx = 0;
         if (ib) {   /* k==1: zero-bit indices — the index stream is empty */
-            if ((bit + (uint64_t)ib - 1) >> 3 >= nb) die("corrupt pack");
-            for (int b = 0; b < ib; b++) {
+            if ((bit + ib - 1) >> 3 >= nb) die("corrupt pack");
+            for (uint64_t b = 0; b < ib; b++) {
                 idx = (idx << 1) | ((in[bit >> 3] >> (7 - (bit & 7))) & 1);
                 bit++;
             }
         }
-        if (idx >= (uint32_t)k) die("corrupt pack");
-        if (bsz == 2) ((uint16_t *)data)[i] = dict[idx];
-        else data[i] = (uint8_t)dict[idx];
+        if (idx >= k) die("corrupt pack");
+        if (bsz == 2) { data[2 * i] = dict[2 * idx]; data[2 * i + 1] = dict[2 * idx + 1]; }
+        else data[i] = dict[2 * idx];
     }
     /* the index stream must be exactly ceil(ne*ib/8) bytes — no slack */
     if ((uint64_t)(lim - in) != (bit + 7) / 8) die("corrupt pack");

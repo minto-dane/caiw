@@ -96,7 +96,7 @@ already-decoded reference tensor.
   scope 8, CBMC proves kmap16/dsym/norm_ctx/rANS (fixed-frequency)
   plus the parser boundary (utf8_ok/hex4/jstr/jstr_skip/jspan),
   Frama-C EVA+RTE screens the codec kernels (0 invalid), and Frama-C
-  WP discharges the ACSL contracts on those kernels — 101/101 goals,
+  WP discharges the ACSL contracts on those kernels — 116/116 goals,
   an unbounded proof per contract. Bounded results and solver limits
   are documented honestly; the rANS core is additionally covered by
   an exhaustive boundary sweep (524,537 cases) and `dsym` by 3,264
