@@ -43,8 +43,11 @@ CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
 for d in "$V/tools/lib" /home/nia/devbox/tools/usr/lib; do
     [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 done
-# /tmp may be a small/full tmpfs — keep tool scratch repo-local
-export TMPDIR=${TMPDIR:-$V/.tmp}
+# /tmp may be a small/full tmpfs — keep tool scratch repo-local.
+# MUST be absolute: why3 writes goal files under TMPDIR relative to the
+# prover's spawn CWD (WP session dir), so a relative TMPDIR silently
+# breaks every external prover call (Sys_error ENOENT on the .smt2).
+export TMPDIR=${TMPDIR:-$PWD/.tmp}
 mkdir -p "$TMPDIR"
 JTMP="-Djava.io.tmpdir=$TMPDIR"
 

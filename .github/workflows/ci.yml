@@ -125,18 +125,6 @@ jobs:
           eval $(opam env --switch=caiw-fc)
           export PATH="$PWD/verify/tools/bin:$PATH"
           why3 config detect
-          echo "--- why3.conf ---"; cat ~/.why3.conf
-          echo "--- provers ---"; why3 config list-provers
-          echo "--- z3 smt2 sanity ---"
-          echo '(set-logic ALL)(assert (> 3 2))(check-sat)' | verify/tools/bin/z3 -smt2 -in
-          echo "--- WP prover list ---"
-          frama-c -wp-list-provers 2>&1 | tail -15
-          echo "--- exact verify.sh WP command, full output ---"
-          PATH="$(dirname $(command -v frama-c)):$PWD/verify/tools/bin:$PATH" \
-            frama-c -wp -wp-rte \
-            -wp-fct hex4,utf8_ok,dsym,kmap16,kmap16_inv,g32le \
-            -wp-timeout 60 -wp-prover z3,alt-ergo -wp-cache none \
-            -machdep gcc_x86_64 verify/wp.c 2>&1 | grep -vE "rte:annot|kernel\] Pars|decimal-float|warn-once|variadic|Incorrect type" | tail -60
 
       - name: Run verify.sh
         # verify.sh finds frama-c via PATH (opam env) and z3 via
