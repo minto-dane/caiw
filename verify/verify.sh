@@ -161,7 +161,7 @@ fi
 if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
     out=$(PATH="$(dirname "$FRAMAC"):/home/nia/devbox/tools/usr/bin:$PATH" \
         timeout 600 "$FRAMAC" -wp -wp-rte \
-        -wp-fct hex4,utf8_ok,dsym,kmap16,kmap16_inv \
+        -wp-fct hex4,utf8_ok,dsym,kmap16,kmap16_inv,g32le \
         -wp-timeout 60 -wp-prover z3,alt-ergo -machdep gcc_x86_64 "$V/wp.c" 2>&1)
     got=$(echo "$out" | grep -oE "[0-9]+ / [0-9]+" | tail -1)
     if [ -n "$got" ]; then
