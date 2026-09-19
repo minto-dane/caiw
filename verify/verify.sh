@@ -36,6 +36,8 @@ CBMC=${CBMC:-cbmc}
 FRAMAC=${FRAMAC:-frama-c}
 command -v "$CBMC"   >/dev/null 2>&1 || CBMC=/home/nia/devbox/tools/usr/bin/cbmc
 command -v "$FRAMAC" >/dev/null 2>&1 || FRAMAC=$HOME/.opam/caiw-fc/bin/frama-c
+CBMC=$(command -v "$CBMC"   2>/dev/null || echo "$CBMC")   # PATH name → absolute (-x test below needs a path)
+FRAMAC=$(command -v "$FRAMAC" 2>/dev/null || echo "$FRAMAC")
 CBMC_TIMEOUT=${CBMC_TIMEOUT:-300}
 CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
 for d in "$V/tools/lib" /home/nia/devbox/tools/usr/lib; do
