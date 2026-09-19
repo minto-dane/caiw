@@ -184,7 +184,8 @@ if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
         if [ "$p" = "$t" ]; then
             ok "Frama-C WP kernel contracts ($p/$t goals proved)"
         else
-            bad "Frama-C WP ($p/$t proved)"; echo "$out" | tail -8
+            bad "Frama-C WP ($p/$t proved)"
+            echo "$out" | grep -iE "warn|error|prover|fail|z3|ergo" | tail -30
         fi
     else
         bad "Frama-C WP (no summary)"; echo "$out" | tail -8
