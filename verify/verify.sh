@@ -138,6 +138,10 @@ if [ -x "$CBMC" ]; then
     cbmc_ok "jspan balanced scan (J=8)"     cbmc_parse.c --unwind 20 -DPICK=5
     cbmc_ok "norm_ctx contract (u64 path, AW=2)"  cbmc_norm.c  --unwind 10
     cbmc_ok "norm_ctx contract (u128 path, AW=2)" cbmc_norm128.c --unwind 10
+    # pack_dec symbolic bit indexing — timed out at every bound under the
+    # pre-refactor code (u16 dict, memcpy, int k); the byte-level refactor
+    # made it tractable (~68s). ESBMC proves the same bound in ~24s below.
+    cbmc_ok "pack_dec bit-index bounds (BL=32, n<=24)" cbmc_pack.c --unwind 40
     # rANS round trip — fixed-frequency sweep (divisor concrete ⇒ tractable).
     # Covers emit-loop worst case f=1 through f=TOT.
     for f in 1 2 3 5 128 257 32768; do
@@ -156,7 +160,7 @@ if [ -x "$CBMC" ]; then
         note "     coverage continues via the fixed-f sweep + exhaustive C tests)"
     fi
 else
-    skip=$((skip+12)); note "SKIP CBMC — binary not found (set CBMC)"
+    skip=$((skip+17)); note "SKIP CBMC — binary not found (set CBMC)"
 fi
 
 # ---------------------------------------------------------------- ESBMC

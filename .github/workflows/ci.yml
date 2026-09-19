@@ -36,6 +36,19 @@ jobs:
         # leak reporting is off; OOB/UB still fail the run
         run: ASAN_OPTIONS=detect_leaks=0 ./test.sh ./caiw_san
 
+  test-tsan:
+    name: build + regression (TSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (ThreadSanitizer)
+        run: gcc -O1 -g -fsanitize=thread -fno-omit-frame-pointer -pthread -o caiw_tsan caiw.c -lm
+
+      - name: TSan regression
+        # data races in the -j4 parallel encode/decode paths fail the run
+        run: ./test.sh ./caiw_tsan
+
   verify:
     name: formal layers (TLA+/Alloy/CBMC)
     runs-on: ubuntu-latest
