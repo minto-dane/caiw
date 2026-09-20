@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -45,9 +46,30 @@ typedef char caiw_needs_64bit_size_t[(sizeof(size_t) >= 8) ? 1 : -1];
 
 /* every archive field is explicitly little-endian — the format must not
    depend on host byte order */
+/*@ requires \valid(o + (0 .. 1));
+    assigns o[0 .. 1];
+*/
 static void p16le(uint8_t *o, uint16_t v) { o[0] = (uint8_t)v; o[1] = (uint8_t)(v >> 8); }
-static void p32le(uint8_t *o, uint32_t v) { for (int i = 0; i < 4; i++) o[i] = (uint8_t)(v >> (8 * i)); }
-static void p64le(uint8_t *o, uint64_t v) { for (int i = 0; i < 8; i++) o[i] = (uint8_t)(v >> (8 * i)); }
+/*@ requires \valid(o + (0 .. 3));
+    assigns o[0 .. 3];
+*/
+static void p32le(uint8_t *o, uint32_t v) {
+    /*@ loop invariant 0 <= i <= 4;
+        loop assigns o[0 .. 3], i;
+        loop variant 4 - i;
+    */
+    for (int i = 0; i < 4; i++) o[i] = (uint8_t)(v >> (8 * i));
+}
+/*@ requires \valid(o + (0 .. 7));
+    assigns o[0 .. 7];
+*/
+static void p64le(uint8_t *o, uint64_t v) {
+    /*@ loop invariant 0 <= i <= 8;
+        loop assigns o[0 .. 7], i;
+        loop variant 8 - i;
+    */
+    for (int i = 0; i < 8; i++) o[i] = (uint8_t)(v >> (8 * i));
+}
 /*@ requires \valid_read(p + (0 .. 3));
     assigns \nothing;
 */
@@ -60,7 +82,18 @@ static uint32_t g32le(const uint8_t *p) {
     for (int i = 0; i < 4; i++) v |= (uint32_t)p[i] << (8 * i);
     return v;
 }
-static uint64_t g64le(const uint8_t *p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v; }
+/*@ requires \valid_read(p + (0 .. 7));
+    assigns \nothing;
+*/
+static uint64_t g64le(const uint8_t *p) {
+    uint64_t v = 0;
+    /*@ loop invariant 0 <= i <= 8;
+        loop assigns v, i;
+        loop variant 8 - i;
+    */
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
 
 #define BS 17
 #define BLK (1u << BS)
@@ -110,8 +143,15 @@ static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("oom"); ret
 static void *xc(size_t a, size_t b) { void *p = calloc(a ? a : 1, b ? b : 1); if (!p) die("oom"); return p; }
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
 
-static uint64_t fnv(const void *d, size_t n) {
-    const uint8_t *p = d; uint64_t h = 1469598103934665603ull;
+/*@ requires \valid_read(p + (0 .. n - 1));
+    assigns \nothing;
+*/
+static uint64_t fnv(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    /*@ loop invariant 0 <= i <= n;
+        loop assigns h, i;
+        loop variant n - i;
+    */
     for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
@@ -650,16 +690,55 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
 }
 
 /* ================= rANS ================= */
+/*@ requires 1 <= f <= TOT;
+    requires 0 <= c <= TOT - f;
+    requires LOWER <= x && x < 256 * LOWER;
+    requires \valid(pp);
+    requires \valid(*pp + (-2 .. -1));
+    assigns *pp, (*pp)[-2 .. -1];
+    ensures LOWER <= \result && \result < 256 * LOWER;
+    ensures \at(*pp, Pre) - 2 <= *pp && *pp <= \at(*pp, Pre);
+*/
 static inline uint64_t enc(uint64_t x, uint32_t f, uint32_t c, uint8_t **pp) {
     /* f==0 (a zeroed cell) would loop forever marching pp below the scratch
        buffer — impossible under the all-ones model invariant; guard anyway */
     if (!f) die("zero freq");
-    while (x >= XMAX(f)) { *--(*pp) = (uint8_t)x; x >>= 8; }
-    return ((x / f) << SB) + (x % f) + c;
+    uint8_t *w = *pp;
+    /*@ loop invariant (uint64_t)f * 65536 <= x && x < 256 * LOWER;
+        loop invariant (w == \at(*pp, Pre) && x == \at(x, Pre)) ||
+                       (w == \at(*pp, Pre) - 1 && 256 * x <= \at(x, Pre) && \at(x, Pre) <= 256 * x + 255) ||
+                       (w == \at(*pp, Pre) - 2 && 65536 * x <= \at(x, Pre) && \at(x, Pre) <= 65536 * x + 65535);
+        loop assigns w, \at(*pp, Pre)[-2 .. -1], x;
+        loop variant x;
+    */
+    while (x >= XMAX(f)) { *--w = (uint8_t)x; x /= 256; }
+    *pp = w;
+    uint64_t xf = x / f;
+    /*@ assert f * xf <= x && x < f * (xf + 1); */
+    /*@ assert xf >= 65536; */
+    /*@ assert xf <= 16777215; */
+    /*@ assert xf * TOT >= 2147483648; */
+    /*@ assert (x % f) + c <= TOT - 1; */
+    return xf * TOT + (x % f) + c;
 }
+/*@ requires 1 <= f <= TOT;
+    requires \valid(rp);
+    requires 0 <= end - *rp <= 4294967295;
+    requires \valid_read(*rp + (0 .. end - *rp - 1));
+    assigns *rp;
+    ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+*/
 static inline uint64_t dec(uint64_t x, uint32_t f, uint32_t c, const uint8_t **rp, const uint8_t *end) {
-    x = (uint64_t)f * (x >> SB) + (x & (TOT - 1)) - c;
-    while (x < LOWER && *rp < end) x = (x << 8) | *(*rp)++;
+    x = (uint64_t)f * (x / TOT) + (x % TOT) - c;
+    const uint8_t *r = *rp;
+    const ptrdiff_t cap = end - r;
+    ptrdiff_t n = 0;
+    /*@ loop invariant 0 <= n && n <= cap;
+        loop assigns x, n;
+        loop variant cap - n;
+    */
+    while (x < LOWER && n < cap) { x = x * 256 + r[n]; n++; }
+    *rp = r + n;
     return x;
 }
 /* decode-side symbol lookup: binary search for the unique cell with
@@ -691,17 +770,53 @@ static inline uint32_t dsym(const uint16_t *f, const uint32_t *cum, int aw, uint
     return r;
 }
 /* emit one rANS block: [u32 len][8B state][bytes] */
+/*@ requires 0 <= scr_end - pp <= 4294967295;
+    requires \valid_read(pp + (0 .. scr_end - pp - 1));
+    requires \valid(o + (0 .. 11));
+    requires \valid(o + (12 .. 11 + (scr_end - pp)));
+    requires \separated(o + (0 .. 11 + (scr_end - pp)), pp + (0 .. scr_end - pp - 1));
+    assigns o[0 .. 11 + (scr_end - pp)];
+    ensures \result == o + 12 + (scr_end - pp);
+*/
 static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) {
+    /*@ loop invariant 0 <= b <= 8;
+        loop assigns o[4 .. 11], b;
+        loop variant 8 - b;
+    */
     for (int b = 0; b < 8; b++) o[4 + b] = (uint8_t)(x >> (8 * (7 - b)));
-    uint32_t bl = (uint32_t)(scr_end - pp);
-    p32le(o, bl);
-    memcpy(o + 12, pp, bl);
+    const ptrdiff_t bl = scr_end - pp;
+    p32le(o, (uint32_t)bl);
+    /*@ loop invariant 0 <= i <= bl;
+        loop invariant \forall integer j; 0 <= j < i ==> o[12 + j] == pp[j];
+        loop assigns o[12 .. 11 + bl], i;
+        loop variant bl - i;
+    */
+    for (ptrdiff_t i = 0; i < bl; i++) o[12 + i] = pp[i];
     return o + 12 + bl;
 }
+/*@ requires rp <= lim;
+    requires 0 <= lim - rp;
+    requires \valid_read(rp + (0 .. lim - rp - 1));
+    requires \valid(x);
+    requires \valid(end);
+    terminates \false;
+    assigns *x, *end;
+    exits \exit_status == 1;
+    ensures \result == rp + 12;
+    ensures 12 <= *end - rp && *end - rp <= lim - rp;
+*/
 static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *x, const uint8_t **end) {
     if (rp > lim || (uint64_t)(lim - rp) < 12) die("corrupt archive");
-    uint32_t bl = g32le(rp); rp += 4;
-    *x = 0; for (int b = 0; b < 8; b++) *x = (*x << 8) | rp[b]; rp += 8;
+    /*@ assert 12 <= lim - rp; */
+    uint32_t bl = (uint32_t)rp[0] + 256u * rp[1] + 65536u * rp[2] + 16777216u * rp[3];
+    rp += 4;
+    *x = 0;
+    /*@ loop invariant 0 <= b <= 8;
+        loop assigns *x, b;
+        loop variant 8 - b;
+    */
+    for (int b = 0; b < 8; b++) *x = (*x << 8) | rp[b];
+    rp += 8;
     if ((uint64_t)bl > (uint64_t)(lim - rp)) die("corrupt archive");
     *end = rp + bl;
     return rp;

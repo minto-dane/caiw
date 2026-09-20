@@ -3,14 +3,16 @@
  * proof per contract, unlike CBMC's bounded model checking.
  *
  * Contracts live in caiw.c itself (ACSL annotations — invisible to
- * gcc, verified here).  Scope: g32le / hex4 / utf8_ok / dsym / kmap16(+inv).
- * Division-heavy kernels (enc/dec, norm_ctx) and pointer-scan parsers
- * (jstr/jstr_skip/jspan/jkey) are outside WP's practical reach — Qed carries
- * no strlen/valid_read_string model and its bit-index arithmetic defeats the
- * solvers (pack_dec: 54/64 non-terminates goals proved, the bit-position
- * loop invariants time out — attempted, then reverted to keep every in-tree
- * annotation machine-checked).  CBMC/exhaustive sweeps own those
- * (honest boundary, docs/design.md). */
+ * gcc, verified here).  Scope: byte-order codecs (p16le/p32le/p64le,
+ * g32le/g64le), fnv, hex4, utf8_ok, dsym, kmap16(+inv), the rANS state
+ * transitions enc/dec (state bounds, read/write cursor bounds), and the
+ * block framing pair emit_blk/read_blk (header+payload bounds, including
+ * read_blk's exits/terminates contract for the die() paths).
+ * norm_ctx's sum-of-frequencies invariants need \sum/lambda constructs
+ * WP 33 does not implement, and pointer-scan parsers (jstr/jkey/jget)
+ * sit behind Qed's missing strlen/valid_read_string model — attempted,
+ * reverted, documented boundary (docs/design.md).  CBMC + the exhaustive
+ * sweeps own those functions. */
 #ifdef __FRAMAC__
 #ifndef MADV_SEQUENTIAL
 #define MADV_SEQUENTIAL 2
