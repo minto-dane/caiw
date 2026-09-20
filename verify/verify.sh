@@ -10,9 +10,12 @@
 #   TLA+ (TLC)  — design-level protocol model checking (finite-state)
 #   Alloy       — design-level structural invariant checking (bounded scope)
 #   CBMC        — implementation-level bounded proofs on the real caiw.c
-#   ESBMC       — second BMC engine (SMT-encoded); proves the pack_dec
-#                 bit-index bound that CBMC/minisat cannot finish at any
-#                 tested bound — optional, local only (~600MB binary)
+#   ESBMC       — second BMC engine (SMT-encoded); pushes the pack_dec
+#                 bit-index bound past CBMC's OOM — optional, local only
+#                 (~600MB binary)
+#   Coq/Rocq    — algorithm-level interactive proof of the general-domain
+#                 rANS round trip (the nondet-divisor domain all BMC
+#                 engines time out on) — optional, local only
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -20,7 +23,7 @@
 # properties of the compiled C semantics within the stated bounds; none of
 # these replace dynamic testing (sanitizers, fuzzing, test.sh).
 #
-# Env overrides: TLA_JAR ALLOY_JAR CBMC ESBMC FRAMAC CBMC_TIMEOUT_SLOW
+# Env overrides: TLA_JAR ALLOY_JAR CBMC ESBMC COQC FRAMAC CBMC_TIMEOUT_SLOW
 # Tool discovery order: env override → verify/tools/ (CI download dir) →
 # PATH.  Nothing here depends on a developer machine layout.
 set -u
@@ -46,6 +49,8 @@ for e in "$V/tools/esbmc/bin/esbmc" /tmp/esbmc/release/bin/esbmc; do
     command -v "$ESBMC" >/dev/null 2>&1 || { [ -x "$e" ] && ESBMC=$e; }
 done
 ESBMC=$(command -v "$ESBMC" 2>/dev/null || echo "$ESBMC")
+COQC=${COQC:-coqc}
+COQC=$(command -v "$COQC" 2>/dev/null || echo "$COQC")
 CBMC_TIMEOUT=${CBMC_TIMEOUT:-300}
 CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
 for d in "$V/tools/lib" /home/nia/devbox/tools/usr/lib; do
@@ -165,15 +170,15 @@ fi
 
 # ---------------------------------------------------------------- ESBMC
 # Second BMC engine (SMT-encoded VCCs, default Bitwuzla). Its one job here
-# is the bound CBMC cannot reach: pack_dec symbolic bit indexing.
+# is pushing the pack_dec symbolic-bit-index bound past CBMC's OOM.
 # Non-vacuity: the run must report a nonzero property count AND the per-loop
 # unwinding assertions must pass (constraints active, paths complete).
 # Local-only layer — the binary is ~600MB, not pulled into CI.
 if [ -x "$ESBMC" ] && [ -f "$V/esbmc_pack.c" ]; then
-    out=$(timeout 240 "$ESBMC" "$V/esbmc_pack.c" --unwind 40 2>&1)
+    out=$(timeout 500 "$ESBMC" "$V/esbmc_pack.c" --unwind 60 2>&1)
     np=$(echo "$out" | grep -oE "[0-9]+ of [0-9]+ properties failed" | awk '{print $3}')
     if echo "$out" | grep -q "VERIFICATION SUCCESSFUL" && [ "${np:-0}" -gt 0 ]; then
-        ok "ESBMC pack_dec bit-index bounds (BL=32, n<=24 — CBMC solver-limit area)"
+        ok "ESBMC pack_dec bit-index bounds (BL=48, n<=36 — beyond CBMC's OOM)"
     elif echo "$out" | grep -q "VERIFICATION FAILED"; then
         bad "ESBMC pack_dec — real counterexample"; echo "$out" | tail -5
     else
@@ -181,6 +186,33 @@ if [ -x "$ESBMC" ] && [ -f "$V/esbmc_pack.c" ]; then
     fi
 else
     skip=$((skip+1)); note "SKIP ESBMC — binary not found (set ESBMC)"
+fi
+
+# ---------------------------------------------------------------- Coq/Rocq
+# Algorithm-level proof of the rANS single-symbol round trip over the FULL
+# general domain (LOWER <= x < LOWER*256, 1<=f<=TOT, 0<=c<=TOT-f) — the
+# nondet-divisor problem that times out under every BMC engine. This
+# proves the ALGORITHM (Z-arithmetic model of enc/dec), not the C code —
+# same tier as the TLA+/Alloy models. Compilation is the check: the
+# kernel verifies every Qed; coqchk rechecks independently when present.
+if [ -x "$COQC" ] && [ -f "$V/Rans.v" ]; then
+    cp "$V/Rans.v" "$TMPDIR/Rans.v"
+    out=$(cd "$TMPDIR" && timeout 300 "$COQC" Rans.v 2>&1)
+    if [ -f "$TMPDIR/Rans.vo" ]; then
+        if COQCHK=$(command -v coqchk 2>/dev/null); then
+            chk=$(cd "$TMPDIR" && timeout 300 "$COQCHK" -o Rans 2>&1)
+            echo "$chk" | grep -q "successfully checked" \
+                && echo "$chk" | grep -q "Axioms: <none>" \
+                && ok "Coq rANS round trip, general domain (kernel-checked, coqchk-clean)" \
+                || { bad "Coq coqchk"; echo "$chk" | tail -8; }
+        else
+            ok "Coq rANS round trip, general domain (kernel-checked)"
+        fi
+    else
+        bad "Coq rANS"; echo "$out" | tail -8
+    fi
+else
+    skip=$((skip+1)); note "SKIP Coq — coqc not found (set COQC)"
 fi
 
 # ---------------------------------------------------------------- Frama-C

@@ -18,3 +18,9 @@ verify/.frama-c/
 verify/.tmp/
 verify/.wp-out/
 verify/tools/
+verify/*.vo
+verify/*.vos
+verify/*.vok
+verify/*.glob
+verify/*.aux
+verify/.lia.cache
