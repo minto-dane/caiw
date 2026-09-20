@@ -317,3 +317,6 @@ Proof.
   - apply uok_sound; exact Hb.
   - apply uok_complete; exact Hb.
 Qed.
+
+(* nat-byte wrapper for extraction/diff-testing *)
+Definition uok_bytes (s : list nat) : bool := uok (map Z.of_nat s).

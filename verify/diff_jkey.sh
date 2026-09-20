@@ -21,13 +21,15 @@ if [ ! -d "$CASES" ]; then
     python3 gen_jkey_cases.py "$CASES" 1
 fi
 
-# 1. extract + build the OCaml oracle
-$COQC -q Jkey.v
+# 1. extract + build the OCaml oracle (Extract.v now also emits the
+#    other models — they are diff_models.sh's business; Jkey.v alone is
+#    enough for this oracle but Extract.v needs all five .vo)
+for f in Utf8 Norm Pack Rans Jkey; do $COQC -q "$f.v"; done
 $COQC -q Extract.v
-$OCAMLFIND ocamlopt -package num -linkpkg -c jkeym.mli
-$OCAMLFIND ocamlopt -package num -linkpkg -c jkeym.ml
-$OCAMLFIND ocamlopt -package num -linkpkg -c diff_jkey.ml
-$OCAMLFIND ocamlopt -package num -linkpkg jkeym.cmx diff_jkey.cmx \
+$OCAMLFIND ocamlopt -package zarith -linkpkg -c jkeym.mli
+$OCAMLFIND ocamlopt -package zarith -linkpkg -c jkeym.ml
+$OCAMLFIND ocamlopt -package zarith -linkpkg -c diff_jkey.ml
+$OCAMLFIND ocamlopt -package zarith -linkpkg jkeym.cmx diff_jkey.cmx \
     -o diff_jkey_ml
 
 # 2. build the C oracle (ASan+UBSan: any OOB inside jkey aborts loudly)

@@ -20,9 +20,9 @@
 #                 histograms (Norm.v), arbitrary-length PACK bitstream
 #                 round trip (Pack.v), jkey nested-scan bounds/position
 #                 (Jkey.v) — optional, local only
-#   diff_jkey   — model<->C differential: the PROVED Jkey.v model,
-#                 extracted to OCaml, vs the real C jkey() under
-#                 ASan/UBSan on a generated corpus — optional
+#   diff_jkey / — model<->C differential: the PROVED Coq models,
+#   diff_models   extracted to OCaml, vs the real C functions under
+#                 ASan/UBSan on generated corpora — optional
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -256,12 +256,12 @@ else
 fi
 
 # ------------------------------------------------- model<->C differential
-# Extracts the PROVED Jkey.v model to OCaml and diffs it against the real
-# C jkey() (ASan+UBSan build) on a generated corpus — empirical
-# correspondence evidence for the one abstraction gap left in Jkey.v.
-# Optional, local only (needs coqc + ocamlfind + zarith/num).
+# Extracts the PROVED models to OCaml and diffs them against the real C
+# functions (ASan+UBSan builds, caiw.c #included) on generated corpora —
+# empirical correspondence evidence for the inspection gap left by the
+# algorithm-level proofs. Optional, local only (coqc + ocamlfind/zarith).
 if [ -x "$COQC" ] && command -v ocamlfind >/dev/null 2>&1 \
-   && ocamlfind query num >/dev/null 2>&1; then
+   && ocamlfind query zarith >/dev/null 2>&1; then
     out=$(timeout 600 sh "$V/diff_jkey.sh" "$TMPDIR/jkeycases" 2>&1)
     if echo "$out" | grep -q "all agree"; then
         ok "diff_jkey model<->C corpus agreement"
@@ -269,8 +269,17 @@ if [ -x "$COQC" ] && command -v ocamlfind >/dev/null 2>&1 \
     else
         bad "diff_jkey"; echo "$out" | tail -12
     fi
+    out=$(timeout 900 sh "$V/diff_models.sh" "$TMPDIR/diffcases" 2>&1)
+    nm=$(echo "$out" | grep -c "all agree")
+    if [ "$nm" -eq 4 ]; then
+        ok "diff_models: utf8/norm/pack/rans corpus agreement"
+        echo "$out" | grep "all agree" | while IFS= read -r l; do
+            note "$l"; done
+    else
+        bad "diff_models"; echo "$out" | tail -15
+    fi
 else
-    skip=$((skip+1)); note "SKIP diff_jkey — needs coqc + ocamlfind/num"
+    skip=$((skip+2)); note "SKIP diff_jkey/diff_models — needs coqc + ocamlfind/zarith"
 fi
 
 # ---------------------------------------------------------------- Frama-C

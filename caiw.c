@@ -635,7 +635,10 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
             f[i] = (uint16_t)q;
             rem -= q;
         }
-    } else {   /* absurdly large counts: u128 keeps the model exact */
+    } else {   /* 2^49 <= tot < 2^64: u128 keeps h[i]*bud exact.
+                * (tot itself is still u64 — beyond 2^64 it wraps and
+                * every quotient inflates; real per-block histograms
+                * never approach it. Found by the norm_ctx model diff.) */
         for (int i = 0; i < aw; i++) {
             if (h[i] > h[bi]) bi = i;
             uint32_t q = h[i] ? (uint32_t)(((unsigned __int128)h[i] * (uint64_t)bud) / tot) + 1 : 0;
