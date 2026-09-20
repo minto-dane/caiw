@@ -94,19 +94,19 @@ jobs:
         run: ./test.sh
 
   verify-framac:
-    name: formal layers (Frama-C EVA+WP)
+    name: formal layers (Frama-C EVA+WP, Rocq)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
       - name: Cache opam switch
-        # first uncached run builds OCaml+Frama-C from source (~40min);
+        # first uncached run builds OCaml+Frama-C+Rocq from source (~60min);
         # the weekly cron in `on:` keeps the cache entry alive
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: ${{ runner.os }}-opam-caiw-fc-framac33-v2
+          key: ${{ runner.os }}-opam-caiw-fc-framac33-coq92-v3
 
       - name: Install opam
         run: |
@@ -123,6 +123,14 @@ jobs:
             eval $(opam env --switch=caiw-fc)
             opam install -y --assume-depexts frama-c.33.0 why3.1.8.2 alt-ergo-free.2.4.3
           fi
+
+      - name: Install Rocq (Coq proof layer)
+        # pinned to the locally proven set: coq 9.2.0 (rocq-stdlib 9.1.0).
+        # Idempotent — a no-op on cache hit.
+        run: |
+          eval $(opam env --switch=caiw-fc)
+          opam install -y --assume-depexts coq.9.2.0 rocq-stdlib.9.1.0
+          coqc --version
 
       - name: Pin z3 4.13.3 (matches local prover)
         run: |

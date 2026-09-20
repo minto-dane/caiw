@@ -6,8 +6,8 @@
  * KNOWN SOLVER LIMIT: times out under minisat at every tested bound
  * (BL=16/n<=8 upward) — symbolic bit indexing (in[bit>>3] >> (7-(bit&7)))
  * is SAT-hard.  Retained so a faster solver (or CBMC upgrade) can run it;
- * verify.sh does NOT run this file.  Dynamic coverage: AFL++/mutation
- * fuzzing + ASan exercise these guards continuously. */
+ * verify.sh does NOT run this file.  Dynamic coverage:
+ * ASan + the crash corpus exercise these guards continuously. */
 #define main caiw_main_
 #include "../caiw.c"
 #undef main

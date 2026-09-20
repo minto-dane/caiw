@@ -745,7 +745,3 @@ Theorem jkey_c_sem : forall l rest key v,
   jkey_c l rest key = Some v ->
   key_at l rest (jstr_dec (S (length l))) key v.
 Proof. intros l rest key v H. eapply jkey_sem. exact H. Qed.
-
-(* nat-byte wrapper for extraction/diff-testing *)
-Definition jkey_bytes (l rest key : list nat) : option nat :=
-  jkey_c (map Z.of_nat l) (map Z.of_nat rest) (map Z.of_nat key).

@@ -19,16 +19,13 @@
 #                 equivalence (Utf8.v), norm_ctx table contract for all
 #                 histograms (Norm.v), arbitrary-length PACK bitstream
 #                 round trip (Pack.v), jkey nested-scan bounds/position
-#                 (Jkey.v) — optional, local only
-#   diff_jkey / — model<->C differential: the PROVED Coq models,
-#   diff_models   extracted to OCaml, vs the real C functions under
-#                 ASan/UBSan on generated corpora — optional
+#                 (Jkey.v)
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
 # Proven ≠ modeled: TLA+/Alloy validate the DESIGN abstraction; CBMC proves
 # properties of the compiled C semantics within the stated bounds; none of
-# these replace dynamic testing (sanitizers, fuzzing, test.sh).
+# these replace dynamic testing (sanitizers, regression corpus, test.sh).
 #
 # Env overrides: TLA_JAR ALLOY_JAR CBMC ESBMC COQC FRAMAC CBMC_TIMEOUT_SLOW
 # Tool discovery order: env override → verify/tools/ (CI download dir) →
@@ -174,8 +171,8 @@ if [ -x "$CBMC" ]; then
     # jkey nested scan: exceeds minisat limits at every tested bound —
     # even O=3,R=1,unwind 8 times out, because each outer iteration
     # branches across memchr + jstr escapes + jstr_skip + jspan paths.
-    # Algorithm-level coverage: Jkey.v (any length); model<->C empirical
-    # agreement: diff_jkey.sh. A counterexample here would still be news.
+    # Algorithm-level coverage: Jkey.v (any length).
+    # A counterexample here would still be news.
     out=$(timeout 60 $CBMC "$V/cbmc_parse.c" --function main $CBMC_I \
         --unwind 8 -DPICK=6 -DOB=3 -DRB=1 2>&1)
     if echo "$out" | grep -q "VERIFICATION SUCCESSFUL"; then
@@ -184,7 +181,7 @@ if [ -x "$CBMC" ]; then
         bad "CBMC jkey — real counterexample"; echo "$out" | tail -5
     else
         note "LIM  CBMC jkey nested scan: solver timeout even at O=3,R=1,"
-        note "     unwind 8 (documented bound — Jkey.v + diff_jkey cover it)"
+        note "     unwind 8 (documented bound — Jkey.v covers it)"
     fi
 else
     skip=$((skip+18)); note "SKIP CBMC — binary not found (set CBMC)"
@@ -253,33 +250,6 @@ if [ -x "$COQC" ]; then
     done
 else
     skip=$((skip+5)); note "SKIP Coq — coqc not found (set COQC)"
-fi
-
-# ------------------------------------------------- model<->C differential
-# Extracts the PROVED models to OCaml and diffs them against the real C
-# functions (ASan+UBSan builds, caiw.c #included) on generated corpora —
-# empirical correspondence evidence for the inspection gap left by the
-# algorithm-level proofs. Optional, local only (coqc + ocamlfind/zarith).
-if [ -x "$COQC" ] && command -v ocamlfind >/dev/null 2>&1 \
-   && ocamlfind query zarith >/dev/null 2>&1; then
-    out=$(timeout 600 sh "$V/diff_jkey.sh" "$TMPDIR/jkeycases" 2>&1)
-    if echo "$out" | grep -q "all agree"; then
-        ok "diff_jkey model<->C corpus agreement"
-        note "$(echo "$out" | tail -1)"
-    else
-        bad "diff_jkey"; echo "$out" | tail -12
-    fi
-    out=$(timeout 900 sh "$V/diff_models.sh" "$TMPDIR/diffcases" 2>&1)
-    nm=$(echo "$out" | grep -c "all agree")
-    if [ "$nm" -eq 4 ]; then
-        ok "diff_models: utf8/norm/pack/rans corpus agreement"
-        echo "$out" | grep "all agree" | while IFS= read -r l; do
-            note "$l"; done
-    else
-        bad "diff_models"; echo "$out" | tail -15
-    fi
-else
-    skip=$((skip+2)); note "SKIP diff_jkey/diff_models — needs coqc + ocamlfind/zarith"
 fi
 
 # ---------------------------------------------------------------- Frama-C

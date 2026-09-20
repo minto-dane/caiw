@@ -45,7 +45,8 @@ $ ./caiw d tune.caiw outdir/ --ref base.st   # same --ref set, same order
 ```
 
 `make test` generates deterministic fixtures and runs the full
-regression; `make fuzz` mutation-fuzzes the decoder.
+regression (round-trips at -j1/-j4, metadata, and a checked-in
+crash corpus that must die cleanly).
 
 ## How it works
 
@@ -88,12 +89,13 @@ already-decoded reference tensor.
   safetensors file exits(1) through `die()`; the decoder validates every
   field, method/dtype pair, payload bound, and batch reference before
   touching memory.
-- **Verified** — ASan/UBSan/MSan/TSan clean; AFL++ coverage fuzzing
-  (crash corpus kept in `tests/corpus/`). CI (`ci.yml`) rebuilds from a
-  clean Ubuntu image and reruns `test.sh` under -O3/-Werror/ASan+UBSan
-  and on real aarch64, plus every `verify.sh` layer — TLA+/Alloy/CBMC
-  in the `verify` job, Frama-C EVA+WP in `verify-framac` (pinned opam
-  switch + pinned z3). Formal layer under `verify/`
+- **Verified** — ASan/UBSan/MSan/TSan clean; a checked-in crash
+  corpus (`tests/corpus/`) replays inputs that once crashed. CI
+  (`ci.yml`) rebuilds from a clean Ubuntu image and reruns `test.sh`
+  under -O3/-Werror/ASan+UBSan and on real aarch64, plus every
+  `verify.sh` layer — TLA+/Alloy/CBMC in the `verify` job, Frama-C
+  EVA+WP + Rocq proofs in `verify-framac` (pinned opam switch +
+  pinned z3). Formal layer under `verify/`
   (`verify/verify.sh`): TLA+ model-checks the batch-merge and
   tmp→rename protocols (flawed variants produce the expected
   counterexamples), Alloy checks archive structural invariants at
@@ -101,10 +103,15 @@ already-decoded reference tensor.
   plus the parser boundary (utf8_ok/hex4/jstr/jstr_skip/jspan),
   Frama-C EVA+RTE screens the codec kernels (0 invalid), and Frama-C
   WP discharges the ACSL contracts on those kernels — 116/116 goals,
-  an unbounded proof per contract. Bounded results and solver limits
-  are documented honestly; the rANS core is additionally covered by
-  an exhaustive boundary sweep (524,537 cases) and `dsym` by 3,264
-  tables × all 32,768 symbol values.
+  an unbounded proof per contract. Five Rocq/Coq proofs (zero-axiom,
+  coqchk-rechecked) cover the regions every BMC backend timed out on:
+  rANS round trip over the full general domain, utf8_ok correctness
+  at any length, norm_ctx's output contract over all histograms,
+  PACK bitstream round trip at any length, and jkey's nested scan
+  (bounds, termination, key-position correctness). Bounded results
+  and solver limits are documented honestly; the rANS core is
+  additionally covered by an exhaustive boundary sweep (524,537
+  cases) and `dsym` by 3,264 tables × all 32,768 symbol values.
 - **Deterministic** — encode decisions are integer-only, so a fixed `-j`
   reproduces bit-identical archives across machines; archives are
   `-j`-independent on the decode side.

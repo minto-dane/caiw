@@ -12,8 +12,7 @@
  *   5 jspan          balanced {..}/[..] scan, J=8
  *   6 jkey           nested key scan — smallest useful bound (O=6,R=4);
  *                    larger bounds exceed minisat limits — Jkey.v covers
- *                    the algorithm at arbitrary length and diff_jkey.sh
- *                    checks model<->C agreement on a corpus
+ *                    the algorithm at arbitrary length
  * pack_dec (bit-level index arithmetic) has its own harness in
  * cbmc_pack.c / esbmc_pack.c. */
 #define main caiw_main_

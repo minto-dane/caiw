@@ -2,7 +2,7 @@
  * caiw's pure codec and parsing kernels over bounded nondeterministic
  * inputs.  Scope is deliberately the pointer/integer-dense functions;
  * filesystem, mmap and pthread paths need an OS model and are covered by
- * sanitizers + fuzzing instead (honest boundary — see docs/design.md). */
+ * sanitizers + the crash corpus instead (honest boundary — see docs/design.md). */
 #ifdef __FRAMAC__
 /* Frama-C's bundled libc lacks madvise/MADV_* — declare the hints so the
  * parse succeeds; eva_main never reaches mmap paths anyway. */

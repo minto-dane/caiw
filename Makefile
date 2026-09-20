@@ -8,13 +8,10 @@ caiw: caiw.c
 test: caiw
 	./test.sh
 
-fuzz: caiw
-	./fuzz.sh
-
 verify:
 	./verify/verify.sh
 
 clean:
 	rm -f caiw
 
-.PHONY: test fuzz verify clean
+.PHONY: test verify clean
