@@ -17,7 +17,8 @@
 #                 all BMC engines time out on: general-domain rANS round
 #                 trip (Rans.v), arbitrary-length UTF-8 validator
 #                 equivalence (Utf8.v), norm_ctx table contract for all
-#                 histograms (Norm.v) — optional, local only
+#                 histograms (Norm.v), arbitrary-length PACK bitstream
+#                 round trip (Pack.v) — optional, local only
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -201,12 +202,15 @@ fi
 #             sum = TOT, length preserved, support preserved
 #             (h_i=0 <-> f_i=0, h_i>0 -> 0<f_i<=TOT), both branches
 #             (BMC tops out at aw=2 on the symbolic division)
+#   Pack.v  — pack_enc/pack_dec bitstream round trip for ARBITRARY
+#             element count, both atom widths (BMC tops out at
+#             BL=48/n<=36 on the bit-index product state space)
 # These prove ALGORITHMS, not the C code — same tier as TLA+/Alloy.
 # Compilation is the check: the kernel verifies every Qed; coqchk
 # rechecks each .vo independently (must report Axioms: <none>).
 if [ -x "$COQC" ]; then
     COQCHK=$(command -v coqchk 2>/dev/null || true)
-    for f in Rans Utf8 Norm; do
+    for f in Rans Utf8 Norm Pack; do
         [ -f "$V/$f.v" ] || continue
         cp "$V/$f.v" "$TMPDIR/$f.v"
         out=$(cd "$TMPDIR" && timeout 300 "$COQC" "$f.v" 2>&1)
@@ -225,7 +229,7 @@ if [ -x "$COQC" ]; then
         fi
     done
 else
-    skip=$((skip+3)); note "SKIP Coq — coqc not found (set COQC)"
+    skip=$((skip+4)); note "SKIP Coq — coqc not found (set COQC)"
 fi
 
 # ---------------------------------------------------------------- Frama-C
