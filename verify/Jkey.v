@@ -248,10 +248,11 @@ Proof.
   apply nth_overflow with (d:=0) in Hge. congruence.
 Qed.
 
-(* the abstract decoder contract: jstr at a quote consumes k bytes,
-   1 <= k <= length of the slice it was given (k>=1 makes progress) *)
+(* the abstract decoder contract: jstr at a quote consumes k >= 1
+   bytes — progress is all the fuel argument needs; the per-iteration
+   e <= oend check lives inside jkey_f itself *)
 Definition dec_contract (dec : list Z -> option (list Z * nat)) : Prop :=
-  forall b d k, dec b = Some (d, k) -> (1 <= k <= length b)%nat.
+  forall b d k, dec b = Some (d, k) -> (1 <= k)%nat.
 
 (* fuel-bounded faithful model of
      while (p < oend) { q = memchr(quote); e = jstr(q); ws; colon; ws;
@@ -386,7 +387,7 @@ Proof.
         [congruence|reflexivity]].
     destruct (dec (skipn q (c0 :: t) ++ rest)) as [[d k]|] eqn:Fd;
       [|reflexivity].
-    pose proof (Hc _ _ _ Fd) as [Hk1 Hk2].
+    pose proof (Hc _ _ _ Fd) as Hk1.
     destruct (Nat.leb (q + k) (S (length t))) eqn:Fl; [|reflexivity].
     apply Nat.leb_le in Fl.
     set (e := (q + k)%nat).
@@ -591,3 +592,160 @@ Proof.
     + subst e. exact Fl.
     + exact Erec.
 Qed.
+
+(* ---------------- concrete decoder: jstr ---------------- *)
+(* Faithful list model of caiw.c's jstr: escape letters, \uXXXX via a
+   4-hex reader, high-surrogate + \uDC00-DFFF pairing, the bs cap checks
+   (i+1 >= bs on plain/short escapes, i+4 >= bs on every \u), and the
+   embedded-NUL rejection.  Returns (decoded bytes, consumed count). *)
+
+Definition hexv (c : Z) : option Z :=
+  if (48 <=? c) && (c <=? 57) then Some (c - 48)
+  else if (97 <=? c) && (c <=? 102) then Some (c - 87)
+  else if (65 <=? c) && (c <=? 70) then Some (c - 55)
+  else None.
+
+Definition escv (c : Z) : option Z :=
+  if c =? 34 then Some 34
+  else if c =? 92 then Some 92
+  else if c =? 47 then Some 47
+  else if c =? 98 then Some 8
+  else if c =? 102 then Some 12
+  else if c =? 110 then Some 10
+  else if c =? 114 then Some 13
+  else if c =? 116 then Some 9
+  else None.
+
+Definition utf8_enc (cp : Z) : list Z :=
+  if cp <? 128 then [cp]
+  else if cp <? 2048 then [192 + Z.shiftr cp 6; 128 + cp mod 64]
+  else if cp <? 65536 then
+    [224 + Z.shiftr cp 12; 128 + (Z.shiftr cp 6) mod 64; 128 + cp mod 64]
+  else
+    [240 + Z.shiftr cp 18; 128 + (Z.shiftr cp 12) mod 64;
+     128 + (Z.shiftr cp 6) mod 64; 128 + cp mod 64].
+
+(* emit_cp: C's shared "\u" tail — cap check i+4 >= bs, NUL-cp
+   rejection, UTF-8 emit; rec = already-computed recursive result;
+   u = extra surrogate bytes consumed (0 or 6). *)
+Definition emit_cp (cp : Z) (cap i u : nat) (rec : option (list Z * nat))
+    : option (list Z * nat) :=
+  if (i + 4 <? cap)%nat then
+    if cp =? 0 then None
+    else option_map (fun '(d,k) => (utf8_enc cp ++ d, (6 + u + k)%nat)) rec
+  else None.
+
+(* jstr_body: l = bytes AFTER the open quote; i = decoded count so far.
+   Returns (decoded suffix, bytes consumed from l) — Some (_,1) at the
+   close quote. *)
+Fixpoint jstr_body (l : list Z) (cap i : nat) : option (list Z * nat) :=
+  match l with
+  | [] => None
+  | c :: t =>
+    if c =? 0 then None
+    else if c =? 34 then Some ([], 1)%nat
+    else if c =? 92 then
+      match t with
+      | [] => None
+      | e :: t2 =>
+        if e =? 117 then                       (* backslash-u *)
+          match t2 with
+          | h1 :: h2 :: h3 :: h4 :: t3 =>
+            match hexv h1, hexv h2, hexv h3, hexv h4 with
+            | Some a, Some b, Some cv, Some d =>
+              let cp0 := a * 4096 + b * 256 + cv * 16 + d in
+              let resume :=
+                emit_cp cp0 cap i 0
+                  (jstr_body t3 cap (i + length (utf8_enc cp0))%nat) in
+              if (55296 <=? cp0) && (cp0 <=? 56319) then
+                match t3 with
+                | x1 :: x2 :: t3b =>
+                  if (x1 =? 92) && (x2 =? 117) then
+                    match t3b with
+                    | l1 :: l2 :: l3 :: l4 :: t4 =>
+                      match hexv l1, hexv l2, hexv l3, hexv l4 with
+                      | Some la, Some lb, Some lc, Some ld =>
+                        let lo := la*4096 + lb*256 + lc*16 + ld in
+                        if (56320 <=? lo) && (lo <=? 57343) then
+                          emit_cp
+                            (65536 + (cp0 - 55296) * 1024 + (lo - 56320))
+                            cap i 6
+                            (jstr_body t4 cap
+                              (i + length (utf8_enc
+                                 (65536 + (cp0 - 55296) * 1024
+                                  + (lo - 56320))))%nat)
+                        else resume
+                      | _, _, _, _ => resume
+                      end
+                    | _ => resume
+                    end
+                  else resume
+                | _ => resume
+                end
+              else resume
+            | _, _, _, _ => None
+            end
+          | _ => None
+          end
+        else
+          match escv e with
+          | None => None
+          | Some cv =>
+            if (i + 1 <? cap)%nat then
+              option_map (fun '(d,k) => (cv :: d, S (S k)))
+                         (jstr_body t2 cap (i + 1)%nat)
+            else None
+          end
+      end
+    else
+      if (i + 1 <? cap)%nat then
+        option_map (fun '(d,k) => (c :: d, S k)) (jstr_body t cap (i + 1)%nat)
+      else None
+  end.
+
+Definition jstr_dec (cap : nat) (l : list Z) : option (list Z * nat) :=
+  match l with
+  | c :: t => if c =? 34 then
+                option_map (fun '(d,k) => (d, S k)) (jstr_body t cap 0)
+              else None
+  | [] => None
+  end.
+
+(* the concrete decoder meets the abstract contract: a successful
+   decode always consumes at least the open quote *)
+Lemma jstr_dec_contract : forall cap, dec_contract (jstr_dec cap).
+Proof.
+  intros cap b d k H. unfold jstr_dec in H.
+  destruct b as [|c t]; [discriminate|].
+  destruct (Z.eqb c 34); [|discriminate].
+  apply option_map_inv in H. destruct H as [y [F Hk]].
+  destruct y as [d2 k2]. inversion Hk. subst. lia.
+Qed.
+
+(* jkey with the real decoder wired in — fully concrete, extractable *)
+Definition jkey_c (l rest key : list Z) : option nat :=
+  jkey l rest (jstr_dec (S (length l))) key.
+
+(* the abstract theorems discharge on the concrete decoder *)
+Theorem jkey_c_bound : forall l rest key v,
+  jkey_c l rest key = Some v -> (v < length l)%nat.
+Proof. intros l rest key v H. eapply jkey_bound. exact H. Qed.
+
+Theorem jkey_c_fuel : forall l rest fuel key,
+  (length l < fuel)%nat ->
+  jkey_f fuel l rest (jstr_dec (S (length l))) key
+  = jkey_c l rest key.
+Proof.
+  intros l rest fuel key Hf. unfold jkey_c, jkey.
+  apply jkey_fuel with (n := length l);
+    [apply jstr_dec_contract | apply Nat.le_refl | exact Hf].
+Qed.
+
+Theorem jkey_c_sem : forall l rest key v,
+  jkey_c l rest key = Some v ->
+  key_at l rest (jstr_dec (S (length l))) key v.
+Proof. intros l rest key v H. eapply jkey_sem. exact H. Qed.
+
+(* nat-byte wrapper for extraction/diff-testing *)
+Definition jkey_bytes (l rest key : list nat) : option nat :=
+  jkey_c (map Z.of_nat l) (map Z.of_nat rest) (map Z.of_nat key).

@@ -27,3 +27,13 @@ verify/.*.aux
 verify/.lia.cache
 verify/.nia.cache
 .lia.cache
+verify/*.cmi
+verify/*.cmx
+verify/*.o
+verify/jkeym.ml
+verify/jkeym.mli
+verify/diff_jkey_ml
+verify/diff_jkey_c
+verify/jkeycases/
+verify/jk_*/
+verify/.diff_*.out

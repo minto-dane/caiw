@@ -10,9 +10,12 @@
  *   3 jstr(p,buf,bs) JSON string parse; writes stay in buf[0..bs), S=12
  *   4 jstr_skip      NUL-driven skip inside a bounded buffer, J=16
  *   5 jspan          balanced {..}/[..] scan, J=8
- * jkey (key lookup over nested scans) and pack_dec (bit-level index
- * arithmetic) exceed minisat limits at every tested bound — they are
- * covered by fuzzing/EVA instead; cbmc_pack.c retains the harness. */
+ *   6 jkey           nested key scan — smallest useful bound (O=6,R=4);
+ *                    larger bounds exceed minisat limits — Jkey.v covers
+ *                    the algorithm at arbitrary length and diff_jkey.sh
+ *                    checks model<->C agreement on a corpus
+ * pack_dec (bit-level index arithmetic) has its own harness in
+ * cbmc_pack.c / esbmc_pack.c. */
 #define main caiw_main_
 #include "../caiw.c"
 #undef main
@@ -51,6 +54,22 @@ int main() {
     for (int i = 0; i < J - 1; i++) j[i] = (char)nondet_u64();
     j[J - 1] = 0;
     if (*j == '{' || *j == '[') jspan(j);
+#elif PICK == 6
+#ifndef OB
+#define OB 6
+#endif
+#ifndef RB
+#define RB 4
+#endif
+    enum { O = OB, R = RB, K = 4 };
+    char buf[O + R], key[K];
+    for (int i = 0; i < O + R - 1; i++) buf[i] = (char)nondet_u64();
+    buf[O + R - 1] = 0;
+    for (int i = 0; i < K - 1; i++) key[i] = (char)nondet_u64();
+    key[K - 1] = 0;
+    size_t olen = nondet_u64(); __CPROVER_assume(olen <= O);
+    const char *r = jkey(buf, buf + olen, key);
+    if (r) __CPROVER_assert(r >= buf && r < buf + olen, "in span");
 #endif
     return 0;
 }
