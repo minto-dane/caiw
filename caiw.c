@@ -125,18 +125,37 @@ static void out_cleanup(void) { if (!g_outok) for (int i = 0; i < g_outn; i++) i
 
 /* ================= CRC32 (integrity) ================= */
 static uint32_t crc_tab[256], crc_ready = 0;
+/*@ assigns crc_tab[0 .. 255], crc_ready;
+    ensures crc_ready == 1;
+*/
 static void crc_setup(void) {
+    /*@ loop invariant 0 <= i <= 256;
+        loop assigns crc_tab[0 .. 255], i;
+        loop variant 256 - i;
+    */
     for (int i = 0; i < 256; i++) {
         uint32_t c = i;
+        /*@ loop invariant 0 <= k <= 8;
+            loop assigns c, k;
+            loop variant 8 - k;
+        */
         for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
         crc_tab[i] = c;
     }
     crc_ready = 1;
 }
+/*@ requires \valid_read(p + (0 .. n - 1));
+    assigns crc_tab[0 .. 255], crc_ready;
+    ensures crc_ready != 0;
+*/
 static uint32_t crc32_of(const uint8_t *p, uint64_t n) {
     if (!crc_ready) crc_setup();
     uint32_t c = 0xFFFFFFFFu;
-    while (n--) c = crc_tab[(c ^ *p++) & 255] ^ (c >> 8);
+    /*@ loop invariant 0 <= i <= n;
+        loop assigns c, i;
+        loop variant n - i;
+    */
+    for (uint64_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) % 256] ^ (c >> 8);
     return ~c;
 }
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("oom"); return p; }
@@ -543,6 +562,11 @@ static int dtb(const char *d) {
     return 1;
 }
 /* dtype width in BITS (packed sub-byte dtypes exist in the spec); -1 = unknown */
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == -1 || \result == 4 || \result == 6 || \result == 8 ||
+            \result == 16 || \result == 32 || \result == 64;
+*/
 static int dbits(const char *d) {
     if (!strcmp(d, "F64") || !strcmp(d, "I64") || !strcmp(d, "U64")) return 64;
     if (!strcmp(d, "F32") || !strcmp(d, "I32") || !strcmp(d, "U32")) return 32;
@@ -558,9 +582,20 @@ static int dbits(const char *d) {
    multiple of 8 are still valid (the remainder bits are simply absent).
    Also bounds pos_dec's ctx index (po*K/P) to < K. Unknown dtypes are
    treated as opaque bytes (round-trip is still byte-exact). */
+/*@ requires \valid_read(t);
+    requires 0 <= t->nd <= 64;
+    requires valid_read_string(t->dtype);
+    terminates \false;
+    assigns \nothing;
+    exits \exit_status == 1;
+*/
 static void ck_shape_len(const Tensor *t) {
     int bits = dbits(t->dtype); if (bits < 0) bits = 8;
     unsigned __int128 prod = 1;
+    /*@ loop invariant 0 <= d <= t->nd;
+        loop assigns d, prod;
+        loop variant t->nd - d;
+    */
     for (int d = 0; d < t->nd; d++) {
         if (t->shape[d] < 0) die("bad shape");
         prod *= (uint64_t)t->shape[d];
@@ -568,10 +603,30 @@ static void ck_shape_len(const Tensor *t) {
     }
     if (prod * (unsigned)bits / 8 != (unsigned __int128)t->len) die("shape/len mismatch");
 }
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == 0 || \result == 1;
+*/
 static int is_bf(const char *d) { return !strcmp(d, "BF16"); }
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == 0 || \result == 1;
+*/
 static int is_f16(const char *d) { return !strcmp(d, "F16"); }
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == 0 || \result == 1;
+*/
 static int is_f32(const char *d) { return !strcmp(d, "F32"); }
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == 0 || \result == 1;
+*/
 static int is_flt16(const char *d) { return is_bf(d) || is_f16(d); }
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == 7 || \result == 10;
+*/
 static int mbits_of(const char *d) { return is_bf(d) ? 7 : 10; }
 
 /* ================= rolling model =================
@@ -1154,6 +1209,11 @@ static inline uint16_t kmap16_inv(int64_t k) {
     k &= 0xFFFF;
     return (k & 0x8000) ? (uint16_t)(k ^ 0x8000) : (uint16_t)(~k);
 }
+/*@ assigns \nothing;
+    ensures 0 <= \result <= 4294967295;
+    ensures \result == ((u & 0x80000000) != 0 ?
+                        (int64_t)(uint32_t)(~u) : (int64_t)(u ^ 0x80000000));
+*/
 static inline int64_t kmap32(uint32_t u) {   /* ordering map for delta_ok pretest */
     return (u & 0x80000000u) ? (int64_t)(uint32_t)(~u) : (int64_t)(u ^ 0x80000000u);
 }

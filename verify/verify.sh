@@ -302,7 +302,7 @@ fi
 if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
     out=$(PATH="$(dirname "$FRAMAC"):$V/tools/bin:/home/nia/devbox/tools/usr/bin:$PATH" \
         timeout 600 "$FRAMAC" -wp -wp-rte \
-        -wp-fct p16le,p32le,p64le,g32le,g64le,fnv,hex4,utf8_ok,dsym,kmap16,kmap16_inv,enc,dec,emit_blk,read_blk \
+        -wp-fct p16le,p32le,p64le,g32le,g64le,fnv,hex4,utf8_ok,dsym,kmap16,kmap16_inv,kmap32,crc_setup,crc32_of,is_bf,is_f16,is_f32,is_flt16,mbits_of,dbits,ck_shape_len,enc,dec,emit_blk,read_blk \
         -wp-timeout 90 -wp-prover z3,alt-ergo -machdep gcc_x86_64 "$V/wp.c" 2>&1)
     got=$(echo "$out" | grep -oE "[0-9]+ / [0-9]+" | tail -1)
     if [ -n "$got" ]; then
