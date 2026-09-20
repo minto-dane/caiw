@@ -20,6 +20,8 @@
 #                 histograms (Norm.v), arbitrary-length PACK bitstream
 #                 round trip (Pack.v), jkey nested-scan bounds/position
 #                 (Jkey.v)
+#   sweeps.c    — exhaustive dynamic reproducers: rANS emit-boundary x
+#                 every f, dsym tables x all v (checked-in, deterministic)
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -205,6 +207,26 @@ if [ -x "$ESBMC" ] && [ -f "$V/esbmc_pack.c" ]; then
     fi
 else
     skip=$((skip+1)); note "SKIP ESBMC — binary not found (set ESBMC)"
+fi
+
+# ------------------------------------------------- exhaustive C sweeps
+# Checked-in reproducer for the documented exhaustive domains (dynamic
+# evidence, not proofs — but exhaustive over the stated classes):
+#   rANS: every f x every emit-boundary x (byte count changes only at
+#         XMAX*256^k) — round trip + exact consumption per case.
+#   dsym: 3,264 deterministic normalized tables x ALL v — cell containment
+#         + nonzero freq per selection.
+if out=$(${CC:-cc} -O2 -w -pthread -o "$TMPDIR/sweeps" "$V/sweeps.c" -lm 2>&1); then
+    if out=$(timeout 300 "$TMPDIR/sweeps" 2>&1) \
+       && echo "$out" | grep -q "all cases pass"; then
+        ok "exhaustive C sweeps (rANS emit boundaries + dsym)"
+        echo "$out" | grep -v "all cases pass" | while IFS= read -r l; do
+            note "     $l"; done
+    else
+        bad "exhaustive sweeps"; echo "$out" | tail -10
+    fi
+else
+    bad "sweeps.c build"; echo "$out" | tail -5
 fi
 
 # ---------------------------------------------------------------- Coq/Rocq

@@ -110,8 +110,9 @@ already-decoded reference tensor.
   PACK bitstream round trip at any length, and jkey's nested scan
   (bounds, termination, key-position correctness). Bounded results
   and solver limits are documented honestly; the rANS core is
-  additionally covered by an exhaustive boundary sweep (524,537
-  cases) and `dsym` by 3,264 tables × all 32,768 symbol values.
+  additionally covered by an exhaustive boundary sweep (589,809
+  cases — `verify/sweeps.c`, run by `verify.sh`) and `dsym` by
+  3,264 tables × all 32,768 symbol values.
 - **Deterministic** — encode decisions are integer-only, so a fixed `-j`
   reproduces bit-identical archives across machines; archives are
   `-j`-independent on the decode side.
