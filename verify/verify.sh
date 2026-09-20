@@ -13,9 +13,11 @@
 #   ESBMC       — second BMC engine (SMT-encoded); pushes the pack_dec
 #                 bit-index bound past CBMC's OOM — optional, local only
 #                 (~600MB binary)
-#   Coq/Rocq    — algorithm-level interactive proof of the general-domain
-#                 rANS round trip (the nondet-divisor domain all BMC
-#                 engines time out on) — optional, local only
+#   Coq/Rocq    — algorithm-level interactive proofs covering the domains
+#                 all BMC engines time out on: general-domain rANS round
+#                 trip (Rans.v), arbitrary-length UTF-8 validator
+#                 equivalence (Utf8.v), norm_ctx table contract for all
+#                 histograms (Norm.v) — optional, local only
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -189,30 +191,41 @@ else
 fi
 
 # ---------------------------------------------------------------- Coq/Rocq
-# Algorithm-level proof of the rANS single-symbol round trip over the FULL
-# general domain (LOWER <= x < LOWER*256, 1<=f<=TOT, 0<=c<=TOT-f) — the
-# nondet-divisor problem that times out under every BMC engine. This
-# proves the ALGORITHM (Z-arithmetic model of enc/dec), not the C code —
-# same tier as the TLA+/Alloy models. Compilation is the check: the
-# kernel verifies every Qed; coqchk rechecks independently when present.
-if [ -x "$COQC" ] && [ -f "$V/Rans.v" ]; then
-    cp "$V/Rans.v" "$TMPDIR/Rans.v"
-    out=$(cd "$TMPDIR" && timeout 300 "$COQC" Rans.v 2>&1)
-    if [ -f "$TMPDIR/Rans.vo" ]; then
-        if COQCHK=$(command -v coqchk 2>/dev/null); then
-            chk=$(cd "$TMPDIR" && timeout 300 "$COQCHK" -o Rans 2>&1)
-            echo "$chk" | grep -q "successfully checked" \
-                && echo "$chk" | grep -q "Axioms: <none>" \
-                && ok "Coq rANS round trip, general domain (kernel-checked, coqchk-clean)" \
-                || { bad "Coq coqchk"; echo "$chk" | tail -8; }
+# Algorithm-level proofs over Z-arithmetic models — the nondet-divisor
+# regions that time out under every BMC engine:
+#   Rans.v  — rANS single-symbol round trip, FULL general domain
+#             (LOWER <= x < LOWER*256, 1<=f<=TOT, 0<=c<=TOT-f)
+#   Utf8.v  — utf8_ok <-> well-formed UTF-8 for ARBITRARY length
+#             (BMC tops out at n=16 due to nested-scan unwinding)
+#   Norm.v  — norm_ctx contract for ALL histograms and aw <= TOT:
+#             sum = TOT, length preserved, support preserved
+#             (h_i=0 <-> f_i=0, h_i>0 -> 0<f_i<=TOT), both branches
+#             (BMC tops out at aw=2 on the symbolic division)
+# These prove ALGORITHMS, not the C code — same tier as TLA+/Alloy.
+# Compilation is the check: the kernel verifies every Qed; coqchk
+# rechecks each .vo independently (must report Axioms: <none>).
+if [ -x "$COQC" ]; then
+    COQCHK=$(command -v coqchk 2>/dev/null || true)
+    for f in Rans Utf8 Norm; do
+        [ -f "$V/$f.v" ] || continue
+        cp "$V/$f.v" "$TMPDIR/$f.v"
+        out=$(cd "$TMPDIR" && timeout 300 "$COQC" "$f.v" 2>&1)
+        if [ -f "$TMPDIR/$f.vo" ]; then
+            if [ -n "$COQCHK" ]; then
+                chk=$(cd "$TMPDIR" && timeout 300 "$COQCHK" -o "$f" 2>&1)
+                echo "$chk" | grep -q "successfully checked" \
+                    && echo "$chk" | grep -q "Axioms: <none>" \
+                    && ok "Coq $f (kernel-checked, coqchk-clean)" \
+                    || { bad "Coq coqchk $f"; echo "$chk" | tail -8; }
+            else
+                ok "Coq $f (kernel-checked)"
+            fi
         else
-            ok "Coq rANS round trip, general domain (kernel-checked)"
+            bad "Coq $f"; echo "$out" | tail -8
         fi
-    else
-        bad "Coq rANS"; echo "$out" | tail -8
-    fi
+    done
 else
-    skip=$((skip+1)); note "SKIP Coq — coqc not found (set COQC)"
+    skip=$((skip+3)); note "SKIP Coq — coqc not found (set COQC)"
 fi
 
 # ---------------------------------------------------------------- Frama-C

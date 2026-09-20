@@ -23,4 +23,6 @@ verify/*.vos
 verify/*.vok
 verify/*.glob
 verify/*.aux
+verify/.*.aux
 verify/.lia.cache
+verify/.nia.cache
