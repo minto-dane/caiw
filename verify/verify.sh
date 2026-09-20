@@ -18,7 +18,8 @@
 #                 trip (Rans.v), arbitrary-length UTF-8 validator
 #                 equivalence (Utf8.v), norm_ctx table contract for all
 #                 histograms (Norm.v), arbitrary-length PACK bitstream
-#                 round trip (Pack.v) — optional, local only
+#                 round trip (Pack.v), jkey nested-scan bounds/position
+#                 (Jkey.v) — optional, local only
 #   Frama-C     — implementation-level static analysis (EVA/RTE) and
 #                 deductive contract proofs (WP), optional
 #
@@ -205,12 +206,16 @@ fi
 #   Pack.v  — pack_enc/pack_dec bitstream round trip for ARBITRARY
 #             element count, both atom widths (BMC tops out at
 #             BL=48/n<=36 on the bit-index product state space)
+#   Jkey.v  — jkey JSON key-scan: returned offset bounded + fuel
+#             sufficiency + semantic position (key_at) — models the
+#             outer bounded loop AND the NUL-driven string/span skips
+#             on abstract lists (BMC unwinds >240s on nested scans)
 # These prove ALGORITHMS, not the C code — same tier as TLA+/Alloy.
 # Compilation is the check: the kernel verifies every Qed; coqchk
 # rechecks each .vo independently (must report Axioms: <none>).
 if [ -x "$COQC" ]; then
-    COQCHK=$(command -v coqchk 2>/dev/null || true)
-    for f in Rans Utf8 Norm Pack; do
+    COQCHK=${COQCHK:-$(command -v coqchk 2>/dev/null || true)}
+    for f in Rans Utf8 Norm Pack Jkey; do
         [ -f "$V/$f.v" ] || continue
         cp "$V/$f.v" "$TMPDIR/$f.v"
         out=$(cd "$TMPDIR" && timeout 300 "$COQC" "$f.v" 2>&1)
@@ -229,7 +234,7 @@ if [ -x "$COQC" ]; then
         fi
     done
 else
-    skip=$((skip+4)); note "SKIP Coq — coqc not found (set COQC)"
+    skip=$((skip+5)); note "SKIP Coq — coqc not found (set COQC)"
 fi
 
 # ---------------------------------------------------------------- Frama-C
