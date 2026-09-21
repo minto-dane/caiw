@@ -713,20 +713,49 @@ static void hcommit(int c, uint64_t *h) {
     memcpy(gh[c], h, csz[c] * 8); free(h);
 }
 
+/*@ requires \valid_read(h + (0 .. aw - 1));
+    requires \valid(f + (0 .. aw - 1));
+    requires 1 <= aw <= 65536;
+    requires \forall integer i; 0 <= i < aw ==> h[i] <= 281474976710655;
+    assigns f[0 .. aw - 1];
+    ensures (\exists integer j; 0 <= j < aw && h[j] > 0) ==>
+            \forall integer i; 0 <= i < aw && h[i] == 0 ==> f[i] == 0;
+*/
 static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
     uint64_t tot = 0; int nz = 0;
+    /*@ loop invariant 0 <= i <= aw;
+        loop invariant 0 <= nz <= i;
+        loop invariant tot <= (uint64_t)i * 281474976710655;
+        loop invariant \forall integer j; 0 <= j < i ==> h[j] <= tot;
+        loop invariant nz > 0 ==> \exists integer j; 0 <= j < i && h[j] > 0;
+        loop invariant nz == 0 ==> \forall integer j; 0 <= j < i ==> h[j] == 0;
+        loop assigns tot, nz, i;
+        loop variant aw - i;
+    */
     for (int i = 0; i < aw; i++) { tot += h[i]; if (h[i]) nz++; }
     if (!nz) {
         uint16_t v = TOT / aw;
+        /*@ loop invariant 0 <= i <= aw;
+            loop assigns f[0 .. aw - 1], i;
+            loop variant aw - i;
+        */
         for (int i = 0; i < aw; i++) f[i] = v;
         f[aw - 1] += TOT - (uint32_t)v * aw;
         return;
     }
     int64_t rem = TOT, bud = TOT - nz; int bi = 0;
     if (tot < ((uint64_t)1 << 49)) {   /* h[i]<=tot => h[i]*bud < 2^64: u64 mul safe */
+        /*@ loop invariant 0 <= i <= aw;
+            loop invariant 0 <= bi < aw;
+            loop invariant \forall integer j; 0 <= j < i ==> h[j] <= h[bi];
+            loop invariant \forall integer j; 0 <= j < i && h[j] == 0 ==> f[j] == 0;
+            loop invariant rem <= TOT && rem >= TOT - (int64_t)i * 4294967295;
+            loop assigns f[0 .. aw - 1], bi, rem, i;
+            loop variant aw - i;
+        */
         for (int i = 0; i < aw; i++) {
             if (h[i] > h[bi]) bi = i;
-            uint32_t q = h[i] ? (uint32_t)(h[i] * bud / tot) + 1 : 0;
+            uint32_t q = h[i] ? (uint32_t)(h[i] * (uint64_t)bud / tot) + 1 : 0;
             f[i] = (uint16_t)q;
             rem -= q;
         }
@@ -734,13 +763,26 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
                 * (tot itself is still u64 — beyond 2^64 it wraps and
                 * every quotient inflates; real per-block histograms
                 * never approach it.) */
+        /*@ loop invariant 0 <= i <= aw;
+            loop invariant 0 <= bi < aw;
+            loop invariant \forall integer j; 0 <= j < i ==> h[j] <= h[bi];
+            loop invariant \forall integer j; 0 <= j < i && h[j] == 0 ==> f[j] == 0;
+            loop invariant rem <= TOT && rem >= TOT - (int64_t)i * 4294967295;
+            loop assigns f[0 .. aw - 1], bi, rem, i;
+            loop variant aw - i;
+        */
         for (int i = 0; i < aw; i++) {
             if (h[i] > h[bi]) bi = i;
             uint32_t q = h[i] ? (uint32_t)(((unsigned __int128)h[i] * (uint64_t)bud) / tot) + 1 : 0;
+            /*@ assert q <= 4294967295; */
             f[i] = (uint16_t)q;
             rem -= q;
         }
     }
+    /*@ assert 0 <= bi < aw; */
+    /*@ assert \forall integer j; 0 <= j < aw ==> h[j] <= h[bi]; */
+    /*@ assert \exists integer j; 0 <= j < aw && h[j] > 0; */
+    /*@ assert h[bi] > 0; */
     f[bi] += (uint32_t)rem;   /* rem>=0 by construction; deficit to dominant cell */
 }
 
