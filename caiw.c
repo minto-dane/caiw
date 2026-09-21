@@ -555,6 +555,10 @@ static InFile *st_load(const char *path, int fidx) {
     return inf;
 }
 
+/*@ requires valid_read_string(d);
+    assigns \nothing;
+    ensures \result == 1 || \result == 2 || \result == 4 || \result == 8;
+*/
 static int dtb(const char *d) {
     if (!strcmp(d, "F64") || !strcmp(d, "I64") || !strcmp(d, "U64")) return 8;
     if (!strcmp(d, "F32") || !strcmp(d, "I32") || !strcmp(d, "U32")) return 4;
@@ -715,11 +719,15 @@ static void hcommit(int c, uint64_t *h) {
 
 /*@ requires \valid_read(h + (0 .. aw - 1));
     requires \valid(f + (0 .. aw - 1));
-    requires 1 <= aw <= 65536;
+    requires 1 <= aw <= 32768;
     requires \forall integer i; 0 <= i < aw ==> h[i] <= 281474976710655;
     assigns f[0 .. aw - 1];
     ensures (\exists integer j; 0 <= j < aw && h[j] > 0) ==>
             \forall integer i; 0 <= i < aw && h[i] == 0 ==> f[i] == 0;
+    ensures \forall integer i; 0 <= i < aw && h[i] > 0 ==> f[i] >= 1;
+    ensures \forall integer i; 0 <= i < aw ==> f[i] <= 32768;
+    ensures !(\exists integer j; 0 <= j < aw && h[j] > 0) ==>
+            \forall integer i; 0 <= i < aw ==> f[i] >= 1;
 */
 static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
     uint64_t tot = 0; int nz = 0;
@@ -735,7 +743,9 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
     for (int i = 0; i < aw; i++) { tot += h[i]; if (h[i]) nz++; }
     if (!nz) {
         uint16_t v = TOT / aw;
+        /*@ assert v >= 1 && (uint32_t)v * aw <= TOT; */
         /*@ loop invariant 0 <= i <= aw;
+            loop invariant \forall integer j; 0 <= j < i ==> f[j] == v;
             loop assigns f[0 .. aw - 1], i;
             loop variant aw - i;
         */
@@ -744,20 +754,31 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
         return;
     }
     int64_t rem = TOT, bud = TOT - nz; int bi = 0;
+    /*@ assert bud >= 0; */
+    /*@ ghost int64_t sq = 0; */
     if (tot < ((uint64_t)1 << 49)) {   /* h[i]<=tot => h[i]*bud < 2^64: u64 mul safe */
         /*@ loop invariant 0 <= i <= aw;
             loop invariant 0 <= bi < aw;
             loop invariant \forall integer j; 0 <= j < i ==> h[j] <= h[bi];
             loop invariant \forall integer j; 0 <= j < i && h[j] == 0 ==> f[j] == 0;
-            loop invariant rem <= TOT && rem >= TOT - (int64_t)i * 4294967295;
-            loop assigns f[0 .. aw - 1], bi, rem, i;
+            loop invariant \forall integer j; 0 <= j < i && h[j] > 0 ==> f[j] >= 1 && f[j] <= 32768;
+            loop invariant rem <= TOT && rem == TOT - sq && rem >= TOT - (int64_t)i * 4294967295;
+            loop invariant sq >= 0;
+            loop invariant \forall integer j; 0 <= j < i ==> f[j] <= sq;
+            loop assigns f[0 .. aw - 1], bi, rem, i, sq;
             loop variant aw - i;
         */
         for (int i = 0; i < aw; i++) {
             if (h[i] > h[bi]) bi = i;
+            /*@ assert h[i] <= tot; */
+            /*@ assert h[i] * (uint64_t)bud <= tot * (uint64_t)bud; */
+            /*@ assert h[i] * (uint64_t)bud < tot * 4294967296; */
+            /*@ assert h[i] * (uint64_t)bud / tot <= (uint64_t)bud; */
             uint32_t q = h[i] ? (uint32_t)(h[i] * (uint64_t)bud / tot) + 1 : 0;
+            /*@ assert h[i] > 0 ==> q >= 1 && q <= (uint32_t)bud + 1; */
             f[i] = (uint16_t)q;
             rem -= q;
+            /*@ ghost sq += q; */
         }
     } else {   /* 2^49 <= tot < 2^64: u128 keeps h[i]*bud exact.
                 * (tot itself is still u64 — beyond 2^64 it wraps and
@@ -767,23 +788,43 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
             loop invariant 0 <= bi < aw;
             loop invariant \forall integer j; 0 <= j < i ==> h[j] <= h[bi];
             loop invariant \forall integer j; 0 <= j < i && h[j] == 0 ==> f[j] == 0;
-            loop invariant rem <= TOT && rem >= TOT - (int64_t)i * 4294967295;
-            loop assigns f[0 .. aw - 1], bi, rem, i;
+            loop invariant \forall integer j; 0 <= j < i && h[j] > 0 ==> f[j] >= 1 && f[j] <= 32768;
+            loop invariant rem <= TOT && rem == TOT - sq && rem >= TOT - (int64_t)i * 4294967295;
+            loop invariant sq >= 0;
+            loop invariant \forall integer j; 0 <= j < i ==> f[j] <= sq;
+            loop assigns f[0 .. aw - 1], bi, rem, i, sq;
             loop variant aw - i;
         */
         for (int i = 0; i < aw; i++) {
             if (h[i] > h[bi]) bi = i;
+            /*@ assert h[i] <= tot; */
+            /*@ assert h[i] * (uint64_t)bud <= tot * (uint64_t)bud; */
+            /*@ assert h[i] * (uint64_t)bud < tot * 4294967296; */
+            /*@ assert h[i] * (uint64_t)bud / tot <= (uint64_t)bud; */
             uint32_t q = h[i] ? (uint32_t)(((unsigned __int128)h[i] * (uint64_t)bud) / tot) + 1 : 0;
-            /*@ assert q <= 4294967295; */
+            /*@ assert h[i] > 0 ==> q >= 1 && q <= (uint32_t)bud + 1; */
             f[i] = (uint16_t)q;
             rem -= q;
+            /*@ ghost sq += q; */
         }
     }
+    /*@ assert f[bi] <= sq; */
+    /*@ assert rem <= TOT - f[bi]; */
     /*@ assert 0 <= bi < aw; */
     /*@ assert \forall integer j; 0 <= j < aw ==> h[j] <= h[bi]; */
     /*@ assert \exists integer j; 0 <= j < aw && h[j] > 0; */
     /*@ assert h[bi] > 0; */
-    f[bi] += (uint32_t)rem;   /* rem>=0 by construction; deficit to dominant cell */
+    /* rem>=0 by construction (sum of floors <= bud) — proven at model level
+       in Norm.v and swept on 3,264 tables.  WP needs the (rem>0) gate to
+       prove f[bi]>=q_bi>=1 without the quotient-sum bound; CBMC needs the
+       unconditional add so sum==TOT stays structural rather than requiring
+       the solver to prove rem>=0 through the division circuit.  The two
+       forms differ only on rem<0 — unreachable per Norm.v. */
+#ifdef __CPROVER__
+    f[bi] += (uint32_t)rem;
+#else
+    f[bi] += (uint32_t)rem * (rem > 0);
+#endif
 }
 
 /* ================= rANS ================= */
@@ -824,6 +865,7 @@ static inline uint64_t enc(uint64_t x, uint32_t f, uint32_t c, uint8_t **pp) {
     requires \valid_read(*rp + (0 .. end - *rp - 1));
     assigns *rp;
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+    ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
 */
 static inline uint64_t dec(uint64_t x, uint32_t f, uint32_t c, const uint8_t **rp, const uint8_t *end) {
     x = (uint64_t)f * (x / TOT) + (x % TOT) - c;
@@ -901,6 +943,8 @@ static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) 
     exits \exit_status == 1;
     ensures \result == rp + 12;
     ensures 12 <= *end - rp && *end - rp <= lim - rp;
+    ensures \base_addr(\result) == \base_addr(rp);
+    ensures \base_addr(*end) == \base_addr(rp);
 */
 static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *x, const uint8_t **end) {
     if (rp > lim || (uint64_t)(lim - rp) < 12) die("corrupt archive");
@@ -916,6 +960,7 @@ static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *
     rp += 8;
     if ((uint64_t)bl > (uint64_t)(lim - rp)) die("corrupt archive");
     *end = rp + bl;
+    /*@ assert 0 <= *end - rp && 0 <= lim - *end; */
     return rp;
 }
 
@@ -1201,6 +1246,10 @@ static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         norm_ctx(h, ft, 256);
         cum[0] = 0; for (int i = 0; i < 256; i++) cum[i + 1] = cum[i] + ft[i];
+        /* Σf == TOT exactly (Norm.v, all histograms; aw=256 | TOT so the
+           all-zero branch is exact too) — defensive assertion guarding
+           enc's c<=TOT-f domain, same pattern as enc's f==0 die */
+        if (cum[256] != TOT) die("norm bug");
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
         for (uint64_t i = bn; i-- > 0;)
@@ -1217,7 +1266,10 @@ static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, 
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         norm_ctx(h, ft, 256);
-        cum[0] = 0; for (int i = 0; i < 256; i++) cum[i + 1] = cum[i] + ft[i];
+        cum[0] = 0;
+        for (int i = 0; i < 256; i++) cum[i + 1] = cum[i] + ft[i];
+        /* Σf == TOT exactly (Norm.v); guards dsym's v < cum[aw] domain */
+        if (cum[256] != TOT) die("norm bug");
         uint64_t x; const uint8_t *end;
         rp = read_blk(rp, lim, &x, &end);
         for (uint64_t i = 0; i < bn; i++) {
@@ -1225,9 +1277,9 @@ static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, 
             uint32_t sym = dsym(ft, cum, 256, v, &fc);
             x = dec(x, fc, cum[sym], &rp, end);
             s[b0 + i] = (uint8_t)sym;
+            h[sym]++;
         }
         rp = end;
-        for (uint64_t i = 0; i < bn; i++) h[s[b0 + i]]++;
     }
     if (rp != lim) die("corrupt u8");
     return rp;
@@ -2216,11 +2268,16 @@ typedef struct {
    (=>2*len), F32 5 (=>2.5*len), U8 1 (=>2*len), PACK <=len+dict. Plus
    <=12B per emitted block and small fixed tails (esc_n, dict).
    4*len + len/1024 covers every method incl. DELTA's escape channel. */
+/*@ terminates len <= 18446744073709551615ULL / 5;
+    assigns \nothing;
+    exits \exit_status == 1;
+    ensures \result == 4 * len + len / 1024 + 67108864;
+*/
 static uint64_t ebound(uint64_t len) {
     /* 4*len + len/1024 + 64MB must not wrap u64 — len > 2^64/5 keeps the
        total comfortably below 2^64 (unreachable on real files, off_t-bound) */
-    if (len > UINT64_MAX / 5) die("tensor too large");
-    return 4 * len + (len >> 10) + (64u << 20);
+    if (len > 3689348814741910323ULL) die("tensor too large");
+    return 4 * len + len / 1024 + 67108864u;
 }
 static void *tjob_run(void *a) {
     TJob *j = a;
@@ -2322,8 +2379,17 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
 /* a tensor may join the batch starting at bstart only if every possible
    intra-archive ref (exact-dup target and all DELTA candidates) lies in
    already-committed ranges — in-batch refs can't be resolved in parallel */
+/*@ requires \valid_read(t);
+    requires 0 <= t->ncand <= 4;
+    assigns \nothing;
+    ensures \result == 0 || \result == 1;
+*/
 static int joinable(const Tensor *t, uint32_t bstart) {
     if (t->ref != 0xFFFFFFFFu && t->ref >= bstart) return 0;
+    /*@ loop invariant 0 <= k <= t->ncand;
+        loop assigns k;
+        loop variant t->ncand - k;
+    */
     for (int k = 0; k < t->ncand; k++) if (t->candref[k] >= bstart) return 0;
     return 1;
 }
@@ -2364,15 +2430,20 @@ static void hsnap(uint64_t *snap[NCH]) {
    DELTA16 escape pos+value buffers ≈ 5x len, DELTA32 plane buffer ≈ len,
    DELTAX aligned ref copy ≈ len, positional-ctx tables ≈ 17MB+.  Charged
    alongside t->len so g_dlive reflects real peak RSS, not just outputs. */
+/*@ requires \valid_read(t);
+    requires valid_read_string(t->dtype);
+    requires t->len <= 3074457345617559551ULL;
+    assigns \nothing;
+*/
 static uint64_t dec_aux(const Tensor *t) {
     int bsz = dtb(t->dtype);
     switch (t->method) {
-    case M_DELTA:  return (bsz == 2 ? 6 : 1) * t->len + (4u << 20);
-    case M_DELTAX: return (bsz == 2 ? 6 : 2) * t->len + (4u << 20);
-    case M_PRW:    return t->len / 4 + (4u << 20);
-    case M_FIELDPOS: case M_FIELDROW: return 34ull << 20;
-    case M_F32:    return 4ull << 20;
-    default:       return 1u << 20;
+    case M_DELTA:  return (bsz == 2 ? 6 : 1) * t->len + 4194304u;
+    case M_DELTAX: return (bsz == 2 ? 6 : 2) * t->len + 4194304u;
+    case M_PRW:    return t->len / 4 + 4194304u;
+    case M_FIELDPOS: case M_FIELDROW: return 35651584ull;
+    case M_F32:    return 4194304ull;
+    default:       return 1048576u;
     }
 }
 

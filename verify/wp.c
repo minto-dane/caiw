@@ -3,28 +3,53 @@
  * proof per contract, unlike CBMC's bounded model checking.
  *
  * Contracts live in caiw.c itself (ACSL annotations — invisible to
- * gcc, verified here).  Scope (26 functions): byte-order codecs
+ * gcc, verified here).  Scope (30 functions): byte-order codecs
  * (p16le/p32le/p64le, g32le/g64le), fnv, crc_setup/crc32_of, hex4,
  * utf8_ok, dsym, kmap16(+inv)/kmap32, the dtype predicate family
- * (is_bf/is_f16/is_f32/is_flt16/mbits_of/dbits — strcmp specs come
- * from Frama-C's bundled libc), ck_shape_len (bounded shape loop,
+ * (is_bf/is_f16/is_f32/is_flt16/mbits_of/dbits/dtb — strcmp specs
+ * come from Frama-C's bundled libc), ck_shape_len (bounded shape
+ * loop,
  * u128 product, die() paths), the rANS state transitions enc/dec
  * (state band + cursor bounds), the block framing pair
  * emit_blk/read_blk (header+payload bounds, exits/terminates for
- * the die() paths), and norm_ctx (memory safety of both branches,
- * dominant-cell index bounds, zero-support preservation
- * h[i]==0 ==> f[i]==0, signed-remainder bounds — under an explicit
- * h[i] <= 2^48-1 per-cell precondition that keeps tot = Σh exact
- * in u64; real histograms count block elements, orders of magnitude
- * below that bound, but callers are outside WP scope so the bound
- * is an assumption, not a discharged obligation).
- * Still outside WP: norm_ctx's full invariants Σf==TOT and
- * h[i]>0 ==> f[i]>0 need \sum/quotient-sum reasoning WP 33 does
- * not discharge; NUL-driven scans (jstr/jws/jkey/jget) need the
- * strlen axioms (strlen_not_zero & co.) whose quantifier
- * instantiation times out in z3/alt-ergo — attempted, reverted,
- * documented boundary (docs/design.md).  CBMC + the exhaustive
- * sweeps own those functions. */
+ * the die() paths), and norm_ctx — the block-table normalizer:
+ * both division branches memory-safe, dominant-cell bounds,
+ * zero-support preservation (h[i]==0 ==> f[i]==0), POSITIVE
+ * support (h[i]>0 ==> f[i]>=1 — the property decoders rely on for
+ * div-safety), uniform cell bound f[i]<=TOT, and the all-zero
+ * branch's uniform positivity — under explicit requires
+ * 1<=aw<=32768 (bud>=0) and h[i]<=2^48-1 (tot = Σh exact in u64;
+ * real callers pass aw<=1024 and histograms count block elements,
+ * but callers are outside WP scope so these stay assumptions).
+ * The final dominant-cell update is gated by (rem>0) (identical
+ * on every reachable state since rem>=0 always — Norm.v proves it
+ * at model level; CBMC is shown the unconditional add via
+ * __CPROVER__ so its sum==TOT check stays structural rather than
+ * requiring the solver to discharge rem>=0 itself) so every
+ * ensures holds WITHOUT discharging the
+ * quotient-sum bound Σq<=TOT in WP: that bound needs partial-sum
+ * reasoning (Σ_{j<i} h_j <= tot) whose quantifier instantiations
+ * drown Z3 — attempted via ghost prefix arrays and an axiomatic
+ * recursive sum, reverted, documented.  Σf==TOT and rem>=0 stay
+ * with Norm.v (all histograms, axiom-free) + the sweeps.
+ * joinable (bounded candidate scan, 0/1 result), ebound
+ * (non-wrapping capacity formula — true bound recorded as the
+ * terminates condition) and dec_aux (assigns \nothing plus an
+ * honest non-wrap requires; a semantic ensures drowned in the
+ * strcmp-derived context — reverted) round out the scope.
+ * Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
+ * the strlen axioms whose quantifier instantiation times out in
+ * z3/alt-ergo — attempted, reverted, documented boundary
+ * (docs/design.md).  The u8_enc/u8_dec/xm composite layer was
+ * likewise attempted and reverted: *rp returned through assigns
+ * boundaries loses syntactic base identity so the callers'
+ * \valid_read subrange requires don't match (the \base_addr
+ * ensures now on dec/read_blk plus pointer re-anchoring fixed
+ * part of it), and 256-cell loop-assigns forall-preservation
+ * goals drown Z3 in large-function contexts — every surviving
+ * goal was a true proposition; zero code defects were found.
+ * The u8 layer keeps the runtime cum[256]==TOT guard that the
+ * effort added.  CBMC + the exhaustive sweeps own those. */
 #ifdef __FRAMAC__
 #ifndef MADV_SEQUENTIAL
 #define MADV_SEQUENTIAL 2
