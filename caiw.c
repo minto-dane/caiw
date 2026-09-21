@@ -861,7 +861,7 @@ static inline uint64_t enc(uint64_t x, uint32_t f, uint32_t c, uint8_t **pp) {
 }
 /*@ requires 1 <= f <= TOT;
     requires \valid(rp);
-    requires 0 <= end - *rp <= 4294967295;
+    requires 0 <= end - *rp;
     requires \valid_read(*rp + (0 .. end - *rp - 1));
     assigns *rp;
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
@@ -893,6 +893,7 @@ static inline uint64_t dec(uint64_t x, uint32_t f, uint32_t c, const uint8_t **r
     assigns *fc;
     ensures 0 <= \result < aw;
     ensures *fc == f[\result];
+    ensures *fc > 0;
 */
 static inline uint32_t dsym(const uint16_t *f, const uint32_t *cum, int aw, uint32_t v, uint32_t *fc) {
     int lo = 0, hi = aw - 1;
@@ -933,8 +934,7 @@ static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) 
     for (ptrdiff_t i = 0; i < bl; i++) o[12 + i] = pp[i];
     return o + 12 + bl;
 }
-/*@ requires rp <= lim;
-    requires 0 <= lim - rp;
+/*@ requires 0 <= lim - rp;
     requires \valid_read(rp + (0 .. lim - rp - 1));
     requires \valid(x);
     requires \valid(end);
@@ -1260,25 +1260,92 @@ static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
     free(scr);
     return o - out;
 }
+/*@ requires \valid_read(ft + (0 .. 255));
+    requires \valid_read(cum + (0 .. 256));
+    requires \forall integer i; 0 <= i < 256 ==> ft[i] <= 32768;
+    requires cum[0] == 0 && cum[256] == 32768;
+    requires \forall integer i; 0 <= i < 256 ==> cum[i] <= cum[i + 1];
+    requires \forall integer i; 0 <= i < 256 && cum[i] < cum[i + 1] ==> ft[i] > 0;
+    requires \valid_read(r + (0 .. end - r - 1));
+    requires 0 <= end - r;
+    requires \valid(s + (0 .. bn - 1));
+    requires \valid(h + (0 .. 255));
+    requires 1 <= bn <= 131072;
+    requires \forall integer j; 0 <= j < 256 ==> h[j] + bn <= 281474976710655;
+    assigns s[0 .. bn - 1], h[0 .. 255];
+    ensures \forall integer j; 0 <= j < 256 ==> h[j] <= 281474976710655;
+    ensures \forall integer j; 0 <= j < 256 ==> h[j] <= \at(h[j], Pre) + bn;
+*/
+static void u8_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
+                   const uint16_t *ft, const uint32_t *cum,
+                   uint64_t bn, uint8_t *s, uint64_t *h) {
+    /*@ loop invariant 0 <= i <= bn;
+        loop invariant 0 <= end - r;
+        loop invariant \valid_read(r + (0 .. end - r - 1));
+        loop invariant \forall integer j; 0 <= j < 256 ==>
+            h[j] + bn - i <= 281474976710655;
+        loop invariant \forall integer j; 0 <= j < 256 ==>
+            h[j] <= \at(h[j], Pre) + i;
+        loop assigns x, r, s[0 .. bn - 1], h[0 .. 255], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++) {
+        uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
+        uint32_t sym = dsym(ft, cum, 256, v, &fc);
+        x = dec(x, fc, cum[sym], &r, end);
+        s[i] = (uint8_t)sym;
+        h[sym]++;
+    }
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid(s + (0 .. n - 1));
+    requires \valid(h + (0 .. 255));
+    requires n <= 281474976710655;
+    requires \forall integer j; 0 <= j < 256 ==> h[j] + n <= 281474976710655;
+    requires \separated(s + (0 .. n - 1), h + (0 .. 255));
+    requires \separated(s + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(h + (0 .. 255), in + (0 .. lim - in - 1));
+    terminates \false;
+    assigns s[0 .. n - 1], h[0 .. 255];
+    exits \exit_status == 1;
+    ensures \result == lim;
+    ensures \forall integer j; 0 <= j < 256 ==> h[j] <= \at(h[j], Pre) + n;
+*/
 static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint8_t *s, uint64_t *h) {
     const uint8_t *rp = in;
     uint16_t ft[256]; uint32_t cum[257];
+    /*@ loop invariant 0 <= b0;
+        loop invariant 0 <= lim - rp;
+        loop invariant \base_addr(rp) == \base_addr(in);
+        loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+        loop invariant \forall integer j; 0 <= j < 256 ==>
+            h[j] <= \at(h[j], Pre) + b0;
+        loop invariant \forall integer j; 0 <= j < 256 ==>
+            h[j] <= \at(h[j], Pre) + n;
+        loop assigns rp, s[0 .. n - 1], h[0 .. 255], b0,
+            ft[0 .. 255], cum[0 .. 256];
+        loop variant n - b0;
+    */
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         norm_ctx(h, ft, 256);
         cum[0] = 0;
+        /*@ loop invariant 0 <= i <= 256;
+            loop invariant cum[i] <= 32768 * i;
+            loop invariant \forall integer j; 0 <= j < i ==>
+                cum[j + 1] == cum[j] + ft[j];
+            loop assigns cum[1 .. 256], i;
+            loop variant 256 - i;
+        */
         for (int i = 0; i < 256; i++) cum[i + 1] = cum[i] + ft[i];
         /* Σf == TOT exactly (Norm.v); guards dsym's v < cum[aw] domain */
         if (cum[256] != TOT) die("norm bug");
         uint64_t x; const uint8_t *end;
+        /*@ assert 0 <= lim - rp; */
         rp = read_blk(rp, lim, &x, &end);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
-            uint32_t sym = dsym(ft, cum, 256, v, &fc);
-            x = dec(x, fc, cum[sym], &rp, end);
-            s[b0 + i] = (uint8_t)sym;
-            h[sym]++;
-        }
+        u8_blk(x, rp, end, ft, cum, bn, s + b0, h);
         rp = end;
     }
     if (rp != lim) die("corrupt u8");
@@ -1755,10 +1822,48 @@ static void w64(FILE *f, uint64_t v) { uint8_t b[8]; for (int i = 0; i < 8; i++)
 static void w32(FILE *f, uint32_t v) { uint8_t b[4]; for (int i = 0; i < 4; i++) b[i] = (uint8_t)(v >> (8 * i)); fwrite(b, 4, 1, f); }
 static void w16(FILE *f, uint16_t v) { uint8_t b[2] = { (uint8_t)v, (uint8_t)(v >> 8) }; fwrite(b, 2, 1, f); }
 static void w8(FILE *f, uint8_t v) { fwrite(&v, 1, 1, f); }
-static uint64_t r64(const uint8_t **p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)(*p)[i] << (8 * i); *p += 8; return v; }
-static uint32_t r32(const uint8_t **p) { uint32_t v = 0; for (int i = 0; i < 4; i++) v |= (uint32_t)(*p)[i] << (8 * i); *p += 4; return v; }
-static uint16_t r16(const uint8_t **p) { uint16_t v = (uint16_t)((*p)[0] | ((uint16_t)(*p)[1] << 8)); *p += 2; return v; }
-static uint8_t r8(const uint8_t **p) { return *(*p)++; }
+/*@ requires \valid(p);
+    requires \valid_read(*p + (0 .. 7));
+    assigns *p;
+    ensures *p == \at(*p, Pre) + 8;
+    ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
+*/
+static uint64_t r64(const uint8_t **p) {
+    const uint8_t *r = *p;
+    uint64_t v = r[7];
+    v = v * 256 + r[6]; v = v * 256 + r[5];
+    v = v * 256 + r[4]; v = v * 256 + r[3];
+    v = v * 256 + r[2]; v = v * 256 + r[1]; v = v * 256 + r[0];
+    *p = r + 8;
+    return v;
+}
+/*@ requires \valid(p);
+    requires \valid_read(*p + (0 .. 3));
+    assigns *p;
+    ensures *p == \at(*p, Pre) + 4;
+    ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
+*/
+static uint32_t r32(const uint8_t **p) {
+    const uint8_t *r = *p;
+    uint32_t v = r[3];
+    v = v * 256 + r[2]; v = v * 256 + r[1]; v = v * 256 + r[0];
+    *p = r + 4;
+    return v;
+}
+/*@ requires \valid(p);
+    requires \valid_read(*p + (0 .. 1));
+    assigns *p;
+    ensures *p == \at(*p, Pre) + 2;
+    ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
+*/
+static uint16_t r16(const uint8_t **p) { uint16_t v = (uint16_t)((*p)[0] + (uint16_t)(*p)[1] * 256); *p += 2; return v; }
+/*@ requires \valid(p);
+    requires \valid_read(*p);
+    assigns *p;
+    ensures *p == \at(*p, Pre) + 1;
+    ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
+*/
+static uint8_t r8(const uint8_t **p) { uint8_t v = **p; *p += 1; return v; }
 
 static void emit_rec(FILE *of, Tensor *t, int bat) {   /* bat: 0 solo, 1 head, 2 member */
     size_t nl_ = strlen(t->name), dl_ = strlen(t->dtype);

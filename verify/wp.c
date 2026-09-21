@@ -3,16 +3,19 @@
  * proof per contract, unlike CBMC's bounded model checking.
  *
  * Contracts live in caiw.c itself (ACSL annotations — invisible to
- * gcc, verified here).  Scope (30 functions): byte-order codecs
- * (p16le/p32le/p64le, g32le/g64le), fnv, crc_setup/crc32_of, hex4,
- * utf8_ok, dsym, kmap16(+inv)/kmap32, the dtype predicate family
+ * gcc, verified here).  Scope (36 functions): byte-order codecs
+ * (p16le/p32le/p64le, g32le/g64le), the little-endian archive
+ * readers r64/r32/r16/r8 (pointer advance + in-range reads on the
+ * untrusted record-walk path), fnv, crc_setup/crc32_of, hex4,
+ * utf8_ok, dsym (incl. *fc>0 — the caller-visible form of its
+ * exit asserts), kmap16(+inv)/kmap32, the dtype predicate family
  * (is_bf/is_f16/is_f32/is_flt16/mbits_of/dbits/dtb — strcmp specs
  * come from Frama-C's bundled libc), ck_shape_len (bounded shape
  * loop,
  * u128 product, die() paths), the rANS state transitions enc/dec
  * (state band + cursor bounds), the block framing pair
  * emit_blk/read_blk (header+payload bounds, exits/terminates for
- * the die() paths), and norm_ctx — the block-table normalizer:
+ * the die() paths), norm_ctx — the block-table normalizer:
  * both division branches memory-safe, dominant-cell bounds,
  * zero-support preservation (h[i]==0 ==> f[i]==0), POSITIVE
  * support (h[i]>0 ==> f[i]>=1 — the property decoders rely on for
@@ -36,20 +39,29 @@
  * (non-wrapping capacity formula — true bound recorded as the
  * terminates condition) and dec_aux (assigns \nothing plus an
  * honest non-wrap requires; a semantic ensures drowned in the
- * strcmp-derived context — reverted) round out the scope.
+ * strcmp-derived context — reverted), and the U8 DECODE layer —
+ * closed by decomposition: the per-block inner loop is u8_blk
+ * (a small void function taking the stream cursor by value, so
+ * *rp is never assigned across a call boundary), contracted
+ * with the normalized-table facts (cum monotone, cum[256]==TOT,
+ * cum[i]<cum[i+1] ==> ft[i]>0), the h-increment bound, and the
+ * stream-validity invariant; u8_dec itself then proves the
+ * whole block loop — memory safety, per-cell h growth <= n, and
+ * exact-consumption \result==lim — with dsym's *fc>0 feeding
+ * dec()'s f>=1 domain.  The earlier monolithic attempt failed
+ * for solver, not semantic, reasons: *rp returned through
+ * assigns boundaries loses syntactic base identity and 256-cell
+ * loop-assigns forall-preservation drowned Z3 — decomposition
+ * shrinks each goal's context enough that the same facts close.
  * Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
  * the strlen axioms whose quantifier instantiation times out in
  * z3/alt-ergo — attempted, reverted, documented boundary
- * (docs/design.md).  The u8_enc/u8_dec/xm composite layer was
- * likewise attempted and reverted: *rp returned through assigns
- * boundaries loses syntactic base identity so the callers'
- * \valid_read subrange requires don't match (the \base_addr
- * ensures now on dec/read_blk plus pointer re-anchoring fixed
- * part of it), and 256-cell loop-assigns forall-preservation
- * goals drown Z3 in large-function contexts — every surviving
- * goal was a true proposition; zero code defects were found.
- * The u8 layer keeps the runtime cum[256]==TOT guard that the
- * effort added.  CBMC + the exhaustive sweeps own those. */
+ * (docs/design.md).  The u8_enc side resists the analogous
+ * decomposition: its backward-moving write cursor needs a
+ * range-assigns frame whose Qed encoding drowns the same
+ * preservation goals — encoder input is trusted, so CBMC + the
+ * exhaustive sweeps + Norm.v continue to own that side; the
+ * runtime cum[256]==TOT guard stays on both paths. */
 #ifdef __FRAMAC__
 #ifndef MADV_SEQUENTIAL
 #define MADV_SEQUENTIAL 2
