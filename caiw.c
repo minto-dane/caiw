@@ -909,6 +909,29 @@ static inline uint32_t dsym(const uint16_t *f, const uint32_t *cum, int aw, uint
     *fc = f[r];
     return r;
 }
+/* memory-safety-only variant of dsym: same binary search, but requires no
+   cumulative-table invariants and guarantees only an in-range index (the
+   monotone-cum property that makes the index *correct* is a construction
+   invariant proved at model level; the caller runtime-checks *fc before
+   dec() divides by it). */
+/*@ requires 1 <= aw <= 65536;
+    requires \valid_read(f + (0 .. aw - 1));
+    requires \valid_read(cum + (0 .. aw));
+    requires \valid(fc);
+    assigns *fc;
+    ensures 0 <= \result < aw;
+    ensures *fc == f[\result];
+*/
+static inline uint32_t dsym_raw(const uint16_t *f, const uint32_t *cum, int aw, uint32_t v, uint32_t *fc) {
+    int lo = 0, hi = aw - 1;
+    /*@ loop invariant 0 <= lo <= hi <= aw - 1;
+        loop assigns lo, hi;
+        loop variant hi - lo;
+    */
+    while (lo < hi) { int m = (lo + hi) >> 1; if (v >= cum[m + 1]) lo = m + 1; else hi = m; }
+    *fc = f[lo];
+    return (uint32_t)lo;
+}
 /* emit one rANS block: [u32 len][8B state][bytes] */
 /*@ requires 0 <= scr_end - pp <= 4294967295;
     requires \valid_read(pp + (0 .. scr_end - pp - 1));
@@ -999,44 +1022,238 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
     free(ft); free(cum); free(scr);
     return o - out;
 }
+/*@ requires 1 <= ew <= 32768;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires 0 <= mb <= 15;
+    requires \valid_read(ft + (0 .. 2 * ew + 65537));
+    requires \valid_read(cum + (0 .. 4 * ew + 65537));
+    requires \valid(rp);
+    requires 0 <= end - *rp;
+    requires \valid_read(*rp + (0 .. end - *rp - 1));
+    requires \valid(si);
+    requires \valid(h + (0 .. 2 * ew + 65537));
+    requires \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns *rp, *si, h[0 .. 2 * ew + 65537];
+    ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+    ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
+    ensures \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] <= \at(h[j], Pre) + 1;
+*/
+static uint64_t f16_elem(uint64_t x, const uint8_t **rp, const uint8_t *end,
+                         const uint16_t *ft, const uint32_t *cum,
+                         int ew, int mw, int mb, uint16_t *si, uint64_t *h) {
+    const uint16_t *fS = ft, *fE = ft + 2, *fM = ft + 2 + 2 * ew;
+    const uint32_t *cE = cum, *cM = cum + 2 * ew + 2;
+    const uint8_t *r = *rp;
+    uint32_t v = (uint32_t)(x & (TOT - 1)), fc, S, E, M;
+    int se;
+    if (v >= fS[0]) {
+        S = 1;
+        if (!fS[1] || fS[1] > TOT) die("corrupt f16");
+        x = dec(x, fS[1], fS[0], &r, end);
+        v = (uint32_t)(x & (TOT - 1));
+        E = dsym_raw(fE + ew, cE + ew + 1, ew, v, &fc);
+        if (!fc || fc > TOT) die("corrupt f16");
+        x = dec(x, fc, cE[ew + 1 + E], &r, end);
+        se = ew + (int)E;
+    } else {
+        S = 0;
+        if (!fS[0] || fS[0] > TOT) die("corrupt f16");
+        x = dec(x, fS[0], 0, &r, end);
+        v = (uint32_t)(x & (TOT - 1));
+        E = dsym_raw(fE, cE, ew, v, &fc);
+        if (!fc || fc > TOT) die("corrupt f16");
+        x = dec(x, fc, cE[E], &r, end);
+        se = (int)E;
+    }
+    v = (uint32_t)(x & (TOT - 1));
+    /*@ assert 0 <= se && se + 1 <= 2 * ew; */
+    if ((int64_t)se * mw + mw > 65536 ||
+        (int64_t)se * (mw + 1) + mw > (int64_t)2 * ew * (mw + 1) - 1)
+        die("corrupt f16");
+    M = dsym_raw(fM + se * mw, cM + se * (mw + 1), mw, v, &fc);
+    if (!fc || fc > TOT) die("corrupt f16");
+    x = dec(x, fc, cM[se * (mw + 1) + M], &r, end);
+    *si = (uint16_t)((S << 15) | (E << mb) | M);
+    /*@ assert 2 + S * ew + E < 2 + 2 * ew; */
+    /*@ assert 2 + 2 * ew + se * mw + M < 2 * ew + 65538; */
+    h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + se * mw + M]++;
+    *rp = r;
+    return x;
+}
+/*@ requires 1 <= ew <= 32768;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires 0 <= mb <= 15;
+    requires \valid_read(ft + (0 .. 2 * ew + 65537));
+    requires \valid_read(cum + (0 .. 4 * ew + 65537));
+    requires \valid_read(r + (0 .. end - r - 1));
+    requires 0 <= end - r;
+    requires \valid(s + (0 .. bn - 1));
+    requires \valid(h + (0 .. 2 * ew + 65537));
+    requires 1 <= bn <= 131072;
+    requires \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] + bn <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns s[0 .. bn - 1], h[0 .. 2 * ew + 65537];
+    ensures \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] <= \at(h[j], Pre) + bn;
+*/
+static void f16_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
+                    const uint16_t *ft, const uint32_t *cum,
+                    int ew, int mw, int mb,
+                    uint64_t bn, uint16_t *s, uint64_t *h) {
+    /*@ loop invariant 0 <= i <= bn;
+        loop invariant 0 <= end - r;
+        loop invariant \valid_read(r + (0 .. end - r - 1));
+        loop invariant \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+            h[j] + bn - i <= 281474976710655;
+        loop invariant \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+            h[j] <= \at(h[j], Pre) + i;
+        loop assigns x, r, s[0 .. bn - 1], h[0 .. 2 * ew + 65537], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++)
+        x = f16_elem(x, &r, end, ft, cum, ew, mw, mb, s + i, h);
+}
+
+/*@ requires \valid(cc + (0 .. aw));
+    requires \valid_read(f + (0 .. aw - 1));
+    requires 1 <= aw <= 32768;
+    terminates \false;
+    assigns cc[0 .. aw];
+    exits \exit_status == 1;
+*/
+static void fill_ctx(uint32_t *cc, const uint16_t *f, int aw) {
+    cc[0] = 0;
+    /*@ loop invariant 0 <= i <= aw;
+        loop invariant \forall integer j; 0 <= j <= i ==> cc[j] <= 65535 * j;
+        loop assigns cc[1 .. aw], i;
+        loop variant aw - i;
+    */
+    for (int i = 0; i < aw; i++)
+        cc[i + 1] = cc[i] + f[i];
+    if (cc[aw] != TOT) die("norm bug");
+}
+
+/*@ requires 1 <= ew <= 256;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires \valid_read(h + (0 .. 2 * ew + 65537));
+    requires \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] <= 281474976710655;
+    requires \valid(fM + (0 .. 65535));
+    terminates \false;
+    assigns fM[0 .. 65535];
+    exits \exit_status == 1;
+*/
+static void norm_fM(const uint64_t *h, uint16_t *fM, int ew, int mw) {
+    /*@ loop invariant 0 <= c <= 2 * ew;
+        loop assigns fM[0 .. 65535], c;
+        loop variant 2 * ew - c;
+    */
+    for (int c = 0; c < 2 * ew; c++) {
+        if ((int64_t)c * mw + mw > 65536) die("f16 layout");
+        /*@ assert c * mw + mw <= 65536; */
+        norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, fM + (size_t)c * mw, mw);
+    }
+}
+
+/*@ requires 1 <= ew <= 256;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires \valid_read(h + (0 .. 2 * ew + 65537));
+    requires \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] <= 281474976710655;
+    requires \valid(ft + (0 .. 2 * ew + 65537));
+    requires \valid(cum + (0 .. 4 * ew + 65537));
+    terminates \false;
+    assigns ft[0 .. 2 * ew + 65537], cum[0 .. 4 * ew + 65537];
+    exits \exit_status == 1;
+*/
+static void f16_tab(const uint64_t *h, uint16_t *ft, uint32_t *cum, int ew, int mw) {
+    uint16_t *fS = ft, *fE = ft + 2, *fM = ft + 2 + 2 * ew;
+    norm_ctx(h, fS, 2);
+    /*@ loop invariant 0 <= c <= 2;
+        loop assigns fE[0 .. 2 * ew - 1], c;
+        loop variant 2 - c;
+    */
+    for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, fE + c * ew, ew);
+    norm_fM(h, fM, ew, mw);
+    /* Σf == TOT exactly (Norm.v); guards dsym's v < cum[aw] domain */
+    if (fS[0] + fS[1] != TOT) die("norm bug");
+    uint32_t *cE = cum, *cM = cum + 2 * ew + 2;
+    /*@ loop invariant 0 <= c <= 2;
+        loop assigns cE[0 .. 2 * ew + 1], c;
+        loop variant 2 - c;
+    */
+    for (int c = 0; c < 2; c++) fill_ctx(cE + c * (ew + 1), fE + c * ew, ew);
+    int k = 0;
+    /*@ loop invariant 0 <= c <= 2 * ew;
+        loop invariant 0 <= k;
+        loop assigns cM[0 .. 2 * ew * (mw + 1) - 1], c, k;
+        loop variant 2 * ew - c;
+    */
+    for (int c = 0; c < 2 * ew; c++) {
+        if ((int64_t)k + mw + 1 > (int64_t)2 * ew * (mw + 1) ||
+            (int64_t)c * mw + mw > 65536)
+            die("f16 layout");
+        /*@ assert k + mw + 1 <= 2 * ew * (mw + 1) && c * mw + mw <= 65536; */
+        fill_ctx(cM + k, fM + c * mw, mw);
+        k += mw + 1;
+    }
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires mb == 7 || mb == 10;
+    requires \valid(s + (0 .. n - 1));
+    requires \valid(h + (0 .. (mb == 7 ? 66050 : 65602) - 1));
+    requires n <= 281474976710655;
+    requires \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+        h[j] + n <= 281474976710655;
+    requires \separated(s + (0 .. n - 1), h + (0 .. (mb == 7 ? 66050 : 65602) - 1));
+    requires \separated(s + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(h + (0 .. (mb == 7 ? 66050 : 65602) - 1), in + (0 .. lim - in - 1));
+    terminates \false;
+    assigns s[0 .. n - 1], h[0 .. (mb == 7 ? 66050 : 65602) - 1];
+    exits \exit_status == 1;
+    ensures \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+        h[j] <= \at(h[j], Pre) + n;
+*/
 static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, uint16_t *s, uint64_t *h) {
-    int ew = 1 << (15 - mb), mw = 1 << mb;
+    int ew, mw;
+    if (mb == 7) { ew = 256; mw = 128; } else { ew = 32; mw = 1024; }
+    /*@ assert ew * mw == 32768; */
+    /*@ assert 2 * ew + 65538 <= (mb == 7 ? 66050 : 65602); */
+    /*@ assert \forall integer j; 0 <= j < 2 * ew + 65538 ==>
+        h[j] <= 281474976710655; */
     const uint8_t *rp = in;
-    uint16_t *ft = xm((2 + 2 * ew + (size_t)2 * ew * mw) * 2);
-    uint32_t *cum = xc((size_t)2 + 2 * ew + 2 * ew * mw + 8, 4);
+    uint16_t ft[66050];              /* max cells over mb in {7,10} */
+    uint32_t cum[66566];             /* 2(ew+1) + 2ew(mw+1) at mb=7 */
+    /*@ loop invariant 0 <= b0;
+        loop invariant 0 <= lim - rp;
+        loop invariant \base_addr(rp) == \base_addr(in);
+        loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+        loop invariant \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+            h[j] <= \at(h[j], Pre) + b0;
+        loop invariant \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+            h[j] <= \at(h[j], Pre) + n;
+        loop assigns rp, s[0 .. n - 1], h[0 .. (mb == 7 ? 66050 : 65602) - 1], b0,
+            ft[0 .. 66049], cum[0 .. 66565];
+        loop variant n - b0;
+    */
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
-        uint16_t *fS = ft, *fE = ft + 2, *fM = ft + 2 + 2 * ew;
-        norm_ctx(h, fS, 2);
-        for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, fE + c * ew, ew);
-        for (int c = 0; c < 2 * ew; c++) norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, fM + (size_t)c * mw, mw);
-        uint32_t cS1 = fS[0];
-        uint32_t *cE = cum, *cM = cum + 2 * ew + 4;
-        for (int c = 0; c < 2; c++) { cE[c * ew] = 0; for (int i = 0; i < ew; i++) cE[c * ew + i + 1] = cE[c * ew + i] + fE[c * ew + i]; }
-        for (int c = 0; c < 2 * ew; c++) { size_t b = (size_t)c * mw; cM[b] = 0; for (int i = 0; i < mw; i++) cM[b + i + 1] = cM[b + i] + fM[b + i]; }
+        f16_tab(h, ft, cum, ew, mw);
         uint64_t x; const uint8_t *end;
+        /*@ assert 0 <= lim - rp; */
         rp = read_blk(rp, lim, &x, &end);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
-            uint32_t S = v >= cS1;
-            x = dec(x, fS[S], S ? cS1 : 0, &rp, end);
-            v = (uint32_t)(x & (TOT - 1));
-            uint32_t E = dsym(fE + S * ew, cE + S * ew, ew, v, &fc);
-            x = dec(x, fc, cE[S * ew + E], &rp, end);
-            v = (uint32_t)(x & (TOT - 1));
-            size_t mb2 = (size_t)(S * ew + E) * mw;
-            uint32_t M = dsym(fM + mb2, cM + mb2, mw, v, &fc);
-            x = dec(x, fc, cM[mb2 + M], &rp, end);
-            s[b0 + i] = (uint16_t)((S << 15) | (E << mb) | M);
-        }
+        f16_blk(x, rp, end, ft, cum, ew, mw, mb, bn, s + b0, h);
         rp = end;
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = s[b0 + i], S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
-            h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
-        }
     }
     if (rp != lim) die("corrupt field");   /* every caller hands the exact stream end */
-    free(ft); free(cum);
 }
 
 /* ============ FIELD+POS: 16-bit, exact position contexts ============
@@ -1090,6 +1307,246 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
     free(ft); free(cum); free(scr);
     return o - out;
 }
+/*@ requires 1 <= ew <= 32768;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires 0 <= mb <= 15;
+    requires 1 <= sew <= 32768;
+    requires 0 <= tSE <= 2097152;
+    requires 0 <= tC;
+    requires \valid_read(ft + (0 .. tSE + 65535));
+    requires \valid_read(cum + (0 .. tC + 65536 + 2 * ew - 1));
+    requires \valid(rp);
+    requires 0 <= end - *rp;
+    requires \valid_read(*rp + (0 .. end - *rp - 1));
+    requires \valid(si);
+    requires \valid(h + (0 .. 2162687));
+    requires \forall integer j; 0 <= j < 2162688 ==>
+        h[j] <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns *rp, *si, h[0 .. 2162687];
+    ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+    ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
+    ensures \forall integer j; 0 <= j < 2162688 ==>
+        h[j] <= \at(h[j], Pre) + 1;
+*/
+static uint64_t pos_elem(uint64_t x, const uint8_t **rp, const uint8_t *end,
+                         const uint16_t *ft, const uint32_t *cum,
+                         int ew, int mw, int mb,
+                         int64_t sew, int64_t tSE, int64_t tC, int64_t ctx,
+                         uint16_t *si, uint64_t *h) {
+    const uint16_t *fM = ft + tSE;
+    const uint32_t *cSE = cum, *cM = cum + tC;
+    const uint8_t *r = *rp;
+    uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
+    if (ctx < 0 || ctx > tSE) die("corrupt pos");
+    /*@ assert 0 <= ctx && ctx <= tSE; */
+    if ((int64_t)ctx * sew + sew > tSE ||
+        (int64_t)ctx * (sew + 1) + sew > tC)
+        die("corrupt pos");
+    /*@ assert ctx * sew + sew <= tSE && ctx * (sew + 1) + sew <= tC; */
+    uint32_t SE = dsym_raw(ft + ctx * sew, cSE + ctx * (sew + 1), sew, v, &fc);
+    if (!fc || fc > TOT) die("corrupt pos");
+    x = dec(x, fc, cSE[ctx * (sew + 1) + SE], &r, end);
+    v = (uint32_t)(x & (TOT - 1));
+    if ((int64_t)SE * mw + mw > 65536 ||
+        (int64_t)SE * (mw + 1) + mw > 65536 + 2 * ew - 1)
+        die("corrupt pos");
+    /*@ assert SE * mw + mw <= 65536 && SE * (mw + 1) + mw <= 65536 + 2 * ew - 1; */
+    uint32_t M = dsym_raw(fM + SE * mw, cM + SE * (mw + 1), mw, v, &fc);
+    if (!fc || fc > TOT) die("corrupt pos");
+    x = dec(x, fc, cM[SE * (mw + 1) + M], &r, end);
+    *si = (uint16_t)((SE << mb) | M);
+    /*@ assert ctx * sew + SE < 2162688; */
+    /*@ assert tSE + SE * mw + M < 2162688; */
+    h[ctx * sew + SE]++;
+    h[tSE + SE * mw + M]++;
+    *rp = r;
+    return x;
+}
+
+/*@ requires 1 <= ew <= 32768;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires 0 <= mb <= 15;
+    requires 1 <= sew <= 32768;
+    requires 0 <= tSE <= 2097152;
+    requires 0 <= tC;
+    requires 1 <= K <= 2097152;
+    requires 1 <= P <= 1099511627776;
+    requires 1 <= D;
+    requires 0 <= rowwise <= 1;
+    requires \valid_read(ft + (0 .. tSE + 65535));
+    requires \valid_read(cum + (0 .. tC + 65536 + 2 * ew - 1));
+    requires \valid_read(r + (0 .. end - r - 1));
+    requires 0 <= end - r;
+    requires \valid(s + (0 .. bn - 1));
+    requires \valid(h + (0 .. 2162687));
+    requires 1 <= bn <= 131072;
+    requires \forall integer j; 0 <= j < 2162688 ==>
+        h[j] + bn <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns s[0 .. bn - 1], h[0 .. 2162687];
+    ensures \forall integer j; 0 <= j < 2162688 ==>
+        h[j] <= \at(h[j], Pre) + bn;
+*/
+static void pos_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
+                    const uint16_t *ft, const uint32_t *cum,
+                    int ew, int mw, int mb,
+                    int64_t sew, int64_t K, int64_t tSE, int64_t tC,
+                    int64_t P, int64_t D, int rowwise, uint64_t b0,
+                    uint64_t bn, uint16_t *s, uint64_t *h) {
+    /*@ loop invariant 0 <= i <= bn;
+        loop invariant 0 <= end - r;
+        loop invariant \valid_read(r + (0 .. end - r - 1));
+        loop invariant \forall integer j; 0 <= j < 2162688 ==>
+            h[j] + bn - i <= 281474976710655;
+        loop invariant \forall integer j; 0 <= j < 2162688 ==>
+            h[j] <= \at(h[j], Pre) + i;
+        loop assigns x, r, s[0 .. bn - 1], h[0 .. 2162687], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++) {
+        uint64_t gi = b0 + i;
+        int64_t po = rowwise ? (int64_t)(gi / (uint64_t)D) : (int64_t)(gi % (uint64_t)P);
+        if (po < 0 || po >= P) die("corrupt pos");
+        int64_t ctx = (int64_t)((__int128)po * K / P);
+        x = pos_elem(x, &r, end, ft, cum, ew, mw, mb, sew, tSE, tC, ctx, s + i, h);
+    }
+}
+
+/*@ requires 1 <= ew <= 32768;
+    requires 1 <= mw <= 32768 && ew * mw == 32768;
+    requires 1 <= sew <= 32768;
+    requires 1 <= K <= 2097152;
+    requires 0 <= tSE <= 2097152;
+    requires tC == tSE + K;
+    requires \valid_read(h + (0 .. 2162687));
+    requires \forall integer j; 0 <= j < 2162688 ==>
+        h[j] <= 281474976710655;
+    requires \valid(ft + (0 .. tSE + 65535));
+    requires \valid(cum + (0 .. tC + 65536 + 2 * ew - 1));
+    terminates \false;
+    assigns ft[0 .. tSE + 65535], cum[0 .. tC + 65536 + 2 * ew - 1];
+    exits \exit_status == 1;
+*/
+static void pos_tab(const uint64_t *h, uint16_t *ft, uint32_t *cum,
+                    int ew, int mw, int64_t sew, int64_t K, int64_t tSE, int64_t tC) {
+    /*@ loop invariant 0 <= c <= K;
+        loop invariant 0 <= off <= tSE;
+        loop assigns ft[0 .. tSE + 65535], c, off;
+        loop variant K - c;
+    */
+    for (int64_t c = 0, off = 0; c < K; c++, off += sew) {
+        if (off + sew > tSE) die("pos layout");
+        /*@ assert off + sew <= tSE; */
+        norm_ctx(h + off, ft + off, sew);
+    }
+    int k = 0;
+    /*@ loop invariant 0 <= c <= 2 * ew;
+        loop invariant 0 <= k <= 65536;
+        loop assigns ft[tSE .. tSE + 65535], c, k;
+        loop variant 2 * ew - c;
+    */
+    for (int c = 0; c < 2 * ew; c++, k += mw) {
+        if (k + mw > 65536) die("pos layout");
+        /*@ assert k + mw <= 65536; */
+        norm_ctx(h + tSE + k, ft + tSE + k, mw);
+    }
+    uint32_t *cSE = cum, *cM = cum + tC;
+    int64_t k2 = 0, fo = 0;
+    /*@ loop invariant 0 <= c <= K;
+        loop invariant 0 <= k2 <= tC;
+        loop invariant 0 <= fo <= tSE;
+        loop assigns cSE[0 .. tC - 1], c, k2, fo;
+        loop variant K - c;
+    */
+    for (int64_t c = 0; c < K; c++, k2 += sew + 1, fo += sew) {
+        if (fo + sew > tSE || k2 + sew + 1 > tC) die("pos layout");
+        /*@ assert fo + sew <= tSE && k2 + sew + 1 <= tC; */
+        fill_ctx(cSE + k2, ft + fo, sew);
+    }
+    k = 0;
+    /*@ loop invariant 0 <= c <= 2 * ew;
+        loop invariant 0 <= c <= k && k <= 65536 + 2 * ew;
+        loop assigns cM[0 .. 65536 + 2 * ew - 1], c, k;
+        loop variant 2 * ew - c;
+    */
+    for (int c = 0; c < 2 * ew; c++, k += mw + 1) {
+        if (k + mw + 1 > 65536 + 2 * ew || k - c + mw > 65536) die("pos layout");
+        /*@ assert k + mw + 1 <= 65536 + 2 * ew && k - c + mw <= 65536; */
+        fill_ctx(cM + k, ft + tSE + k - c, mw);
+    }
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires mb == 7 || mb == 10;
+    requires 1 <= P <= 1099511627776;
+    requires 1 <= D;
+    requires 1 <= K <= 2097152;
+    requires 0 <= rowwise <= 1;
+    requires 0 <= tSE <= 2097152;
+    requires tC == tSE + K;
+    requires \valid(s + (0 .. n - 1));
+    requires \valid(h + (0 .. 2162687));
+    requires n <= 281474976710655;
+    requires \forall integer j; 0 <= j < 2162688 ==>
+        h[j] + n <= 281474976710655;
+    requires \valid(ft + (0 .. tSE + 65535));
+    requires \valid(cum + (0 .. tC + (mb == 7 ? 66048 : 65600) - 1));
+    requires \separated(s + (0 .. n - 1), h + (0 .. 2162687));
+    requires \separated(s + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(h + (0 .. 2162687), in + (0 .. lim - in - 1));
+    requires \separated(ft + (0 .. tSE + 65535), s + (0 .. n - 1));
+    requires \separated(ft + (0 .. tSE + 65535), h + (0 .. 2162687));
+    requires \separated(ft + (0 .. tSE + 65535), in + (0 .. lim - in - 1));
+    requires \separated(cum + (0 .. tC + (mb == 7 ? 66048 : 65600) - 1), s + (0 .. n - 1));
+    requires \separated(cum + (0 .. tC + (mb == 7 ? 66048 : 65600) - 1), h + (0 .. 2162687));
+    requires \separated(cum + (0 .. tC + (mb == 7 ? 66048 : 65600) - 1), in + (0 .. lim - in - 1));
+    requires \separated(ft + (0 .. tSE + 65535), cum + (0 .. tC + (mb == 7 ? 66048 : 65600) - 1));
+    terminates \false;
+    assigns s[0 .. n - 1], h[0 .. 2162687],
+        ft[0 .. tSE + 65535], cum[0 .. tC + (mb == 7 ? 66048 : 65600) - 1];
+    exits \exit_status == 1;
+    ensures \forall integer j; 0 <= j < 2162688 ==>
+        h[j] <= \at(h[j], Pre) + n;
+*/
+static void pos_dec_ws(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb,
+                       int64_t P, int64_t D, int64_t K, int rowwise,
+                       int64_t tSE, int64_t tC,
+                       uint16_t *s, uint64_t *h, uint16_t *ft, uint32_t *cum) {
+    int ew, mw;
+    if (mb == 7) { ew = 256; mw = 128; } else { ew = 32; mw = 1024; }
+    int64_t sew = 2 * ew;
+    /*@ assert ew * mw == 32768; */
+    /*@ assert 65536 + 2 * ew <= (mb == 7 ? 66048 : 65600); */
+    const uint8_t *rp = in;
+    /*@ loop invariant 0 <= b0;
+        loop invariant 0 <= lim - rp;
+        loop invariant \base_addr(rp) == \base_addr(in);
+        loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+        loop invariant \forall integer j; 0 <= j < 2162688 ==>
+            h[j] <= \at(h[j], Pre) + b0;
+        loop invariant \forall integer j; 0 <= j < 2162688 ==>
+            h[j] <= \at(h[j], Pre) + n;
+        loop assigns rp, s[0 .. n - 1], h[0 .. 2162687], b0,
+            ft[0 .. tSE + 65535], cum[0 .. tC + (mb == 7 ? 66048 : 65600) - 1];
+        loop variant n - b0;
+    */
+    for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
+        uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
+        pos_tab(h, ft, cum, ew, mw, sew, K, tSE, tC);
+        uint64_t x; const uint8_t *end;
+        /*@ assert 0 <= lim - rp; */
+        rp = read_blk(rp, lim, &x, &end);
+        pos_blk(x, rp, end, ft, cum, ew, mw, mb, sew, K, tSE, tC, P, D,
+                rowwise, b0, bn, s + b0, h);
+        rp = end;
+    }
+    if (rp != lim) die("corrupt pos");
+}
+
 static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, int64_t P, int rowwise,
                     uint16_t *s, uint64_t *h) {
     if (P <= 0 || P > ((int64_t)1 << 40)) die("bad shape");
@@ -1097,44 +1554,10 @@ static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, i
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
     int64_t D = n / P;
     if (D < 1) D = 1;
-    const uint8_t *rp = in;
-    size_t tSE = (size_t)K * sew, tM = (size_t)2 * ew * mw;
-    uint16_t *ft = xm((tSE + tM) * 2);
-    uint32_t *cum = xc(tSE + (size_t)K * sew + tM + 8, 4);
-    for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
-        uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
-        for (int64_t c = 0; c < K; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
-        for (int c = 0; c < 2 * ew; c++) norm_ctx(h + tSE + (size_t)c * mw, ft + tSE + (size_t)c * mw, mw);
-        uint32_t *cSE = cum, *cM = cum + tSE + (size_t)K * sew;
-        for (int64_t c = 0; c < K; c++) { cSE[c * sew] = 0; for (int i = 0; i < sew; i++) cSE[c * sew + i + 1] = cSE[c * sew + i] + ft[c * sew + i]; }
-        for (int c = 0; c < 2 * ew; c++) { size_t b = (size_t)c * mw; cM[b] = 0; for (int i = 0; i < mw; i++) cM[b + i + 1] = cM[b + i] + ft[tSE + b + i]; }
-        uint64_t x; const uint8_t *end;
-        rp = read_blk(rp, lim, &x, &end);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint64_t gi = b0 + i;
-            int64_t po = rowwise ? (int64_t)(gi / D) : (int64_t)(gi % P);
-            int64_t ctx = po * K / P;
-            uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
-            uint32_t SE = dsym(ft + ctx * sew, cSE + ctx * sew, sew, v, &fc);
-            x = dec(x, fc, cSE[ctx * sew + SE], &rp, end);
-            v = (uint32_t)(x & (TOT - 1));
-            size_t mb2 = (size_t)SE * mw;
-            uint32_t M = dsym(ft + tSE + mb2, cM + mb2, mw, v, &fc);
-            x = dec(x, fc, cM[mb2 + M], &rp, end);
-            s[gi] = (uint16_t)((SE << mb) | M);
-        }
-        rp = end;
-        for (uint64_t i = 0; i < bn; i++) {
-            uint64_t gi = b0 + i;
-            int64_t po = rowwise ? (int64_t)(gi / D) : (int64_t)(gi % P);
-            int64_t ctx = po * K / P;
-            uint32_t v = s[gi];
-            uint32_t SE = v >> mb, Mv = v & (mw - 1);
-            h[ctx * sew + SE]++;
-            h[tSE + (size_t)SE * mw + Mv]++;
-        }
-    }
-    if (rp != lim) die("corrupt pos");
+    size_t tSE = (size_t)K * sew, tC = (size_t)K * (sew + 1);
+    uint16_t *ft = xm((tSE + (size_t)2 * ew * mw) * 2);
+    uint32_t *cum = xc(tC + (size_t)2 * ew * (mw + 1), 4);
+    pos_dec_ws(in, lim, n, mb, P, D, K, rowwise, (int64_t)tSE, (int64_t)tC, s, h, ft, cum);
     free(ft); free(cum);
 }
 

@@ -3,7 +3,7 @@
  * proof per contract, unlike CBMC's bounded model checking.
  *
  * Contracts live in caiw.c itself (ACSL annotations — invisible to
- * gcc, verified here).  Scope (36 functions): byte-order codecs
+ * gcc, verified here).  Scope (47 functions): byte-order codecs
  * (p16le/p32le/p64le, g32le/g64le), the little-endian archive
  * readers r64/r32/r16/r8 (pointer advance + in-range reads on the
  * untrusted record-walk path), fnv, crc_setup/crc32_of, hex4,
@@ -53,7 +53,37 @@
  * assigns boundaries loses syntactic base identity and 256-cell
  * loop-assigns forall-preservation drowned Z3 — decomposition
  * shrinks each goal's context enough that the same facts close.
- * Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
+ * The F16/FIELD decoder layer is closed the same way, one level
+ * deeper: f16_elem (one element: S/E/M symbol decodes via
+ * dsym_raw — a memory-safety-only binary-search variant whose
+ * contract needs no table semantics — with every dec() call
+ * guarded by a runtime fc check so div-safety is a path fact,
+ * not a quantified hypothesis), f16_blk (per-block loop, cursor
+ * by value), fill_ctx (per-context prefix-sum build, u32-safe by
+ * the linear 65535*i bound — f entries are u16 so no table
+ * invariant is needed at all), norm_fM (the 2ew-context
+ * norm_ctx sweep with an int64 index check per context), and
+ * f16_tab (whole ft/cum construction); f16_dec then proves the
+ * block loop, exact consumption (rp==lim), memory safety, and
+ * the h-growth bound.  ew/mw enter as literals per mb∈{7,10}
+ * branch — semantically identical (mb is contract-bound) but
+ * keeps 1<<(15-mb) shift evaluation out of every goal.
+ * Quantifier-instantiation notes: ctx-index products like
+ * c*(mw+1) in forall hypotheses defeat e-matching (Qed's let-CSE
+ * renames the products), so the layer carries NO semantic cum
+ * invariants — the runtime cum[aw]==TOT and fc guards (unreachable
+ * on encoder-produced tables, die() otherwise) plus Norm.v own
+ * those facts instead.  The FIELDPOS/FIELDROW decoder closes
+ * identically: pos_dec is a thin alloc+call+free shell and the
+ * real work lives in pos_dec_ws (heap workspace passed as
+ * pointers — xm/xc cannot be contracted since \fresh cannot
+ * re-export malloc's bundled spec; callers are out of scope
+ * anyway), pos_tab walks contexts with accumulator indices
+ * (off/fo/k2 — zero product-index goals), pos_blk bounds the
+ * position ctx via a po>=P die (unreachable when P|n) and a
+ * __int128 po*K/P product, and pos_elem decodes SE/M through
+ * dsym_raw with int64 checks feeding every bound as a path
+ * fact.  Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
  * the strlen axioms whose quantifier instantiation times out in
  * z3/alt-ergo — attempted, reverted, documented boundary
  * (docs/design.md).  The u8_enc side resists the analogous
