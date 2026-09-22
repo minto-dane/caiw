@@ -131,6 +131,13 @@
  * row framing with a linear pos cursor in place of r*cols,
  * per-row [u32 len] bounds l1/lr, exact in==lim consumption,
  * and workspace-slice separation stated as asserts.
+ * Every assigns clause that writes a pointer (or returns one)
+ * now carries a \from functional-dependency set — the pedantic
+ * "no \from specification" warnings are all discharged: cursor
+ * stores say \from <old cursor + the inputs that decide
+ * advancement>, block readers say \result \from the header
+ * bytes that set the returned position, and u8_dec's
+ * \result \from lim literalizes the exact-consumption ensures.
  * Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
  * the strlen axioms whose quantifier instantiation times out in
  * z3/alt-ergo — attempted, reverted, documented boundary

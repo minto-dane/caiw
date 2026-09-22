@@ -833,7 +833,7 @@ static void norm_ctx(const uint64_t *h, uint16_t *f, int aw) {
     requires LOWER <= x && x < 256 * LOWER;
     requires \valid(pp);
     requires \valid(*pp + (-2 .. -1));
-    assigns *pp, (*pp)[-2 .. -1];
+    assigns *pp, (*pp)[-2 .. -1] \from *pp, x, f;
     ensures LOWER <= \result && \result < 256 * LOWER;
     ensures \at(*pp, Pre) - 2 <= *pp && *pp <= \at(*pp, Pre);
 */
@@ -863,7 +863,7 @@ static inline uint64_t enc(uint64_t x, uint32_t f, uint32_t c, uint8_t **pp) {
     requires \valid(rp);
     requires 0 <= end - *rp;
     requires \valid_read(*rp + (0 .. end - *rp - 1));
-    assigns *rp;
+    assigns *rp \from *rp, x, f, c, end, (*rp)[0 .. end - *rp - 1];
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
     ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
 */
@@ -938,7 +938,9 @@ static inline uint32_t dsym_raw(const uint16_t *f, const uint32_t *cum, int aw, 
     requires \valid(o + (0 .. 11));
     requires \valid(o + (12 .. 11 + (scr_end - pp)));
     requires \separated(o + (0 .. 11 + (scr_end - pp)), pp + (0 .. scr_end - pp - 1));
-    assigns o[0 .. 11 + (scr_end - pp)];
+    assigns o[0 .. 11 + (scr_end - pp)] \from o, scr_end, pp, x,
+        pp[0 .. scr_end - pp - 1];
+    assigns \result \from o, scr_end, pp;
     ensures \result == o + 12 + (scr_end - pp);
 */
 static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) {
@@ -962,7 +964,9 @@ static uint8_t *emit_blk(uint8_t *o, uint8_t *scr_end, uint8_t *pp, uint64_t x) 
     requires \valid(x);
     requires \valid(end);
     terminates \false;
-    assigns *x, *end;
+    assigns *x \from rp[0 .. 11];
+    assigns *end \from rp, lim, rp[0 .. 3];
+    assigns \result \from rp;
     exits \exit_status == 1;
     ensures \result == rp + 12;
     ensures 12 <= *end - rp && *end - rp <= lim - rp;
@@ -1036,7 +1040,9 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
         h[j] <= 281474976710655;
     terminates \false;
     exits \exit_status == 1;
-    assigns *rp, *si, h[0 .. 2 * ew + 65537];
+    assigns *rp \from *rp, x, end, ew, mw, mb, ft[0 .. 2 * ew + 65537],
+        cum[0 .. 4 * ew + 65537], (*rp)[0 .. end - *rp - 1];
+    assigns *si, h[0 .. 2 * ew + 65537];
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
     ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
     ensures \forall integer j; 0 <= j < 2 * ew + 65538 ==>
@@ -1325,7 +1331,10 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
         h[j] <= 281474976710655;
     terminates \false;
     exits \exit_status == 1;
-    assigns *rp, *si, h[0 .. 2162687];
+    assigns *rp \from *rp, x, end, ew, mw, mb, sew, tSE, tC, ctx,
+        ft[0 .. tSE + 65535], cum[0 .. tC + 65536 + 2 * ew - 1],
+        (*rp)[0 .. end - *rp - 1];
+    assigns *si, h[0 .. 2162687];
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
     ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
     ensures \forall integer j; 0 <= j < 2162688 ==>
@@ -1620,7 +1629,9 @@ static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) 
         h[j] <= 281474976710655;
     terminates \false;
     exits \exit_status == 1;
-    assigns *rp, *si, h[0 .. 328193];
+    assigns *rp \from *rp, x, end, ft[0 .. 328193],
+        cum[0 .. 329729], (*rp)[0 .. end - *rp - 1];
+    assigns *si, h[0 .. 328193];
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
     ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
     ensures \forall integer j; 0 <= j < 328194 ==>
@@ -1917,6 +1928,7 @@ static void u8_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
     requires \separated(h + (0 .. 255), in + (0 .. lim - in - 1));
     terminates \false;
     assigns s[0 .. n - 1], h[0 .. 255];
+    assigns \result \from lim;
     exits \exit_status == 1;
     ensures \result == lim;
     ensures \forall integer j; 0 <= j < 256 ==> h[j] <= \at(h[j], Pre) + n;
@@ -2095,7 +2107,9 @@ static uint16_t dlt_val(uint16_t rv, uint32_t sym) {
     requires \valid(escbits + (0 .. gi / 8));
     terminates \false;
     exits \exit_status == 1;
-    assigns *rp, *ci, h[0 .. 524543], escbits[0 .. gi / 8];
+    assigns *rp \from *rp, x, end, rv, ft[0 .. 524415],
+        cum[0 .. 524543], (*rp)[0 .. end - *rp - 1];
+    assigns *ci, h[0 .. 524543], escbits[0 .. gi / 8];
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
     ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
     ensures \forall integer j; 0 <= j < 524544 ==>
@@ -2249,6 +2263,7 @@ static void dlt_tab(const uint8_t *used, const uint64_t *h,
     assigns cur[0 .. n - 1], h[0 .. 524543],
             w->escbits[0 .. (n + 7) / 8 - 1], w->ft[0 .. 524415],
             w->dcum[0 .. 524543], w->used[0 .. 127], *escn;
+    assigns \result \from in, n, lim, in[0 .. lim - in - 1];
     exits \exit_status == 1;
     ensures \forall integer j; 0 <= j < 524544 ==>
         h[j] <= \at(h[j], Pre) + n;
@@ -2451,7 +2466,9 @@ static size_t dlt32_enc(const uint32_t *cur, const uint32_t *ref, uint64_t n,
     requires \valid(hp + (0 .. 65535));
     terminates \false;
     exits \exit_status == 1;
-    assigns *rp, *pli, hp[0 .. 65535];
+    assigns *rp \from *rp, x, end, cbv, ft[0 .. 65535],
+        cum[0 .. 65791], (*rp)[0 .. end - *rp - 1];
+    assigns *pli, hp[0 .. 65535];
     ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
     ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
     ensures \forall integer j; 0 <= j < 65536 ==>
@@ -2588,6 +2605,7 @@ static void d32_tab(const uint8_t *cb, uint64_t bn, const uint64_t *hp,
     terminates \false;
     assigns cur[0 .. n - 1], hp[0 .. 65535], pl[0 .. 131071], cb[0 .. 131071],
             ft[0 .. 65535], cum[0 .. 65791];
+    assigns \result \from in, n, lim, in[0 .. lim - in - 1];
     exits \exit_status == 1;
     ensures 0 <= \result - in && \result - in <= lim - in;
     ensures \base_addr(\result) == \base_addr(in);
@@ -3037,7 +3055,7 @@ static void w16(FILE *f, uint16_t v) { uint8_t b[2] = { (uint8_t)v, (uint8_t)(v 
 static void w8(FILE *f, uint8_t v) { fwrite(&v, 1, 1, f); }
 /*@ requires \valid(p);
     requires \valid_read(*p + (0 .. 7));
-    assigns *p;
+    assigns *p \from *p;
     ensures *p == \at(*p, Pre) + 8;
     ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
 */
@@ -3052,7 +3070,7 @@ static uint64_t r64(const uint8_t **p) {
 }
 /*@ requires \valid(p);
     requires \valid_read(*p + (0 .. 3));
-    assigns *p;
+    assigns *p \from *p;
     ensures *p == \at(*p, Pre) + 4;
     ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
 */
@@ -3065,14 +3083,14 @@ static uint32_t r32(const uint8_t **p) {
 }
 /*@ requires \valid(p);
     requires \valid_read(*p + (0 .. 1));
-    assigns *p;
+    assigns *p \from *p;
     ensures *p == \at(*p, Pre) + 2;
     ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
 */
 static uint16_t r16(const uint8_t **p) { uint16_t v = (uint16_t)((*p)[0] + (uint16_t)(*p)[1] * 256); *p += 2; return v; }
 /*@ requires \valid(p);
     requires \valid_read(*p);
-    assigns *p;
+    assigns *p \from *p;
     ensures *p == \at(*p, Pre) + 1;
     ensures \base_addr(*p) == \base_addr(\at(*p, Pre));
 */
@@ -3914,9 +3932,11 @@ static void hsnap(uint64_t *snap[NCH]) {
 
 /* ================= decode ================= */
 /* Per-in-flight decode scratch the tensor buffer itself doesn't cover:
-   DELTA16 escape pos+value buffers ≈ 5x len, DELTA32 plane buffer ≈ len,
-   DELTAX aligned ref copy ≈ len, positional-ctx tables ≈ 17MB+.  Charged
-   alongside t->len so g_dlive reflects real peak RSS, not just outputs. */
+   DELTA16 escape bitmap+value buffers ≈ 5x len, DELTA32 plane buffer ≈ len,
+   DELTAX aligned ref copy ≈ len, PRW escape workspace ≈ len/2 (escbuf is
+   sized to cols*2 upfront, escbits to cols/8), positional-ctx tables ≈ 17MB+.
+   Charged alongside t->len so g_dlive reflects real peak RSS, not just
+   outputs. */
 /*@ requires \valid_read(t);
     requires valid_read_string(t->dtype);
     requires t->len <= 3074457345617559551ULL;
@@ -3927,7 +3947,7 @@ static uint64_t dec_aux(const Tensor *t) {
     switch (t->method) {
     case M_DELTA:  return (bsz == 2 ? 6 : 1) * t->len + 4194304u;
     case M_DELTAX: return (bsz == 2 ? 6 : 2) * t->len + 4194304u;
-    case M_PRW:    return t->len / 4 + 4194304u;
+    case M_PRW:    return t->len / 2 + t->len / 16 + 8388608u;
     case M_FIELDPOS: case M_FIELDROW: return 35651584ull;
     case M_F32:    return 4194304ull;
     default:       return 1048576u;

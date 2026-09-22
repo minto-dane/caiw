@@ -255,13 +255,12 @@ fi
 # Compilation is the check: the kernel verifies every Qed; coqchk
 # rechecks each .vo independently (must report Axioms: <none>).
 if [ -x "$COQC" ]; then
-    COQCHK=${COQCHK:-$(command -v coqchk 2>/dev/null || true)}
     for f in Rans Utf8 Norm Pack Jkey; do
         [ -f "$V/$f.v" ] || continue
         cp "$V/$f.v" "$TMPDIR/$f.v"
         out=$(cd "$TMPDIR" && timeout 300 "$COQC" "$f.v" 2>&1)
         if [ -f "$TMPDIR/$f.vo" ]; then
-            if [ -n "$COQCHK" ]; then
+            if [ -x "$COQCHK" ]; then
                 chk=$(cd "$TMPDIR" && timeout 300 "$COQCHK" -o "$f" 2>&1)
                 echo "$chk" | grep -q "successfully checked" \
                     && echo "$chk" | grep -q "Axioms: <none>" \

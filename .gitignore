@@ -27,3 +27,4 @@ verify/.*.aux
 verify/.lia.cache
 verify/.nia.cache
 .lia.cache
+.tmp/

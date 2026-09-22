@@ -102,8 +102,11 @@ already-decoded reference tensor.
   scope 8, CBMC proves kmap16/dsym/norm_ctx/rANS (fixed-frequency)
   plus the parser boundary (utf8_ok/hex4/jstr/jstr_skip/jspan),
   Frama-C EVA+RTE screens the codec kernels (0 invalid), and Frama-C
-  WP discharges the ACSL contracts on those kernels — 116/116 goals,
-  an unbounded proof per contract. Five Rocq/Coq proofs (zero-axiom,
+  WP discharges the ACSL contracts — 3022/3022 goals across 65
+  functions covering every payload decoder (U8/FIELD/FIELDPOS/
+  FIELDROW/F32/PACK/DELTA/DELTAX/PRW): memory safety, cursor
+  bounds, and exact payload consumption on untrusted input, an
+  unbounded proof per contract. Five Rocq/Coq proofs (zero-axiom,
   coqchk-rechecked) cover the regions every BMC backend timed out on:
   rANS round trip over the full general domain, utf8_ok correctness
   at any length, norm_ctx's output contract over all histograms,
