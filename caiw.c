@@ -1234,6 +1234,7 @@ static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, u
     uint32_t cum[66566];             /* 2(ew+1) + 2ew(mw+1) at mb=7 */
     /*@ loop invariant 0 <= b0;
         loop invariant 0 <= lim - rp;
+        loop invariant in <= rp;
         loop invariant \base_addr(rp) == \base_addr(in);
         loop invariant \valid_read(rp + (0 .. lim - rp - 1));
         loop invariant \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
@@ -1524,6 +1525,7 @@ static void pos_dec_ws(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb
     const uint8_t *rp = in;
     /*@ loop invariant 0 <= b0;
         loop invariant 0 <= lim - rp;
+        loop invariant in <= rp;
         loop invariant \base_addr(rp) == \base_addr(in);
         loop invariant \valid_read(rp + (0 .. lim - rp - 1));
         loop invariant \forall integer j; 0 <= j < 2162688 ==>
@@ -1607,57 +1609,240 @@ static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) 
     free(ft); free(cum); free(scr);
     return o - out;
 }
-static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t *s, uint64_t *h) {
+/*@ requires \valid_read(ft + (0 .. 328193));
+    requires \valid_read(cum + (0 .. 329729));
+    requires \valid(rp);
+    requires 0 <= end - *rp;
+    requires \valid_read(*rp + (0 .. end - *rp - 1));
+    requires \valid(si);
+    requires \valid(h + (0 .. 328193));
+    requires \forall integer j; 0 <= j < 328194 ==>
+        h[j] <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns *rp, *si, h[0 .. 328193];
+    ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+    ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
+    ensures \forall integer j; 0 <= j < 328194 ==>
+        h[j] <= \at(h[j], Pre) + 1;
+*/
+static uint64_t f32_elem(uint64_t x, const uint8_t **rp, const uint8_t *end,
+                         const uint16_t *ft, const uint32_t *cum,
+                         uint32_t *si, uint64_t *h) {
+    const uint16_t *fE = ft + 2, *f1 = ft + 514, *f2 = f1 + 65536, *f3 = f2 + 131072;
+    const uint32_t *cE = cum, *c1 = cum + 514, *c2 = c1 + 66048, *c3 = c2 + 131584;
+    const uint8_t *r = *rp;
+    uint32_t v = (uint32_t)(x & (TOT - 1)), fc, S, E, se, m1, m2, m3;
+    if (v >= ft[0]) {
+        S = 1;
+        if (!ft[1] || ft[1] > TOT) die("corrupt f32");
+        x = dec(x, ft[1], ft[0], &r, end);
+    } else {
+        S = 0;
+        if (!ft[0] || ft[0] > TOT) die("corrupt f32");
+        x = dec(x, ft[0], 0, &r, end);
+    }
+    v = (uint32_t)(x & (TOT - 1));
+    E = dsym_raw(fE + S * 256, cE + S * 257, 256, v, &fc);
+    if (!fc || fc > TOT) die("corrupt f32");
+    x = dec(x, fc, cE[S * 257 + E], &r, end);
+    se = S * 256 + E;
+    /*@ assert 0 <= se && se <= 511; */
+    v = (uint32_t)(x & (TOT - 1));
+    if ((int64_t)se * 128 + 128 > 65536 || (int64_t)se * 129 + 128 > 66048)
+        die("corrupt f32");
+    m1 = dsym_raw(f1 + se * 128, c1 + se * 129, 128, v, &fc);
+    if (!fc || fc > TOT) die("corrupt f32");
+    x = dec(x, fc, c1[se * 129 + m1], &r, end);
+    v = (uint32_t)(x & (TOT - 1));
+    if ((int64_t)se * 256 + 256 > 131072 || (int64_t)se * 257 + 256 > 131584)
+        die("corrupt f32");
+    m2 = dsym_raw(f2 + se * 256, c2 + se * 257, 256, v, &fc);
+    if (!fc || fc > TOT) die("corrupt f32");
+    x = dec(x, fc, c2[se * 257 + m2], &r, end);
+    v = (uint32_t)(x & (TOT - 1));
+    m3 = dsym_raw(f3 + se * 256, c3 + se * 257, 256, v, &fc);
+    if (!fc || fc > TOT) die("corrupt f32");
+    x = dec(x, fc, c3[se * 257 + m3], &r, end);
+    *si = (S << 31) | (E << 23) | (m1 << 16) | (m2 << 8) | m3;
+    /*@ assert 2 + S * 256 + E < 514; */
+    /*@ assert 514 + se * 128 + m1 < 514 + 65536; */
+    /*@ assert 514 + 65536 + se * 256 + m2 < 514 + 65536 + 131072; */
+    /*@ assert 514 + 65536 + 131072 + se * 256 + m3 < 328194; */
+    h[S]++;
+    h[2 + S * 256 + E]++;
+    h[514 + se * 128 + m1]++;
+    h[514 + 65536 + se * 256 + m2]++;
+    h[514 + 65536 + 131072 + se * 256 + m3]++;
+    *rp = r;
+    return x;
+}
+
+/*@ requires \valid_read(ft + (0 .. 328193));
+    requires \valid_read(cum + (0 .. 329729));
+    requires \valid_read(r + (0 .. end - r - 1));
+    requires 0 <= end - r;
+    requires \valid(s + (0 .. bn - 1));
+    requires \valid(h + (0 .. 328193));
+    requires 1 <= bn <= 131072;
+    requires \forall integer j; 0 <= j < 328194 ==>
+        h[j] + bn <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns s[0 .. bn - 1], h[0 .. 328193];
+    ensures \forall integer j; 0 <= j < 328194 ==>
+        h[j] <= \at(h[j], Pre) + bn;
+*/
+static void f32_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
+                    const uint16_t *ft, const uint32_t *cum,
+                    uint64_t bn, uint32_t *s, uint64_t *h) {
+    /*@ loop invariant 0 <= i <= bn;
+        loop invariant 0 <= end - r;
+        loop invariant \valid_read(r + (0 .. end - r - 1));
+        loop invariant \forall integer j; 0 <= j < 328194 ==>
+            h[j] + bn - i <= 281474976710655;
+        loop invariant \forall integer j; 0 <= j < 328194 ==>
+            h[j] <= \at(h[j], Pre) + i;
+        loop assigns x, r, s[0 .. bn - 1], h[0 .. 328193], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++)
+        x = f32_elem(x, &r, end, ft, cum, s + i, h);
+}
+
+/*@ requires \valid_read(h + (0 .. 328193));
+    requires \forall integer j; 0 <= j < 328194 ==>
+        h[j] <= 281474976710655;
+    requires \valid(ft + (0 .. 328193));
+    requires \valid(cum + (0 .. 329729));
+    terminates \false;
+    assigns ft[0 .. 328193], cum[0 .. 329729];
+    exits \exit_status == 1;
+*/
+static void f32_tab(const uint64_t *h, uint16_t *ft, uint32_t *cum) {
+    norm_ctx(h, ft, 2);
+    int off = 0;
+    /*@ loop invariant 0 <= c <= 2;
+        loop invariant 0 <= off <= 512 && off == c * 256;
+        loop assigns ft[2 .. 513], c, off;
+        loop variant 2 - c;
+    */
+    for (int c = 0; c < 2; c++, off += 256)
+        norm_ctx(h + 2 + off, ft + 2 + off, 256);
+    int k = 0;
+    /*@ loop invariant 0 <= c <= 512;
+        loop invariant 0 <= k <= 65536 && k == c * 128;
+        loop assigns ft[514 .. 514 + 65535], c, k;
+        loop variant 512 - c;
+    */
+    for (int c = 0; c < 512; c++, k += 128)
+        norm_ctx(h + 514 + k, ft + 514 + k, 128);
+    k = 0;
+    /*@ loop invariant 0 <= c <= 512;
+        loop invariant 0 <= k <= 131072 && k == c * 256;
+        loop assigns ft[514 + 65536 .. 514 + 65536 + 131071], c, k;
+        loop variant 512 - c;
+    */
+    for (int c = 0; c < 512; c++, k += 256)
+        norm_ctx(h + 514 + 65536 + k, ft + 514 + 65536 + k, 256);
+    k = 0;
+    /*@ loop invariant 0 <= c <= 512;
+        loop invariant 0 <= k <= 131072 && k == c * 256;
+        loop assigns ft[514 + 196608 .. 514 + 196608 + 131071], c, k;
+        loop variant 512 - c;
+    */
+    for (int c = 0; c < 512; c++, k += 256)
+        norm_ctx(h + 514 + 196608 + k, ft + 514 + 196608 + k, 256);
+    if (ft[0] + ft[1] != TOT) die("norm bug");
+    uint32_t *cE = cum, *c1 = cum + 514, *c2 = c1 + 66048, *c3 = c2 + 131584;
+    fill_ctx(cE, ft + 2, 256);
+    fill_ctx(cE + 257, ft + 258, 256);
+    int ko = 0, fo = 0;
+    /*@ loop invariant 0 <= c <= 512;
+        loop invariant 0 <= ko <= 66048 && 0 <= fo <= 65536;
+        loop invariant ko == c * 129 && fo == c * 128;
+        loop assigns c1[0 .. 66047], c, ko, fo;
+        loop variant 512 - c;
+    */
+    for (int c = 0; c < 512; c++, ko += 129, fo += 128)
+        fill_ctx(c1 + ko, ft + 514 + fo, 128);
+    ko = 0; fo = 0;
+    /*@ loop invariant 0 <= c <= 512;
+        loop invariant 0 <= ko <= 131584 && 0 <= fo <= 131072;
+        loop invariant ko == c * 257 && fo == c * 256;
+        loop assigns c2[0 .. 131583], c, ko, fo;
+        loop variant 512 - c;
+    */
+    for (int c = 0; c < 512; c++, ko += 257, fo += 256)
+        fill_ctx(c2 + ko, ft + 514 + 65536 + fo, 256);
+    ko = 0; fo = 0;
+    /*@ loop invariant 0 <= c <= 512;
+        loop invariant 0 <= ko <= 131584 && 0 <= fo <= 131072;
+        loop invariant ko == c * 257 && fo == c * 256;
+        loop assigns c3[0 .. 131583], c, ko, fo;
+        loop variant 512 - c;
+    */
+    for (int c = 0; c < 512; c++, ko += 257, fo += 256)
+        fill_ctx(c3 + ko, ft + 514 + 196608 + fo, 256);
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid(s + (0 .. n - 1));
+    requires \valid(h + (0 .. 328193));
+    requires n <= 281474976710655;
+    requires \forall integer j; 0 <= j < 328194 ==>
+        h[j] + n <= 281474976710655;
+    requires \valid(ft + (0 .. 328193));
+    requires \valid(cum + (0 .. 329729));
+    requires \separated(s + (0 .. n - 1), h + (0 .. 328193));
+    requires \separated(s + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(h + (0 .. 328193), in + (0 .. lim - in - 1));
+    requires \separated(ft + (0 .. 328193), s + (0 .. n - 1));
+    requires \separated(ft + (0 .. 328193), h + (0 .. 328193));
+    requires \separated(ft + (0 .. 328193), in + (0 .. lim - in - 1));
+    requires \separated(cum + (0 .. 329729), s + (0 .. n - 1));
+    requires \separated(cum + (0 .. 329729), h + (0 .. 328193));
+    requires \separated(cum + (0 .. 329729), in + (0 .. lim - in - 1));
+    requires \separated(ft + (0 .. 328193), cum + (0 .. 329729));
+    terminates \false;
+    assigns s[0 .. n - 1], h[0 .. 328193], ft[0 .. 328193], cum[0 .. 329729];
+    exits \exit_status == 1;
+    ensures \forall integer j; 0 <= j < 328194 ==>
+        h[j] <= \at(h[j], Pre) + n;
+*/
+static void f32_dec_ws(const uint8_t *in, const uint8_t *lim, uint64_t n,
+                       uint32_t *s, uint64_t *h, uint16_t *ft, uint32_t *cum) {
     const uint8_t *rp = in;
-    size_t nM1 = 512 * 128, nM2 = 512 * 256, nM3 = 512 * 256;
-    uint16_t *ft = xm((2 + 512 + nM1 + nM2 + nM3) * 2);
-    uint32_t *cum = xc(2 + 512 + nM1 + nM2 + nM3 + 2048, 4);
+    /*@ loop invariant 0 <= b0;
+        loop invariant 0 <= lim - rp;
+        loop invariant in <= rp;
+        loop invariant \base_addr(rp) == \base_addr(in);
+        loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+        loop invariant \forall integer j; 0 <= j < 328194 ==>
+            h[j] <= \at(h[j], Pre) + b0;
+        loop invariant \forall integer j; 0 <= j < 328194 ==>
+            h[j] <= \at(h[j], Pre) + n;
+        loop assigns rp, s[0 .. n - 1], h[0 .. 328193], b0,
+            ft[0 .. 328193], cum[0 .. 329729];
+        loop variant n - b0;
+    */
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
-        norm_ctx(h, ft, 2);
-        for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * 256, ft + 2 + c * 256, 256);
-        uint16_t *f1 = ft + 2 + 512, *f2 = f1 + nM1, *f3 = f2 + nM2;
-        for (int c = 0; c < 512; c++) norm_ctx(h + 2 + 512 + (size_t)c * 128, f1 + (size_t)c * 128, 128);
-        for (int c = 0; c < 512; c++) norm_ctx(h + 2 + 512 + nM1 + (size_t)c * 256, f2 + (size_t)c * 256, 256);
-        for (int c = 0; c < 512; c++) norm_ctx(h + 2 + 512 + nM1 + nM2 + (size_t)c * 256, f3 + (size_t)c * 256, 256);
-        uint32_t cS1 = ft[0];
-        uint32_t *cE = cum, *c1 = cum + 520, *c2 = c1 + nM1 + 512, *c3 = c2 + nM2 + 512;
-        for (int c = 0; c < 2; c++) { cE[c * 256] = 0; for (int i = 0; i < 256; i++) cE[c * 256 + i + 1] = cE[c * 256 + i] + ft[2 + c * 256 + i]; }
-        for (int c = 0; c < 512; c++) { size_t b = (size_t)c * 128; c1[b] = 0; for (int i = 0; i < 128; i++) c1[b + i + 1] = c1[b + i] + f1[b + i]; }
-        for (int c = 0; c < 512; c++) { size_t b = (size_t)c * 256; c2[b] = 0; for (int i = 0; i < 256; i++) c2[b + i + 1] = c2[b + i] + f2[b + i]; }
-        for (int c = 0; c < 512; c++) { size_t b = (size_t)c * 256; c3[b] = 0; for (int i = 0; i < 256; i++) c3[b + i + 1] = c3[b + i] + f3[b + i]; }
+        f32_tab(h, ft, cum);
         uint64_t x; const uint8_t *end;
+        /*@ assert 0 <= lim - rp; */
         rp = read_blk(rp, lim, &x, &end);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
-            uint32_t S = v >= cS1;
-            x = dec(x, ft[S], S ? cS1 : 0, &rp, end);
-            v = (uint32_t)(x & (TOT - 1));
-            uint32_t E = dsym(ft + 2 + S * 256, cE + S * 256, 256, v, &fc);
-            x = dec(x, fc, cE[S * 256 + E], &rp, end);
-            size_t se = S * 256 + E;
-            v = (uint32_t)(x & (TOT - 1));
-            uint32_t m1 = dsym(f1 + se * 128, c1 + se * 128, 128, v, &fc);
-            x = dec(x, fc, c1[se * 128 + m1], &rp, end);
-            v = (uint32_t)(x & (TOT - 1));
-            uint32_t m2 = dsym(f2 + se * 256, c2 + se * 256, 256, v, &fc);
-            x = dec(x, fc, c2[se * 256 + m2], &rp, end);
-            v = (uint32_t)(x & (TOT - 1));
-            uint32_t m3 = dsym(f3 + se * 256, c3 + se * 256, 256, v, &fc);
-            x = dec(x, fc, c3[se * 256 + m3], &rp, end);
-            s[b0 + i] = (S << 31) | (E << 23) | (m1 << 16) | (m2 << 8) | m3;
-        }
+        f32_blk(x, rp, end, ft, cum, bn, s + b0, h);
         rp = end;
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = s[b0 + i], S = v >> 31, E = (v >> 23) & 255;
-            size_t se = S * 256 + E;
-            h[S]++; h[2 + S * 256 + E]++;
-            h[2 + 512 + se * 128 + ((v >> 16) & 127)]++;
-            h[2 + 512 + nM1 + se * 256 + ((v >> 8) & 255)]++;
-            h[2 + 512 + nM1 + nM2 + se * 256 + (v & 255)]++;
-        }
     }
     if (rp != lim) die("corrupt f32");
+}
+
+static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t *s, uint64_t *h) {
+    uint16_t *ft = xm(328194 * 2);
+    uint32_t *cum = xc(329730, 4);
+    f32_dec_ws(in, lim, n, s, h, ft, cum);
     free(ft); free(cum);
 }
 
@@ -1741,6 +1926,7 @@ static const uint8_t *u8_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, 
     uint16_t ft[256]; uint32_t cum[257];
     /*@ loop invariant 0 <= b0;
         loop invariant 0 <= lim - rp;
+        loop invariant in <= rp;
         loop invariant \base_addr(rp) == \base_addr(in);
         loop invariant \valid_read(rp + (0 .. lim - rp - 1));
         loop invariant \forall integer j; 0 <= j < 256 ==>
@@ -1812,19 +1998,32 @@ typedef struct {
     uint16_t *ft, *sB, *escbuf;
     uint32_t *dcum;
     uint64_t esc_cap;
-    uint64_t *escpos, escap;        /* decode side only */
+    uint8_t *escbits; uint64_t esccap;  /* decode side only: escape bitmap */
 } DltWs;
 static void dltws_init(DltWs *w) {
     w->scr = xm(SCRSZ); w->cB = xm(BLK); w->used = xm(DCTX);
     w->ft = xm(DCTX * DSYMS * 2); w->sB = xm(BLK * 2);
     w->dcum = xm(DCTX * (DSYMS + 1) * 4);
     w->esc_cap = 8192; w->escbuf = xm(w->esc_cap * 2);
-    w->escpos = 0; w->escap = 0;
+    w->escbits = 0; w->esccap = 0;
 }
 static void dltws_free(DltWs *w) {
     free(w->scr); free(w->cB); free(w->used);
     free(w->ft); free(w->sB); free(w->dcum);
-    free(w->escbuf); free(w->escpos);
+    free(w->escbuf); free(w->escbits);
+}
+/* callers size the escape bitmap/values buffer BEFORE entering the verified
+   decoder — keeps realloc out of the WP-checked loops entirely */
+static void dltws_need_bits(DltWs *w, uint64_t n) {
+    uint64_t need = (n + 7) / 8;
+    if (w->esccap < need) { free(w->escbits); w->escbits = xm(need); w->esccap = need; }
+}
+static void dltws_need_eb(DltWs *w, uint64_t escn) {
+    if (w->esc_cap < escn) {
+        w->esc_cap = escn;
+        w->escbuf = realloc(w->escbuf, w->esc_cap * 2);
+        if (!w->escbuf) die("oom");
+    }
 }
 static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
                          uint8_t *out, uint64_t *h, int mb, uint64_t *hesc, DltWs *w) {
@@ -1877,60 +2076,325 @@ static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
     dltws_free(&w);
     return r;
 }
-static void dlt_dec_ws(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
-                       uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc, DltWs *w) {
+/*@ requires sym < 4096;
+    assigns \nothing;
+    ensures \result <= 65535;
+*/
+static uint16_t dlt_val(uint16_t rv, uint32_t sym) {
+    return kmap16_inv(kmap16(rv) + (int64_t)sym - DR);
+}
+/*@ requires \valid_read(ft + (0 .. 524415));
+    requires \valid_read(cum + (0 .. 524543));
+    requires \valid(rp);
+    requires 0 <= end - *rp;
+    requires \valid_read(*rp + (0 .. end - *rp - 1));
+    requires \valid(ci);
+    requires \valid(h + (0 .. 524543));
+    requires \forall integer j; 0 <= j < 524544 ==>
+        h[j] <= 281474976710655;
+    requires \valid(escbits + (0 .. gi / 8));
+    terminates \false;
+    exits \exit_status == 1;
+    assigns *rp, *ci, h[0 .. 524543], escbits[0 .. gi / 8];
+    ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+    ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
+    ensures \forall integer j; 0 <= j < 524544 ==>
+        h[j] <= \at(h[j], Pre) + 1;
+*/
+static uint64_t dlt_elem(uint64_t x, const uint8_t **rp, const uint8_t *end,
+                         uint16_t rv, const uint16_t *ft, const uint32_t *cum,
+                         uint16_t *ci, uint64_t *h, uint8_t *escbits,
+                         uint64_t gi) {
+    uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
+    uint32_t c = ((uint32_t)rv / 512) % 128;
+    /*@ assert c <= 127; */
+    uint32_t fo = c * DSYMS, ko = c * (DSYMS + 1);
+    /*@ assert fo + 4096 < 524544 && ko + 4096 < 524544; */
+    uint32_t sym = dsym_raw(ft + fo, cum + ko, DSYMS, v, &fc);
+    if (!fc || fc > TOT) die("corrupt delta");
+    const uint8_t *r = *rp;
+    x = dec(x, fc, cum[ko + sym], &r, end);
+    uint32_t hidx = fo + sym;
+    /*@ assert hidx < 524544; */
+    h[hidx]++;
+    if (sym == DESC) {
+        *ci = 0;
+        escbits[gi / 8] |= (uint8_t)(1u << (gi % 8));
+    } else {
+        *ci = dlt_val(rv, sym);
+    }
+    *rp = r;
+    return x;
+}
+
+/*@ requires \valid_read(ft + (0 .. 524415));
+    requires \valid_read(cum + (0 .. 524543));
+    requires \valid_read(r + (0 .. end - r - 1));
+    requires 0 <= end - r;
+    requires \valid_read(ref + (0 .. bn - 1));
+    requires \valid(cur + (0 .. bn - 1));
+    requires \valid(h + (0 .. 524543));
+    requires 1 <= bn <= 131072;
+    requires \forall integer j; 0 <= j < 524544 ==>
+        h[j] + bn <= 281474976710655;
+    requires \valid(escbits + (0 .. (b0 + bn - 1) / 8));
+    requires b0 + bn <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns cur[0 .. bn - 1], h[0 .. 524543],
+            escbits[0 .. (b0 + bn - 1) / 8];
+    ensures \forall integer j; 0 <= j < 524544 ==>
+        h[j] <= \at(h[j], Pre) + bn;
+*/
+static void dlt_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
+                    const uint16_t *ref, uint64_t b0, const uint16_t *ft,
+                    const uint32_t *cum, uint64_t bn, uint16_t *cur,
+                    uint64_t *h, uint8_t *escbits) {
+    /*@ loop invariant 0 <= i <= bn;
+        loop invariant 0 <= end - r;
+        loop invariant \valid_read(r + (0 .. end - r - 1));
+        loop invariant \forall integer j; 0 <= j < 524544 ==>
+            h[j] + bn - i <= 281474976710655;
+        loop invariant \forall integer j; 0 <= j < 524544 ==>
+            h[j] <= \at(h[j], Pre) + i;
+        loop assigns x, r, cur[0 .. bn - 1], h[0 .. 524543],
+                escbits[0 .. (b0 + bn - 1) / 8], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++)
+        x = dlt_elem(x, &r, end, ref[i], ft, cum, cur + i, h, escbits,
+                     b0 + i);
+}
+
+/*@ requires \valid_read(used + (0 .. 127));
+    requires \valid_read(h + (0 .. 524543));
+    requires \forall integer j; 0 <= j < 524544 ==>
+        h[j] <= 281474976710655;
+    requires \valid(ft + (0 .. 524415));
+    requires \valid(cum + (0 .. 524543));
+    terminates \false;
+    assigns ft[0 .. 524415], cum[0 .. 524543];
+    exits \exit_status == 1;
+*/
+static void dlt_tab(const uint8_t *used, const uint64_t *h,
+                    uint16_t *ft, uint32_t *cum) {
+    int fo = 0, ko = 0;
+    /*@ loop invariant 0 <= c <= 128;
+        loop invariant fo == c * 4097 && ko == c * 4098;
+        loop invariant 0 <= fo <= 524416 && 0 <= ko <= 524544;
+        loop assigns ft[0 .. 524415], cum[0 .. 524543], c, fo, ko;
+        loop variant 128 - c;
+    */
+    for (int c = 0; c < DCTX; c++, fo += DSYMS, ko += DSYMS + 1) {
+        if (used[c]) {
+            norm_ctx(h + fo, ft + fo, DSYMS);
+            fill_ctx(cum + ko, ft + fo, DSYMS);
+        }
+    }
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid_read(ref + (0 .. n - 1));
+    requires \valid(cur + (0 .. n - 1));
+    requires \valid(h + (0 .. 524543));
+    requires n <= 281474976710655;
+    requires \forall integer j; 0 <= j < 524544 ==>
+        h[j] + n <= 281474976710655;
+    requires \valid(w);
+    requires \valid(w->ft + (0 .. 524415));
+    requires \valid(w->dcum + (0 .. 524543));
+    requires \valid(w->used + (0 .. 127));
+    requires \valid(w->escbits + (0 .. (n + 7) / 8 - 1));
+    requires \valid(escn);
+    requires \separated(escn, cur + (0 .. n - 1));
+    requires \separated(escn, h + (0 .. 524543));
+    requires \separated(cur + (0 .. n - 1), h + (0 .. 524543));
+    requires \separated(cur + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(cur + (0 .. n - 1), ref + (0 .. n - 1));
+    requires \separated(cur + (0 .. n - 1), w->ft + (0 .. 524415));
+    requires \separated(cur + (0 .. n - 1), w->dcum + (0 .. 524543));
+    requires \separated(cur + (0 .. n - 1), w->used + (0 .. 127));
+    requires \separated(cur + (0 .. n - 1), w->escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(cur + (0 .. n - 1), escn);
+    requires \separated(h + (0 .. 524543), in + (0 .. lim - in - 1));
+    requires \separated(h + (0 .. 524543), ref + (0 .. n - 1));
+    requires \separated(h + (0 .. 524543), w->ft + (0 .. 524415));
+    requires \separated(h + (0 .. 524543), w->dcum + (0 .. 524543));
+    requires \separated(h + (0 .. 524543), w->used + (0 .. 127));
+    requires \separated(h + (0 .. 524543), w->escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(h + (0 .. 524543), escn);
+    requires \separated(w->ft + (0 .. 524415), in + (0 .. lim - in - 1));
+    requires \separated(w->ft + (0 .. 524415), ref + (0 .. n - 1));
+    requires \separated(w->ft + (0 .. 524415), w->dcum + (0 .. 524543));
+    requires \separated(w->ft + (0 .. 524415), w->used + (0 .. 127));
+    requires \separated(w->ft + (0 .. 524415), w->escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(w->ft + (0 .. 524415), escn);
+    requires \separated(w->dcum + (0 .. 524543), in + (0 .. lim - in - 1));
+    requires \separated(w->dcum + (0 .. 524543), ref + (0 .. n - 1));
+    requires \separated(w->dcum + (0 .. 524543), w->used + (0 .. 127));
+    requires \separated(w->dcum + (0 .. 524543), w->escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(w->dcum + (0 .. 524543), escn);
+    requires \separated(w->used + (0 .. 127), in + (0 .. lim - in - 1));
+    requires \separated(w->used + (0 .. 127), ref + (0 .. n - 1));
+    requires \separated(w->used + (0 .. 127), w->escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(w->used + (0 .. 127), escn);
+    requires \separated(w->escbits + (0 .. (n + 7) / 8 - 1), in + (0 .. lim - in - 1));
+    requires \separated(w->escbits + (0 .. (n + 7) / 8 - 1), ref + (0 .. n - 1));
+    requires \separated(w->escbits + (0 .. (n + 7) / 8 - 1), escn);
+    requires \separated(ref + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(ref + (0 .. n - 1), escn);
+    requires \separated(in + (0 .. lim - in - 1), escn);
+    terminates \false;
+    assigns cur[0 .. n - 1], h[0 .. 524543],
+            w->escbits[0 .. (n + 7) / 8 - 1], w->ft[0 .. 524415],
+            w->dcum[0 .. 524543], w->used[0 .. 127], *escn;
+    exits \exit_status == 1;
+    ensures \forall integer j; 0 <= j < 524544 ==>
+        h[j] <= \at(h[j], Pre) + n;
+    ensures *escn <= n;
+    ensures 0 <= \result - in && \result - in <= lim - in;
+    ensures \base_addr(\result) == \base_addr(in);
+*/
+static const uint8_t *dlt_dec_ws(const uint8_t *in, const uint8_t *lim,
+                                 const uint16_t *ref, uint64_t n,
+                                 uint16_t *cur, uint64_t *h, DltWs *w,
+                                 uint64_t *escn) {
     const uint8_t *rp = in;
     uint16_t *ft = w->ft;
     uint32_t *cum = w->dcum;
     uint8_t *used = w->used;
-    /* first pass: decode symbols; record ESC positions */
-    uint64_t escn = 0, escap = w->escap ? w->escap : 1024;
-    if (!w->escpos) { w->escap = escap; w->escpos = xm(escap * 8); }
-    uint64_t *escpos = w->escpos;
+    uint8_t *escbits = w->escbits;
+    /* escape positions now live in a caller-sized bitmap — no realloc inside
+       the verified loop nest */
+    /*@ loop invariant 0 <= z <= (n + 7) / 8;
+        loop assigns w->escbits[0 .. (n + 7) / 8 - 1], z;
+        loop variant (n + 7) / 8 - z;
+    */
+    for (uint64_t z = 0; z < (n + 7) / 8; z++) escbits[z] = 0;
+    /*@ loop invariant 0 <= b0;
+        loop invariant 0 <= lim - rp;
+        loop invariant in <= rp;
+        loop invariant \base_addr(rp) == \base_addr(in);
+        loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+        loop invariant \forall integer j; 0 <= j < 524544 ==>
+            h[j] <= \at(h[j], Pre) + b0;
+        loop invariant \forall integer j; 0 <= j < 524544 ==>
+            h[j] <= \at(h[j], Pre) + n;
+        loop assigns rp, cur[0 .. n - 1], h[0 .. 524543], b0,
+                w->escbits[0 .. (n + 7) / 8 - 1], w->ft[0 .. 524415],
+                w->dcum[0 .. 524543], w->used[0 .. 127];
+        loop variant n - b0;
+    */
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
-        memset(used, 0, DCTX);
-        for (uint64_t i = 0; i < bn; i++) used[ref[b0 + i] >> 9] = 1;
-        for (int c = 0; c < DCTX; c++) if (used[c]) {
-            norm_ctx(h + c * DSYMS, ft + c * DSYMS, DSYMS);
-            uint32_t *cu = cum + c * (DSYMS + 1);
-            cu[0] = 0;
-            for (int i = 0; i < DSYMS; i++) cu[i + 1] = cu[i] + ft[c * DSYMS + i];
-        }
+        /*@ assert b0 + bn <= n; */
+        /*@ loop invariant 0 <= z <= 128;
+            loop assigns w->used[0 .. 127], z;
+            loop variant 128 - z;
+        */
+        for (int z = 0; z < DCTX; z++) used[z] = 0;
+        /*@ loop invariant 0 <= i <= bn;
+            loop assigns w->used[0 .. 127], i;
+            loop variant bn - i;
+        */
+        for (uint64_t i = 0; i < bn; i++)
+            used[((uint32_t)ref[b0 + i] / 512) % 128] = 1;
+        dlt_tab(used, h, ft, cum);
         uint64_t x; const uint8_t *end;
+        /*@ assert 0 <= lim - rp; */
         rp = read_blk(rp, lim, &x, &end);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
-            int c = ref[b0 + i] >> 9;
-            uint32_t sym = dsym(ft + c * DSYMS, cum + c * (DSYMS + 1), DSYMS, v, &fc);
-            x = dec(x, fc, cum[c * (DSYMS + 1) + sym], &rp, end);
-            uint64_t gi = b0 + i;
-            h[c * DSYMS + sym]++;
-            if (sym == DESC) {
-                if (escn >= escap) { escap *= 2; escpos = realloc(escpos, escap * 8); if (!escpos) die("oom"); w->escpos = escpos; w->escap = escap; }
-                escpos[escn++] = gi;
-                cur[gi] = 0;
-            } else {
-                int64_t k = kmap16(ref[gi]) + (int64_t)sym - DR;
-                cur[gi] = kmap16_inv(k);
-            }
-        }
+        dlt_blk(x, rp, end, ref + b0, b0, ft, cum, bn, cur + b0, h,
+                escbits);
         rp = end;
     }
     if ((uint64_t)(lim - rp) < 8) die("corrupt delta");
     uint64_t ne = g64le(rp); rp += 8;
-    if (ne != escn) die("delta esc count mismatch");
-    if (escn) {
-        uint16_t *eb = xm(escn * 2);
-        f16_dec(rp, lim, escn, mb, eb, hesc);   /* escapes from FIELD channel; consumes to lim */
-        for (uint64_t i = 0; i < escn; i++) cur[escpos[i]] = eb[i];
-        free(eb);
-    } else if (rp != lim) die("corrupt delta");
+    uint64_t ec = 0;
+    /*@ loop invariant 0 <= gi <= n;
+        loop invariant ec <= gi;
+        loop assigns gi, ec;
+        loop variant n - gi;
+    */
+    for (uint64_t gi = 0; gi < n; gi++)
+        ec += (escbits[gi / 8] >> (gi % 8)) & 1;
+    *escn = ec;
+    if (ne != ec) die("delta esc count mismatch");
+    return rp;
 }
+
+/*@ requires \valid_read(escbits + (0 .. (n + 7) / 8 - 1));
+    requires \valid_read(eb + (0 .. escn - 1));
+    requires \valid(cur + (0 .. n - 1));
+    requires escn <= n;
+    requires n <= 281474976710655;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns cur[0 .. n - 1];
+*/
+static void dlt_scatter(uint16_t *cur, uint64_t n, const uint8_t *escbits,
+                        const uint16_t *eb, uint64_t escn) {
+    uint64_t j = 0;
+    /*@ loop invariant 0 <= gi <= n;
+        loop invariant j <= escn;
+        loop assigns cur[0 .. n - 1], gi, j;
+        loop variant n - gi;
+    */
+    for (uint64_t gi = 0; gi < n; gi++) {
+        /*@ assert gi / 8 < (n + 7) / 8; */
+        if ((escbits[gi / 8] >> (gi % 8)) & 1) {
+            if (j >= escn) die("corrupt delta");
+            cur[gi] = eb[j++];
+        }
+    }
+    if (j != escn) die("corrupt delta");
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires mb == 7 || mb == 10;
+    requires \valid(eb + (0 .. escn - 1));
+    requires \valid(hesc + (0 .. (mb == 7 ? 66050 : 65602) - 1));
+    requires \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+        hesc[j] + escn <= 281474976710655;
+    requires \valid(cur + (0 .. n - 1));
+    requires \valid_read(escbits + (0 .. (n + 7) / 8 - 1));
+    requires escn <= n;
+    requires n <= 281474976710655;
+    requires \separated(eb + (0 .. escn - 1), hesc + (0 .. (mb == 7 ? 66050 : 65602) - 1));
+    requires \separated(eb + (0 .. escn - 1), in + (0 .. lim - in - 1));
+    requires \separated(eb + (0 .. escn - 1), cur + (0 .. n - 1));
+    requires \separated(eb + (0 .. escn - 1), escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(hesc + (0 .. (mb == 7 ? 66050 : 65602) - 1), in + (0 .. lim - in - 1));
+    requires \separated(hesc + (0 .. (mb == 7 ? 66050 : 65602) - 1), cur + (0 .. n - 1));
+    requires \separated(hesc + (0 .. (mb == 7 ? 66050 : 65602) - 1), escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(cur + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(cur + (0 .. n - 1), escbits + (0 .. (n + 7) / 8 - 1));
+    requires \separated(escbits + (0 .. (n + 7) / 8 - 1), in + (0 .. lim - in - 1));
+    terminates \false;
+    exits \exit_status == 1;
+    assigns eb[0 .. escn - 1], hesc[0 .. (mb == 7 ? 66050 : 65602) - 1],
+            cur[0 .. n - 1];
+    ensures \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+        hesc[j] <= \at(hesc[j], Pre) + escn;
+*/
+static void dlt_tail(const uint8_t *in, const uint8_t *lim, uint64_t escn,
+                     int mb, uint16_t *eb, uint64_t *hesc,
+                     uint16_t *cur, uint64_t n, const uint8_t *escbits) {
+    if (escn) {
+        f16_dec(in, lim, escn, mb, eb, hesc);   /* escapes from FIELD channel; consumes to lim */
+        dlt_scatter(cur, n, escbits, eb, escn);
+    } else if (in != lim) die("corrupt delta");
+}
+
 static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
                     uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc) {
     DltWs w; dltws_init(&w);
-    dlt_dec_ws(in, lim, ref, n, cur, h, mb, hesc, &w);
+    dltws_need_bits(&w, n);
+    uint64_t escn;
+    const uint8_t *rp = dlt_dec_ws(in, lim, ref, n, cur, h, &w, &escn);
+    dltws_need_eb(&w, escn);
+    dlt_tail(rp, lim, escn, mb, w.escbuf, hesc, cur, n, w.escbits);
     dltws_free(&w);
 }
 
@@ -1978,46 +2442,340 @@ static size_t dlt32_enc(const uint32_t *cur, const uint32_t *ref, uint64_t n,
     free(pl); free(cb); free(scr); free(ft); free(cum);
     return o - out;
 }
+/*@ requires \valid_read(ft + (0 .. 65535));
+    requires \valid_read(cum + (0 .. 65791));
+    requires \valid(rp);
+    requires 0 <= end - *rp;
+    requires \valid_read(*rp + (0 .. end - *rp - 1));
+    requires \valid(pli);
+    requires \valid(hp + (0 .. 65535));
+    terminates \false;
+    exits \exit_status == 1;
+    assigns *rp, *pli, hp[0 .. 65535];
+    ensures 0 <= *rp - \at(*rp, Pre) && *rp - \at(*rp, Pre) <= end - \at(*rp, Pre);
+    ensures \base_addr(*rp) == \base_addr(\at(*rp, Pre));
+    ensures \forall integer j; 0 <= j < 65536 ==>
+        hp[j] <= \at(hp[j], Pre) + 1;
+*/
+static uint64_t d32_elem(uint64_t x, const uint8_t **rp, const uint8_t *end,
+                         uint8_t cbv, const uint16_t *ft,
+                         const uint32_t *cum, uint8_t *pli, uint64_t *hp) {
+    uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
+    uint32_t c = cbv % 256;
+    uint32_t fo = c * 256, ko = c * 257;
+    /*@ assert fo + 255 < 65536 && ko + 256 < 65792; */
+    uint32_t sym = dsym_raw(ft + fo, cum + ko, 256, v, &fc);
+    if (!fc || fc > TOT) die("corrupt delta32");
+    const uint8_t *r = *rp;
+    x = dec(x, fc, cum[ko + sym], &r, end);
+    uint32_t hidx = fo + sym;
+    /*@ assert hidx < 65536; */
+    if (hp[hidx] != 0xFFFFFFFFFFFFFFFFu) hp[hidx]++;
+    *pli = (uint8_t)sym;
+    *rp = r;
+    return x;
+}
+
+/*@ requires \valid_read(ft + (0 .. 65535));
+    requires \valid_read(cum + (0 .. 65791));
+    requires \valid_read(r + (0 .. end - r - 1));
+    requires 0 <= end - r;
+    requires \valid_read(cb + (0 .. bn - 1));
+    requires \valid(pl + (0 .. bn - 1));
+    requires \valid(hp + (0 .. 65535));
+    requires 1 <= bn <= 131072;
+    terminates \false;
+    exits \exit_status == 1;
+    assigns pl[0 .. bn - 1], hp[0 .. 65535];
+    ensures \forall integer j; 0 <= j < 65536 ==>
+        hp[j] <= \at(hp[j], Pre) + bn;
+*/
+static void d32_blk(uint64_t x, const uint8_t *r, const uint8_t *end,
+                    const uint8_t *cb, uint64_t bn,
+                    const uint16_t *ft, const uint32_t *cum,
+                    uint8_t *pl, uint64_t *hp) {
+    /*@ loop invariant 0 <= i <= bn;
+        loop invariant 0 <= end - r;
+        loop invariant \valid_read(r + (0 .. end - r - 1));
+        loop invariant \forall integer j; 0 <= j < 65536 ==>
+            hp[j] <= \at(hp[j], Pre) + i;
+        loop assigns x, r, pl[0 .. bn - 1], hp[0 .. 65535], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++)
+        x = d32_elem(x, &r, end, cb[i], ft, cum, pl + i, hp);
+}
+
+/*@ requires \valid_read(cb + (0 .. bn - 1));
+    requires bn <= 131072;
+    requires \valid_read(hp + (0 .. 65535));
+    requires \forall integer j; 0 <= j < 65536 ==> hp[j] <= 281474976710655;
+    requires \valid(ft + (0 .. 65535));
+    requires \valid(cum + (0 .. 65791));
+    terminates \false;
+    assigns ft[0 .. 65535], cum[0 .. 65791];
+    exits \exit_status == 1;
+*/
+static void d32_tab(const uint8_t *cb, uint64_t bn, const uint64_t *hp,
+                    uint16_t *ft, uint32_t *cum) {
+    uint8_t used[256];
+    /*@ loop invariant 0 <= z <= 256;
+        loop assigns used[0 .. 255], z;
+        loop variant 256 - z;
+    */
+    for (int z = 0; z < 256; z++) used[z] = 0;
+    /*@ loop invariant 0 <= i <= bn;
+        loop assigns used[0 .. 255], i;
+        loop variant bn - i;
+    */
+    for (uint64_t i = 0; i < bn; i++) used[cb[i] % 256] = 1;
+    int fo = 0, ko = 0;
+    /*@ loop invariant 0 <= c <= 256;
+        loop invariant fo == c * 256 && ko == c * 257;
+        loop invariant 0 <= fo <= 65536 && 0 <= ko <= 65792;
+        loop assigns ft[0 .. 65535], cum[0 .. 65791], c, fo, ko;
+        loop variant 256 - c;
+    */
+    for (int c = 0; c < 256; c++, fo += 256, ko += 257) {
+        if (used[c]) {
+            norm_ctx(hp + c * 256, ft + fo, 256);
+            fill_ctx(cum + ko, ft + fo, 256);
+        }
+    }
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid_read(ref + (0 .. n - 1));
+    requires \valid(cur + (0 .. n - 1));
+    requires \valid(hp + (0 .. 65535));
+    requires n <= 281474976710655;
+    requires \forall integer j; 0 <= j < 65536 ==>
+        hp[j] + n <= 281474976710655;
+    requires \valid(pl + (0 .. 131071));
+    requires \valid(cb + (0 .. 131071));
+    requires \valid(ft + (0 .. 65535));
+    requires \valid(cum + (0 .. 65791));
+    requires 0 <= plane <= 3;
+    requires \separated(cur + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(cur + (0 .. n - 1), ref + (0 .. n - 1));
+    requires \separated(cur + (0 .. n - 1), hp + (0 .. 65535));
+    requires \separated(cur + (0 .. n - 1), pl + (0 .. 131071));
+    requires \separated(cur + (0 .. n - 1), cb + (0 .. 131071));
+    requires \separated(cur + (0 .. n - 1), ft + (0 .. 65535));
+    requires \separated(cur + (0 .. n - 1), cum + (0 .. 65791));
+    requires \separated(hp + (0 .. 65535), in + (0 .. lim - in - 1));
+    requires \separated(hp + (0 .. 65535), ref + (0 .. n - 1));
+    requires \separated(hp + (0 .. 65535), ft + (0 .. 65535));
+    requires \separated(hp + (0 .. 65535), cum + (0 .. 65791));
+    requires \separated(hp + (0 .. 65535), pl + (0 .. 131071));
+    requires \separated(hp + (0 .. 65535), cb + (0 .. 131071));
+    requires \separated(ft + (0 .. 65535), in + (0 .. lim - in - 1));
+    requires \separated(ft + (0 .. 65535), ref + (0 .. n - 1));
+    requires \separated(ft + (0 .. 65535), cum + (0 .. 65791));
+    requires \separated(ft + (0 .. 65535), pl + (0 .. 131071));
+    requires \separated(ft + (0 .. 65535), cb + (0 .. 131071));
+    requires \separated(cum + (0 .. 65791), in + (0 .. lim - in - 1));
+    requires \separated(cum + (0 .. 65791), ref + (0 .. n - 1));
+    requires \separated(cum + (0 .. 65791), pl + (0 .. 131071));
+    requires \separated(cum + (0 .. 65791), cb + (0 .. 131071));
+    requires \separated(ref + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(ref + (0 .. n - 1), pl + (0 .. 131071));
+    requires \separated(ref + (0 .. n - 1), cb + (0 .. 131071));
+    requires \separated(pl + (0 .. 131071), in + (0 .. lim - in - 1));
+    requires \separated(pl + (0 .. 131071), cb + (0 .. 131071));
+    requires \separated(cb + (0 .. 131071), in + (0 .. lim - in - 1));
+    terminates \false;
+    assigns cur[0 .. n - 1], hp[0 .. 65535], pl[0 .. 131071], cb[0 .. 131071],
+            ft[0 .. 65535], cum[0 .. 65791];
+    exits \exit_status == 1;
+    ensures 0 <= \result - in && \result - in <= lim - in;
+    ensures \base_addr(\result) == \base_addr(in);
+*/
+static const uint8_t *d32_plane(const uint8_t *in, const uint8_t *lim,
+                                const uint32_t *ref, uint64_t n,
+                                uint32_t *cur, uint64_t *hp, int plane,
+                                uint8_t *pl, uint8_t *cb, uint16_t *ft,
+                                uint32_t *cum) {
+    const uint8_t *rp = in;
+    int sh = plane * 8;
+    /*@ loop invariant 0 <= c0;
+        loop invariant 0 <= lim - rp;
+        loop invariant in <= rp;
+        loop invariant \base_addr(rp) == \base_addr(in);
+        loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+        loop invariant \forall integer j; 0 <= j < 65536 ==>
+            hp[j] <= \at(hp[j], Pre) + c0;
+        loop invariant \forall integer j; 0 <= j < 65536 ==>
+            hp[j] <= \at(hp[j], Pre) + n;
+        loop assigns rp, cur[0 .. n - 1], hp[0 .. 65535], c0,
+                pl[0 .. 131071], cb[0 .. 131071], ft[0 .. 65535],
+                cum[0 .. 65791];
+        loop variant n - c0;
+    */
+    for (uint64_t c0 = 0; c0 < n; c0 += D32CN) {
+        uint64_t cn = n - c0 < D32CN ? n - c0 : D32CN;
+        /*@ assert c0 + cn <= n; */
+        /*@ loop invariant 0 <= b0;
+            loop invariant 0 <= lim - rp;
+            loop invariant in <= rp;
+            loop invariant \base_addr(rp) == \base_addr(in);
+            loop invariant \valid_read(rp + (0 .. lim - rp - 1));
+            loop invariant \forall integer j; 0 <= j < 65536 ==>
+                hp[j] <= \at(hp[j], Pre) + c0 + (b0 <= cn ? b0 : cn);
+            loop invariant \forall integer j; 0 <= j < 65536 ==>
+                hp[j] <= \at(hp[j], Pre) + n;
+            loop assigns rp, cur[c0 .. c0 + cn - 1], hp[0 .. 65535], b0,
+                    pl[0 .. 131071], cb[0 .. 131071], ft[0 .. 65535],
+                    cum[0 .. 65791];
+            loop variant cn - b0;
+        */
+        for (uint64_t b0 = 0; b0 < cn; b0 += BLK) {
+            uint64_t bn = cn - b0 < BLK ? cn - b0 : BLK;
+            /*@ assert b0 + bn <= cn; */
+            /*@ assert bn <= 131072; */
+            /*@ assert c0 + b0 + bn <= n; */
+            /*@ assert \forall integer j; 0 <= j < 65536 ==>
+                hp[j] <= 281474976710655; */
+            /*@ loop invariant 0 <= i <= bn;
+                loop assigns cb[0 .. bn - 1], i;
+                loop variant bn - i;
+            */
+            for (uint64_t i = 0; i < bn; i++)
+                cb[i] = (uint8_t)(ref[c0 + b0 + i] >> 23);
+            d32_tab(cb, bn, hp, ft, cum);
+            uint64_t x; const uint8_t *end;
+            /*@ assert 0 <= lim - rp; */
+            rp = read_blk(rp, lim, &x, &end);
+            d32_blk(x, rp, end, cb, bn, ft, cum, pl, hp);
+            rp = end;
+            if (plane == 0) {
+                /*@ loop invariant 0 <= i <= bn;
+                    loop assigns cur[c0 + b0 .. c0 + b0 + bn - 1], i;
+                    loop variant bn - i;
+                */
+                for (uint64_t i = 0; i < bn; i++)
+                    cur[c0 + b0 + i] = ref[c0 + b0 + i] ^ ((uint32_t)pl[i]);
+            } else {
+                /*@ loop invariant 0 <= i <= bn;
+                    loop assigns cur[c0 + b0 .. c0 + b0 + bn - 1], i;
+                    loop variant bn - i;
+                */
+                for (uint64_t i = 0; i < bn; i++)
+                    cur[c0 + b0 + i] ^= ((uint32_t)pl[i]) << sh;
+            }
+        }
+    }
+    return rp;
+}
+
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid_read(ref + (0 .. n - 1));
+    requires \valid(cur + (0 .. n - 1));
+    requires \valid(h + (0 .. 262143));
+    requires n <= 281474976710655;
+    requires \forall integer k; 0 <= k < 262144 ==>
+        h[k] + n <= 281474976710655;
+    requires \valid(pl + (0 .. 131071));
+    requires \valid(cb + (0 .. 131071));
+    requires \valid(ft + (0 .. 65535));
+    requires \valid(cum + (0 .. 65791));
+    requires \separated(cur + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(cur + (0 .. n - 1), ref + (0 .. n - 1));
+    requires \separated(cur + (0 .. n - 1), h + (0 .. 262143));
+    requires \separated(cur + (0 .. n - 1), pl + (0 .. 131071));
+    requires \separated(cur + (0 .. n - 1), cb + (0 .. 131071));
+    requires \separated(cur + (0 .. n - 1), ft + (0 .. 65535));
+    requires \separated(cur + (0 .. n - 1), cum + (0 .. 65791));
+    requires \separated(h + (0 .. 262143), in + (0 .. lim - in - 1));
+    requires \separated(h + (0 .. 262143), ref + (0 .. n - 1));
+    requires \separated(h + (0 .. 262143), ft + (0 .. 65535));
+    requires \separated(h + (0 .. 262143), cum + (0 .. 65791));
+    requires \separated(h + (0 .. 262143), pl + (0 .. 131071));
+    requires \separated(h + (0 .. 262143), cb + (0 .. 131071));
+    requires \separated(ft + (0 .. 65535), in + (0 .. lim - in - 1));
+    requires \separated(ft + (0 .. 65535), ref + (0 .. n - 1));
+    requires \separated(ft + (0 .. 65535), cum + (0 .. 65791));
+    requires \separated(ft + (0 .. 65535), pl + (0 .. 131071));
+    requires \separated(ft + (0 .. 65535), cb + (0 .. 131071));
+    requires \separated(cum + (0 .. 65791), in + (0 .. lim - in - 1));
+    requires \separated(cum + (0 .. 65791), ref + (0 .. n - 1));
+    requires \separated(cum + (0 .. 65791), pl + (0 .. 131071));
+    requires \separated(cum + (0 .. 65791), cb + (0 .. 131071));
+    requires \separated(ref + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(ref + (0 .. n - 1), pl + (0 .. 131071));
+    requires \separated(ref + (0 .. n - 1), cb + (0 .. 131071));
+    requires \separated(pl + (0 .. 131071), in + (0 .. lim - in - 1));
+    requires \separated(pl + (0 .. 131071), cb + (0 .. 131071));
+    requires \separated(cb + (0 .. 131071), in + (0 .. lim - in - 1));
+    terminates \false;
+    assigns cur[0 .. n - 1], h[0 .. 262143], pl[0 .. 131071], cb[0 .. 131071],
+            ft[0 .. 65535], cum[0 .. 65791];
+    exits \exit_status == 1;
+*/
+static void dlt32_dec_ws(const uint8_t *in, const uint8_t *lim,
+                         const uint32_t *ref, uint64_t n,
+                         uint32_t *cur, uint64_t *h,
+                         uint8_t *pl, uint8_t *cb, uint16_t *ft,
+                         uint32_t *cum) {
+    const uint8_t *rp = in;
+    /*@ assert \forall integer j; 0 <= j < 65536 ==>
+        h[j] + n <= 281474976710655; */
+    /*@ assert \separated(h + (0 .. 65535), in + (0 .. lim - in - 1)); */
+    /*@ assert \separated(h + (0 .. 65535), ref + (0 .. n - 1)); */
+    /*@ assert \separated(h + (0 .. 65535), ft + (0 .. 65535)); */
+    /*@ assert \separated(h + (0 .. 65535), cum + (0 .. 65791)); */
+    /*@ assert \separated(h + (0 .. 65535), pl + (0 .. 131071)); */
+    /*@ assert \separated(h + (0 .. 65535), cb + (0 .. 131071)); */
+    /*@ assert \separated(cur + (0 .. n - 1), h + (0 .. 65535)); */
+    /*@ assert 0 <= lim - rp && \base_addr(rp) == \base_addr(in) &&
+        \valid_read(rp + (0 .. lim - rp - 1)); */
+    rp = d32_plane(rp, lim, ref, n, cur, h, 0, pl, cb, ft, cum);
+    /*@ assert \forall integer j; 0 <= j < 65536 ==>
+        h[65536 + j] + n <= 281474976710655; */
+    /*@ assert \separated(h + 65536 + (0 .. 65535), in + (0 .. lim - in - 1)); */
+    /*@ assert \separated(h + 65536 + (0 .. 65535), ref + (0 .. n - 1)); */
+    /*@ assert \separated(h + 65536 + (0 .. 65535), ft + (0 .. 65535)); */
+    /*@ assert \separated(h + 65536 + (0 .. 65535), cum + (0 .. 65791)); */
+    /*@ assert \separated(h + 65536 + (0 .. 65535), pl + (0 .. 131071)); */
+    /*@ assert \separated(h + 65536 + (0 .. 65535), cb + (0 .. 131071)); */
+    /*@ assert \separated(cur + (0 .. n - 1), h + 65536 + (0 .. 65535)); */
+    /*@ assert 0 <= lim - rp && \base_addr(rp) == \base_addr(in) &&
+        \valid_read(rp + (0 .. lim - rp - 1)); */
+    rp = d32_plane(rp, lim, ref, n, cur, h + 65536, 1, pl, cb, ft, cum);
+    /*@ assert \forall integer j; 0 <= j < 65536 ==>
+        h[131072 + j] + n <= 281474976710655; */
+    /*@ assert \separated(h + 131072 + (0 .. 65535), in + (0 .. lim - in - 1)); */
+    /*@ assert \separated(h + 131072 + (0 .. 65535), ref + (0 .. n - 1)); */
+    /*@ assert \separated(h + 131072 + (0 .. 65535), ft + (0 .. 65535)); */
+    /*@ assert \separated(h + 131072 + (0 .. 65535), cum + (0 .. 65791)); */
+    /*@ assert \separated(h + 131072 + (0 .. 65535), pl + (0 .. 131071)); */
+    /*@ assert \separated(h + 131072 + (0 .. 65535), cb + (0 .. 131071)); */
+    /*@ assert \separated(cur + (0 .. n - 1), h + 131072 + (0 .. 65535)); */
+    /*@ assert 0 <= lim - rp && \base_addr(rp) == \base_addr(in) &&
+        \valid_read(rp + (0 .. lim - rp - 1)); */
+    rp = d32_plane(rp, lim, ref, n, cur, h + 131072, 2, pl, cb, ft, cum);
+    /*@ assert \forall integer j; 0 <= j < 65536 ==>
+        h[196608 + j] + n <= 281474976710655; */
+    /*@ assert \separated(h + 196608 + (0 .. 65535), in + (0 .. lim - in - 1)); */
+    /*@ assert \separated(h + 196608 + (0 .. 65535), ref + (0 .. n - 1)); */
+    /*@ assert \separated(h + 196608 + (0 .. 65535), ft + (0 .. 65535)); */
+    /*@ assert \separated(h + 196608 + (0 .. 65535), cum + (0 .. 65791)); */
+    /*@ assert \separated(h + 196608 + (0 .. 65535), pl + (0 .. 131071)); */
+    /*@ assert \separated(h + 196608 + (0 .. 65535), cb + (0 .. 131071)); */
+    /*@ assert \separated(cur + (0 .. n - 1), h + 196608 + (0 .. 65535)); */
+    /*@ assert 0 <= lim - rp && \base_addr(rp) == \base_addr(in) &&
+        \valid_read(rp + (0 .. lim - rp - 1)); */
+    rp = d32_plane(rp, lim, ref, n, cur, h + 196608, 3, pl, cb, ft, cum);
+    if (rp != lim) die("corrupt delta32");
+}
+
 static void dlt32_dec(const uint8_t *in, const uint8_t *lim, const uint32_t *ref, uint64_t n,
                       uint32_t *cur, uint64_t *h) {
     uint8_t *pl = xm(BLK), *cb = xm(BLK);
     uint16_t *ft = xm(256 * 256 * 2); uint32_t *cum = xm(256 * 257 * 4);
-    for (int p = 0; p < 4; p++) {
-        int sh = p * 8;
-        for (uint64_t c0 = 0; c0 < n; c0 += D32CN) {
-            uint64_t cn = n - c0 < D32CN ? n - c0 : D32CN;
-            for (uint64_t b0 = 0; b0 < cn; b0 += BLK) {
-                uint64_t bn = cn - b0 < BLK ? cn - b0 : BLK;
-                for (uint64_t i = 0; i < bn; i++) cb[i] = (uint8_t)(ref[c0 + b0 + i] >> 23);
-                uint8_t used[256] = {0};
-                for (uint64_t i = 0; i < bn; i++) used[cb[i]] = 1;
-                for (int c = 0; c < 256; c++) if (used[c]) {
-                    norm_ctx(h + (p * 256 + c) * 256, ft + c * 256, 256);
-                    uint32_t *cu = cum + c * 257;
-                    cu[0] = 0;
-                    for (int i = 0; i < 256; i++) cu[i + 1] = cu[i] + ft[c * 256 + i];
-                }
-                uint64_t x; const uint8_t *end;
-                in = read_blk(in, lim, &x, &end);
-                for (uint64_t i = 0; i < bn; i++) {
-                    uint32_t v = (uint32_t)(x & (TOT - 1)), fc;
-                    int c = cb[i];
-                    uint32_t sym = dsym(ft + c * 256, cum + c * 257, 256, v, &fc);
-                    x = dec(x, fc, cum[c * 257 + sym], &in, end);
-                    h[(p * 256 + c) * 256 + sym]++;
-                    pl[i] = (uint8_t)sym;
-                }
-                in = end;
-                if (p == 0)
-                    for (uint64_t i = 0; i < bn; i++)
-                        cur[c0 + b0 + i] = ref[c0 + b0 + i] ^ ((uint32_t)pl[i]);
-                else
-                    for (uint64_t i = 0; i < bn; i++)
-                        cur[c0 + b0 + i] ^= ((uint32_t)pl[i]) << sh;
-            }
-        }
-    }
-    if (in != lim) die("corrupt delta32");
+    dlt32_dec_ws(in, lim, ref, n, cur, h, pl, cb, ft, cum);
     free(pl); free(cb); free(ft); free(cum);
 }
 
@@ -2061,27 +2819,59 @@ static size_t pack_enc(const uint8_t *data, uint64_t n, int bsz, uint8_t *out) {
     free(cnt); free(rmap);
     return o - out;
 }
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid(data + (0 .. n - 1));
+    requires bsz == 1 || bsz == 2;
+    requires n <= 281474976710655;
+    requires lim - in <= 281474976710655;
+    requires \separated(data + (0 .. n - 1), in + (0 .. lim - in - 1));
+    terminates \false;
+    exits \exit_status == 1;
+    assigns data[0 .. n - 1];
+*/
 static void pack_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int bsz, uint8_t *data) {
     if (lim - in < 4) die("corrupt pack");
     uint32_t k = g32le(in); in += 4;
     if (k < 1 || k > 256) die("corrupt pack");
     if ((uint64_t)(lim - in) < (uint64_t)k * 2) die("corrupt pack");
     uint8_t dict[512];              /* raw LE bytes — no host-order cast */
+    /*@ loop invariant 0 <= di <= k * 2;
+        loop assigns dict[0 .. 511], di;
+        loop variant k * 2 - di;
+    */
     for (uint32_t di = 0; di < k * 2; di++) dict[di] = in[di];
     in += k * 2;
-    uint64_t ib = 0;
-    while (((uint64_t)1 << ib) < k) ib++;
+    uint64_t ib = 0, p2 = 1;
+    /*@ loop invariant 0 <= ib <= 8 && p2 >= 1;
+        loop assigns ib, p2;
+        loop variant 8 - ib;
+    */
+    while (p2 < k) { if (ib >= 8) die("corrupt pack"); ib++; p2 += p2; }
     uint64_t ne = n / bsz, bit = 0, nb = (uint64_t)(lim - in);
+    /*@ loop invariant 0 <= i <= ne;
+        loop invariant 0 <= bit <= 8 * nb;
+        loop assigns data[0 .. n - 1], i, bit;
+        loop variant ne - i;
+    */
     for (uint64_t i = 0; i < ne; i++) {
         uint32_t idx = 0;
         if (ib) {   /* k==1: zero-bit indices — the index stream is empty */
-            if ((bit + ib - 1) >> 3 >= nb) die("corrupt pack");
+            if ((bit + ib - 1) / 8 >= nb) die("corrupt pack");
+            /*@ assert bit / 8 <= (bit + ib - 1) / 8; */
+            /*@ loop invariant 0 <= b <= ib;
+                loop invariant bit + ib - b <= 8 * nb;
+                loop assigns idx, bit, b;
+                loop variant ib - b;
+            */
             for (uint64_t b = 0; b < ib; b++) {
-                idx = (idx << 1) | ((in[bit >> 3] >> (7 - (bit & 7))) & 1);
+                idx = idx * 2 + ((in[bit / 8] >> (7 - bit % 8)) % 2);
                 bit++;
             }
         }
         if (idx >= k) die("corrupt pack");
+        /*@ assert 2 * idx + 1 < 512; */
+        /*@ assert bsz == 2 ==> 2 * i + 1 < n; */
         if (bsz == 2) { data[2 * i] = dict[2 * idx]; data[2 * i + 1] = dict[2 * idx + 1]; }
         else data[i] = dict[2 * idx];
     }
@@ -2509,24 +3299,193 @@ static size_t prw_enc(const uint16_t *s, uint64_t n, uint64_t cols, int mb,
     dltws_free(&w);
     return o - out;
 }
-static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t cols,
-                    int mb, uint16_t *s, uint64_t *hf, uint64_t *hd) {
+/*@ requires \valid_read(in + (0 .. lim - in - 1));
+    requires 0 <= lim - in;
+    requires \valid(s + (0 .. n - 1));
+    requires 1 <= cols <= n;
+    requires n <= 281474976710655;
+    requires mb == 7 || mb == 10;
+    requires \valid(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1));
+    requires \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+        hf[j] + n <= 281474976710655;
+    requires \valid(hd + (0 .. 524543));
+    requires \forall integer j; 0 <= j < 524544 ==>
+        hd[j] + n <= 281474976710655;
+    requires \valid(w);
+    requires \valid(w->ft + (0 .. 524415));
+    requires \valid(w->dcum + (0 .. 524543));
+    requires \valid(w->used + (0 .. 127));
+    requires \valid(w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \valid(w->escbuf + (0 .. cols - 1));
+    requires \separated(s + (0 .. n - 1), in + (0 .. lim - in - 1));
+    requires \separated(s + (0 .. n - 1),
+                        hf + (0 .. (mb == 7 ? 66050 : 65602) - 1));
+    requires \separated(s + (0 .. n - 1), hd + (0 .. 524543));
+    requires \separated(s + (0 .. n - 1), w->ft + (0 .. 524415));
+    requires \separated(s + (0 .. n - 1), w->dcum + (0 .. 524543));
+    requires \separated(s + (0 .. n - 1), w->used + (0 .. 127));
+    requires \separated(s + (0 .. n - 1),
+                        w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \separated(s + (0 .. n - 1), w->escbuf + (0 .. cols - 1));
+    requires \separated(s + (0 .. n - 1), w);
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        in + (0 .. lim - in - 1));
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        hd + (0 .. 524543));
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        w->ft + (0 .. 524415));
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        w->dcum + (0 .. 524543));
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        w->used + (0 .. 127));
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                        w->escbuf + (0 .. cols - 1));
+    requires \separated(hd + (0 .. 524543), in + (0 .. lim - in - 1));
+    requires \separated(hd + (0 .. 524543), w->ft + (0 .. 524415));
+    requires \separated(hd + (0 .. 524543), w->dcum + (0 .. 524543));
+    requires \separated(hd + (0 .. 524543), w->used + (0 .. 127));
+    requires \separated(hd + (0 .. 524543),
+                        w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \separated(hd + (0 .. 524543), w->escbuf + (0 .. cols - 1));
+    requires \separated(w->ft + (0 .. 524415), in + (0 .. lim - in - 1));
+    requires \separated(w->ft + (0 .. 524415), w->dcum + (0 .. 524543));
+    requires \separated(w->ft + (0 .. 524415), w->used + (0 .. 127));
+    requires \separated(w->ft + (0 .. 524415),
+                        w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \separated(w->ft + (0 .. 524415), w->escbuf + (0 .. cols - 1));
+    requires \separated(w->dcum + (0 .. 524543), in + (0 .. lim - in - 1));
+    requires \separated(w->dcum + (0 .. 524543), w->used + (0 .. 127));
+    requires \separated(w->dcum + (0 .. 524543),
+                        w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \separated(w->dcum + (0 .. 524543), w->escbuf + (0 .. cols - 1));
+    requires \separated(w->used + (0 .. 127), in + (0 .. lim - in - 1));
+    requires \separated(w->used + (0 .. 127),
+                        w->escbits + (0 .. (cols + 7) / 8 - 1));
+    requires \separated(w->used + (0 .. 127), w->escbuf + (0 .. cols - 1));
+    requires \separated(w->escbits + (0 .. (cols + 7) / 8 - 1),
+                        in + (0 .. lim - in - 1));
+    requires \separated(w->escbits + (0 .. (cols + 7) / 8 - 1),
+                        w->escbuf + (0 .. cols - 1));
+    requires \separated(w->escbuf + (0 .. cols - 1),
+                        in + (0 .. lim - in - 1));
+    terminates \false;
+    assigns s[0 .. n - 1], hf[0 .. (mb == 7 ? 66050 : 65602) - 1],
+            hd[0 .. 524543], w->ft[0 .. 524415], w->dcum[0 .. 524543],
+            w->used[0 .. 127], w->escbits[0 .. (cols + 7) / 8 - 1],
+            w->escbuf[0 .. cols - 1];
+    exits \exit_status == 1;
+    ensures \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+        hf[j] <= \at(hf[j], Pre) + n;
+    ensures \forall integer j; 0 <= j < 524544 ==>
+        hd[j] <= \at(hd[j], Pre) + n;
+*/
+static void prw_dec_ws(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t cols,
+                       int mb, uint16_t *s, uint64_t *hf, uint64_t *hd, DltWs *w) {
     if ((uint64_t)(lim - in) < 4) die("corrupt prw");
     uint32_t l1 = g32le(in); in += 4;
     if ((uint64_t)l1 > (uint64_t)(lim - in)) die("corrupt prw");
     f16_dec(in, in + l1, cols, mb, s, hf);
     in += l1;
-    DltWs w; dltws_init(&w);
-    for (uint64_t r = 1; r * cols < n; r++) {
-        uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
+    /*@ loop invariant cols <= pos;
+        loop invariant 0 <= lim - in;
+        loop invariant 0 <= in - \at(in, Pre);
+        loop invariant \base_addr(in) == \base_addr(\at(in, Pre));
+        loop invariant \valid_read(in + (0 .. lim - in - 1));
+        loop invariant \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+            hf[j] <= \at(hf[j], Pre) + pos;
+        loop invariant \forall integer j; 0 <= j < (mb == 7 ? 66050 : 65602) ==>
+            hf[j] <= \at(hf[j], Pre) + n;
+        loop invariant \forall integer j; 0 <= j < 524544 ==>
+            hd[j] <= \at(hd[j], Pre) + pos;
+        loop invariant \forall integer j; 0 <= j < 524544 ==>
+            hd[j] <= \at(hd[j], Pre) + n;
+        loop assigns in, pos, s[0 .. n - 1],
+                hf[0 .. (mb == 7 ? 66050 : 65602) - 1], hd[0 .. 524543],
+                w->ft[0 .. 524415], w->dcum[0 .. 524543],
+                w->used[0 .. 127], w->escbits[0 .. (cols + 7) / 8 - 1],
+                w->escbuf[0 .. cols - 1];
+        loop variant n - pos;
+    */
+    for (uint64_t pos = cols; pos < n; pos += cols) {
+        uint64_t rn = n - pos < cols ? n - pos : cols;
+        /*@ assert 1 <= rn && rn <= cols; */
+        /*@ assert pos + rn <= n; */
+        /*@ assert pos - cols + rn <= n; */
+        /*@ assert (rn + 7) / 8 <= (cols + 7) / 8; */
         if ((uint64_t)(lim - in) < 4) die("corrupt prw");
         uint32_t lr = g32le(in); in += 4;
-        if ((uint64_t)lr > (uint64_t)(lim - in)) { dltws_free(&w); die("corrupt prw"); }
-        dlt_dec_ws(in, in + lr, s + (r - 1) * cols, rn, s + r * cols, hd, mb, hf, &w);
+        if ((uint64_t)lr > (uint64_t)(lim - in)) die("corrupt prw");
+        /*@ assert \separated(s + pos + (0 .. rn - 1),
+                              s + pos - cols + (0 .. rn - 1)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1),
+                              in + (0 .. lim - in - 1)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1), hd + (0 .. 524543)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1), w->ft + (0 .. 524415)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1),
+                              w->dcum + (0 .. 524543)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1), w->used + (0 .. 127)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1),
+                              w->escbits + (0 .. (rn + 7) / 8 - 1)); */
+        /*@ assert \separated(s + pos - cols + (0 .. rn - 1),
+                              in + (0 .. lim - in - 1)); */
+        /*@ assert \separated(s + pos - cols + (0 .. rn - 1),
+                              w->escbits + (0 .. (rn + 7) / 8 - 1)); */
+        /*@ assert \separated(s + pos - cols + (0 .. rn - 1),
+                              w->ft + (0 .. 524415)); */
+        /*@ assert \separated(s + pos - cols + (0 .. rn - 1),
+                              w->dcum + (0 .. 524543)); */
+        /*@ assert \separated(s + pos - cols + (0 .. rn - 1),
+                              w->used + (0 .. 127)); */
+        /*@ assert \separated(hd + (0 .. 524543),
+                              w->escbits + (0 .. (rn + 7) / 8 - 1)); */
+        /*@ assert \separated(hd + (0 .. 524543),
+                              s + pos - cols + (0 .. rn - 1)); */
+        /*@ assert \separated(w->escbits + (0 .. (rn + 7) / 8 - 1),
+                              in + (0 .. lim - in - 1)); */
+        uint64_t escn;
+        /*@ assert \separated(&escn, s + pos + (0 .. rn - 1)); */
+        /*@ assert \separated(&escn, hd + (0 .. 524543)); */
+        /*@ assert \separated(&escn, w->ft + (0 .. 524415)); */
+        /*@ assert \separated(&escn, w->dcum + (0 .. 524543)); */
+        const uint8_t *rp = dlt_dec_ws(in, in + lr, s + pos - cols, rn,
+                                     s + pos, hd, w, &escn);
+        /*@ assert escn <= rn && escn <= cols; */
+        /*@ assert \separated(w->escbuf + (0 .. escn - 1),
+                              hf + (0 .. (mb == 7 ? 66050 : 65602) - 1)); */
+        /*@ assert \separated(w->escbuf + (0 .. escn - 1),
+                              in + (0 .. lim - in - 1)); */
+        /*@ assert \separated(w->escbuf + (0 .. escn - 1),
+                              s + pos + (0 .. rn - 1)); */
+        /*@ assert \separated(w->escbuf + (0 .. escn - 1),
+                              w->escbits + (0 .. (rn + 7) / 8 - 1)); */
+        /*@ assert \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                              in + (0 .. lim - in - 1)); */
+        /*@ assert \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                              s + pos + (0 .. rn - 1)); */
+        /*@ assert \separated(hf + (0 .. (mb == 7 ? 66050 : 65602) - 1),
+                              w->escbits + (0 .. (rn + 7) / 8 - 1)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1),
+                              in + (0 .. lim - in - 1)); */
+        /*@ assert \separated(s + pos + (0 .. rn - 1),
+                              w->escbits + (0 .. (rn + 7) / 8 - 1)); */
+        /*@ assert \separated(w->escbits + (0 .. (rn + 7) / 8 - 1),
+                              in + (0 .. lim - in - 1)); */
+        dlt_tail(rp, in + lr, escn, mb, w->escbuf, hf, s + pos, rn,
+                 w->escbits);
         in += lr;
     }
-    dltws_free(&w);
     if (in != lim) die("corrupt prw");   /* exact payload consumption */
+}
+
+static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t cols,
+                    int mb, uint16_t *s, uint64_t *hf, uint64_t *hd) {
+    DltWs w; dltws_init(&w);
+    dltws_need_bits(&w, cols);
+    dltws_need_eb(&w, cols);
+    prw_dec_ws(in, lim, n, cols, mb, s, hf, hd, &w);
+    dltws_free(&w);
 }
 
 static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri) {

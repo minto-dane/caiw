@@ -3,7 +3,7 @@
  * proof per contract, unlike CBMC's bounded model checking.
  *
  * Contracts live in caiw.c itself (ACSL annotations — invisible to
- * gcc, verified here).  Scope (47 functions): byte-order codecs
+ * gcc, verified here).  Scope (65 functions): byte-order codecs
  * (p16le/p32le/p64le, g32le/g64le), the little-endian archive
  * readers r64/r32/r16/r8 (pointer advance + in-range reads on the
  * untrusted record-walk path), fnv, crc_setup/crc32_of, hex4,
@@ -83,7 +83,55 @@
  * position ctx via a po>=P die (unreachable when P|n) and a
  * __int128 po*K/P product, and pos_elem decodes SE/M through
  * dsym_raw with int64 checks feeding every bound as a path
- * fact.  Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
+ * fact.  The F32 decoder reuses the identical template at five
+ * decode stages (S/E/m1/m2/m3, se<=511 ctx, fixed 328194-cell
+ * ft / 329730-cell cum workspaces): f32_elem (5 dsym_raw +
+ * 5 runtime fc guards + int64 product checks), f32_blk,
+ * f32_tab (norm_ctx/fill_ctx sweeps over accumulator indices
+ * ko/fo carrying the equalities ko==c*(aw+1)/fo==c*aw — the
+ * equalities, not bounds alone, are what let call-site
+ * requires instantiate), f32_dec_ws (block loop + rp==lim).
+ * pack_dec proves bit-extraction safety and exact consumption
+ * (lim-in == ceil(ne*ib/8)): k∈[1,256]/idx<k stay runtime
+ * checks that themselves supply every downstream bound, bit
+ * reads use /8 and %8 arithmetic forms, and the ib width loop
+ * is a doubling p2 accumulator with an unreachable ib>=8
+ * die-guard (k<=256 makes it dead — the guard, not lsl
+ * reasoning, supplies the bound).  The DELTA16 layer is fully
+ * decomposed: dlt_val (kmap16/kmap16_inv value mapping pulled
+ * non-inline — the inlined bit_test chain poisoned every
+ * enclosing goal), dlt_elem (one symbol; ctx = ref>>9 written
+ * /512, the u16-load upper bound supplied by an explicit
+ * assert since the model does not infer C integer ranges, a
+ * (uint32_t) cast ahead of the shift keeps every stage
+ * nonneg), dlt_blk, dlt_tab (per-ctx norm_ctx + fill_ctx over
+ * accumulator offsets; the earlier fo<=520319 invariant was a
+ * genuine bound bug — the true max at c=128 is 524416),
+ * dlt_dec_ws (workspace form; the escape-position list that
+ * used to realloc inside the element loop is now an escbits
+ * bitmap — the escape count is derived as its popcount, so no
+ * pointer-count invariant is needed), dlt_scatter (bitmap-
+ * driven escape collection) and dlt_tail (escape values run
+ * through f16_dec, inheriting its own rp==lim check);
+ * zero-escape payloads close with rp==lim.  The DELTA32 layer
+ * repeats the template over four byte planes: d32_elem uses a
+ * saturating histogram increment (if (hp[i] != UINT64_MAX)
+ * hp[i]++ — unreachable for counts, removes every u64-overflow
+ * precondition at once), d32_blk/d32_tab mirror DELTA16,
+ * d32_plane lifts the whole per-plane pass to a function
+ * boundary (its ensures carry the per-cell +n growth bound —
+ * a mixed-plane h[j]<=Pre+c0 invariant would be false from
+ * pass 2 on since earlier planes' cells already grew), and
+ * dlt32_dec_ws unrolls the four plane calls with literal
+ * offsets h+0/65536/131072/196608 — literal indices make every
+ * slice instantiation, separation fact and assigns-disjointness
+ * decidable, whereas the same goals with a symbolic p*65536
+ * index drown e-matching (verified by minimal repro).  The PRW
+ * decoder (prw_dec_ws behind a thin alloc shell) proves the
+ * row framing with a linear pos cursor in place of r*cols,
+ * per-row [u32 len] bounds l1/lr, exact in==lim consumption,
+ * and workspace-slice separation stated as asserts.
+ * Still outside WP: NUL-driven scans (jstr/jws/jkey/jget) need
  * the strlen axioms whose quantifier instantiation times out in
  * z3/alt-ergo — attempted, reverted, documented boundary
  * (docs/design.md).  The u8_enc side resists the analogous

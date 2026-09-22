@@ -56,7 +56,11 @@ for e in "$V/tools/esbmc/bin/esbmc" /tmp/esbmc/release/bin/esbmc; do
 done
 ESBMC=$(command -v "$ESBMC" 2>/dev/null || echo "$ESBMC")
 COQC=${COQC:-coqc}
+command -v "$COQC" >/dev/null 2>&1 || COQC=$HOME/.opam/caiw-fc/bin/coqc
 COQC=$(command -v "$COQC" 2>/dev/null || echo "$COQC")
+COQCHK=${COQCHK:-coqchk}
+command -v "$COQCHK" >/dev/null 2>&1 || COQCHK=$HOME/.opam/caiw-fc/bin/coqchk
+COQCHK=$(command -v "$COQCHK" 2>/dev/null || echo "$COQCHK")
 CBMC_TIMEOUT=${CBMC_TIMEOUT:-300}
 CBMC_TIMEOUT_SLOW=${CBMC_TIMEOUT_SLOW:-120}
 for d in "$V/tools/lib" /home/nia/devbox/tools/usr/lib; do
@@ -301,8 +305,8 @@ fi
 # Needs why3-registered provers (alt-ergo, z3) — see ~/.why3.conf.
 if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
     out=$(PATH="$(dirname "$FRAMAC"):$V/tools/bin:/home/nia/devbox/tools/usr/bin:$PATH" \
-        timeout 600 "$FRAMAC" -wp -wp-rte \
-        -wp-fct p16le,p32le,p64le,g32le,g64le,fnv,hex4,utf8_ok,dsym,dsym_raw,kmap16,kmap16_inv,kmap32,crc_setup,crc32_of,is_bf,is_f16,is_f32,is_flt16,mbits_of,dbits,dtb,ck_shape_len,enc,dec,emit_blk,read_blk,norm_ctx,joinable,ebound,dec_aux,r64,r32,r16,r8,u8_blk,u8_dec,f16_elem,f16_blk,fill_ctx,norm_fM,f16_tab,f16_dec,pos_elem,pos_blk,pos_tab,pos_dec_ws \
+        timeout 3600 "$FRAMAC" -wp -wp-rte \
+        -wp-fct p16le,p32le,p64le,g32le,g64le,fnv,hex4,utf8_ok,dsym,dsym_raw,kmap16,kmap16_inv,kmap32,crc_setup,crc32_of,is_bf,is_f16,is_f32,is_flt16,mbits_of,dbits,dtb,ck_shape_len,enc,dec,emit_blk,read_blk,norm_ctx,joinable,ebound,dec_aux,r64,r32,r16,r8,u8_blk,u8_dec,f16_elem,f16_blk,fill_ctx,norm_fM,f16_tab,f16_dec,pos_elem,pos_blk,pos_tab,pos_dec_ws,f32_elem,f32_blk,f32_tab,f32_dec_ws,pack_dec,dlt_val,dlt_elem,dlt_blk,dlt_tab,dlt_dec_ws,dlt_scatter,dlt_tail,d32_elem,d32_blk,d32_tab,d32_plane,dlt32_dec_ws,prw_dec_ws \
         -wp-timeout 90 -wp-prover z3,alt-ergo -machdep gcc_x86_64 "$V/wp.c" 2>&1)
     got=$(echo "$out" | grep -oE "[0-9]+ / [0-9]+" | tail -1)
     if [ -n "$got" ]; then
