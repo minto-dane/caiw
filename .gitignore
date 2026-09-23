@@ -9,6 +9,7 @@ __pycache__/
 *.log
 *.caiw
 verify/states/
+/states/
 CaiwArchive/
 *_TTrace_*
 verify/CaiwArchive/
