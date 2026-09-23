@@ -158,6 +158,46 @@ static uint32_t crc32_of(const uint8_t *p, uint64_t n) {
     for (uint64_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) % 256] ^ (c >> 8);
     return ~c;
 }
+/* slicing-by-8 fast path: T[0]=crc_tab, T[k][b]=T[k-1][b]>>8^T[0][T[k-1][b]&FF].
+   Same CRC as crc32_of by construction; guarded by a one-time differential
+   self-check that permanently falls back to the proved scalar loop on
+   mismatch (crc_fast_ok = -1). Little-endian hosts only — same constraint
+   as the element payloads. */
+static uint32_t crc_t8[8][256];
+static int crc_fast_ok = 0;   /* 0 = untested, 1 = slice path verified, -1 = mismatch */
+static uint32_t crc32_slice(const uint8_t *p, uint64_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    while (n >= 8) {
+        uint32_t w;
+        memcpy(&w, p, 4);   /* little-endian load — BE hosts fail the self-test
+                               below and stay on the scalar path */
+        c ^= w;
+        c = crc_t8[7][c & 0xFF] ^ crc_t8[6][(c >> 8) & 0xFF] ^
+            crc_t8[5][(c >> 16) & 0xFF] ^ crc_t8[4][c >> 24] ^
+            crc_t8[3][p[4]] ^ crc_t8[2][p[5]] ^ crc_t8[1][p[6]] ^ crc_t8[0][p[7]];
+        p += 8; n -= 8;
+    }
+    while (n--) c = crc_tab[(c ^ *p++) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+static void crc_setup8(void) {
+    for (int b = 0; b < 256; b++) crc_t8[0][b] = crc_tab[b];
+    for (int k = 1; k < 8; k++)
+        for (int b = 0; b < 256; b++)
+            crc_t8[k][b] = crc_t8[k - 1][b] >> 8 ^ crc_tab[crc_t8[k - 1][b] & 0xFF];
+    /* differential self-test on a deterministic 4KB+tail pattern: any bug in
+       table construction or the fold loop shows up here before real data;
+       on mismatch (e.g. big-endian host) stay on the proved scalar loop */
+    static uint8_t pat[4101];
+    uint32_t s = 0x9E3779B9u;
+    for (int i = 0; i < 4101; i++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; pat[i] = (uint8_t)s; }
+    crc_fast_ok = crc32_slice(pat, sizeof pat) == crc32_of(pat, sizeof pat) ? 1 : -1;
+}
+static uint32_t crc32b(const uint8_t *p, uint64_t n) {
+    if (!crc_ready) crc_setup();
+    if (!crc_fast_ok) crc_setup8();
+    return crc_fast_ok > 0 ? crc32_slice(p, n) : crc32_of(p, n);
+}
 static void *xm(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("oom"); return p; }
 static void *xc(size_t a, size_t b) { void *p = calloc(a ? a : 1, b ? b : 1); if (!p) die("oom"); return p; }
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
@@ -3121,7 +3161,7 @@ static void emit_rec(FILE *of, Tensor *t, int bat) {   /* bat: 0 solo, 1 head, 2
     w64(of, t->len);
     if (m == M_REF || m == M_DELTA || m == M_DELTAX) w32(of, t->ref);
     w64(of, t->plen);
-    w32(of, crc32_of(t->data, t->len));
+    w32(of, crc32b(t->data, t->len));
 }
 
 static int g_amap; /* set by slurp when archive buffer is mmap-backed */
@@ -3860,11 +3900,14 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         if (t->candref[k] < refcut) { cref[nc] = t->candref[k]; cand[nc++] = M_DELTA; }
     if (t->xreft) { cref[nc] = 0xFFFFFFFFu; cand[nc++] = M_DELTAX; }
 
-    /* prefix pre-filter (big tensors only): encode the first PREF_EL
-       elements of every candidate, project to full size, and drop
-       candidates projected >1/6 + 256KB behind the best. Candidates within
-       the margin are re-encoded at full size below — the winner is still
-       chosen by real full-size bytes; a prefix-failing candidate is kept. */
+    TJob *jb = xc(nc, sizeof(TJob));
+    pthread_t *th = xc(nc, sizeof(pthread_t));
+
+    /* prefix pre-filter (big tensors only): encode the first cap elements
+       of every candidate, project to full size, and drop candidates
+       projected >1/6 + 256KB behind the best. Candidates within the margin
+       are re-encoded at full size below — the winner is still chosen by
+       real full-size bytes; a prefix-failing candidate is kept. */
     {
         int bsz = dtb(t->dtype);
         uint64_t ne0 = bsz ? t->len / bsz : t->len;
@@ -3873,12 +3916,29 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         if (nc > 1 && cap >= (1u << 16)) {         /* engage at >=512K elems */
             uint64_t nBk = cap * (bsz ? bsz : 1);
             if (nBk > t->len) nBk = t->len;
+            int psp = ntry < nc ? ntry : nc;
+            uint64_t pper = ebound(nBk);
+            if (psp > 1 && pper > TRYBUD / (uint64_t)psp) psp = (int)(TRYBUD / pper);
+            if (psp < 1) psp = 1;
             uint64_t *psz = xc(nc, 8);
-            for (int k = 0; k < nc; k++) {
-                uint8_t *pb = xm(ebound(nBk));
-                uint64_t *ph[2] = {0, 0}; int pc[2] = {-1, -1};
-                psz[k] = try_method(cand[k], t, all, pb, ph, pc, cref[k], cap);
-                free(pb); free(ph[0]); free(ph[1]);
+            for (int k = 0; k < nc; k += psp) {
+                int e = k + psp < nc ? k + psp : nc;
+                for (int k2 = k; k2 < e; k2++) {
+                    TJob *j = &jb[k2];
+                    j->m = cand[k2]; j->t = t; j->all = all; j->ri = cref[k2];
+                    j->capel = cap; j->spawned = 0;
+                    j->ghs = gh; j->snp = gsnp;
+                    if (psp == 1) tjob_run(j);
+                    else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
+                    else j->spawned = 1;
+                }
+                for (int k2 = k; k2 < e; k2++) if (jb[k2].spawned) pthread_join(th[k2], 0);
+                for (int k2 = k; k2 < e; k2++) {
+                    TJob *j = &jb[k2];
+                    psz[k2] = j->sz;
+                    free(j->buf); free(j->ho[0]); free(j->ho[1]);
+                    j->ho[0] = j->ho[1] = 0;
+                }
             }
             __uint128_t bp = ~(__uint128_t)0;
             for (int k = 0; k < nc; k++)
@@ -3896,8 +3956,6 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         }
     }
 
-    TJob *jb = xc(nc, sizeof(TJob));
-    pthread_t *th = xc(nc, sizeof(pthread_t));
     int nsp = ntry < nc ? ntry : nc;
     uint64_t per = ebound(t->len);
     /* division form — per*nsp itself could wrap u64 on absurd lens */
@@ -3913,6 +3971,7 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
             TJob *j = &jb[k2];
             j->m = cand[k2]; j->t = t; j->all = all; j->ri = cref[k2];
             j->capel = ~0ull;   /* full-size competition */
+            j->spawned = 0;
             j->ghs = gh; j->snp = gsnp;
             if (nsp == 1) tjob_run(j);
             else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
@@ -4110,12 +4169,12 @@ static void *djob_run(void *a) {
     if (j->t->method == M_RAW && !j->keep) {
         /* zero-copy: payload is the tensor; t->data stays NULL */
         if (j->t->plen != j->t->len) die("corrupt raw");
-        if (crc32_of(j->pl, j->t->len) != j->t->crc)
+        if (crc32b(j->pl, j->t->len) != j->t->crc)
             die("crc mismatch: archive corrupt");
         teach(j->t, j->pl);
     } else {
         dec_tensor(j->t, j->pl, j->all);
-        if (crc32_of(j->t->data, j->t->len) != j->t->crc)
+        if (crc32b(j->t->data, j->t->len) != j->t->crc)
             die("crc mismatch: archive corrupt");
     }
     gh = oh; gsnp = os;
@@ -4615,7 +4674,7 @@ int main(int argc, char **argv) {
                 /* zero-copy: payload bytes are the tensor — no alloc */
                 if (t->plen != t->len) die("corrupt raw");
                 const uint8_t *pd = buf + t->off;
-                if (crc32_of(pd, t->len) != t->crc) die("crc mismatch: archive corrupt");
+                if (crc32b(pd, t->len) != t->crc) die("crc mismatch: archive corrupt");
                 teach(t, pd);
                 FILE *of = ofs[t->file];
                 if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
@@ -4624,7 +4683,7 @@ int main(int argc, char **argv) {
                 i++; continue;
             }
             dec_tensor(t, buf + t->off, all);
-            if (crc32_of(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
+            if (crc32b(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
             FILE *of = ofs[t->file];
             if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
             if (t->len && fwrite(t->data, 1, t->len, of) != t->len) die("write");
@@ -4773,12 +4832,12 @@ int main(int argc, char **argv) {
                 if (t->method == M_RAW && !keep[i]) {
                     /* zero-copy: payload IS the tensor; compare direct */
                     if (t->plen != t->len) die("corrupt raw");
-                    if (crc32_of(buf + t->off, t->len) != t->crc)
+                    if (crc32b(buf + t->off, t->len) != t->crc)
                         die("crc mismatch: archive corrupt");
                     teach(t, buf + t->off);
                 } else {
                     dec_tensor(t, buf + t->off, all);
-                    if (crc32_of(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
+                    if (crc32b(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
                 }
             }
             /* post: compare each decoded tensor against the source */
