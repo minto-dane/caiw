@@ -3516,16 +3516,23 @@ static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t 
     dltws_free(&w);
 }
 
-static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri) {
+/* capel: element cap for prefix trials (candidate selection only — a
+   prefix-encoded candidate is never emitted; near-ties are re-encoded at
+   full length and the winner is always chosen by real full-size bytes).
+   ~0 means no cap. */
+static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri, uint64_t capel) {
     hout[0] = 0; hout[1] = 0; chout[0] = -1; chout[1] = -1;
     int bsz = dtb(t->dtype);
-    uint64_t ne = bsz ? t->len / bsz : 0;
+    uint64_t ne = bsz ? t->len / bsz : 0, ne0 = ne;
+    if (capel != ~0ull && ne > capel) ne = capel;
+    uint64_t nB = t->len;
+    if (capel != ~0ull && nB > capel * (uint64_t)bsz) nB = capel * (uint64_t)bsz;
     switch (m) {
     case M_RAW:
-        memcpy(scr, t->data, t->len);
-        return t->len;
+        memcpy(scr, t->data, nB);
+        return nB;
     case M_PACK:
-        if (bsz <= 2 && ne) return pack_enc(t->data, t->len, bsz, scr);
+        if (bsz <= 2 && nB) return pack_enc(t->data, nB, bsz, scr);
         return 0;
     case M_FIELD: {
         if (!is_flt16(t->dtype) || !ne) return 0;
@@ -3547,21 +3554,25 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         if (!is_flt16(t->dtype) || !ne || t->nd < 2) return 0;
         int c = is_bf(t->dtype) ? CBPOS : CFPOS;
         uint64_t *h = hclone(c);
-        uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), t->shape[0], 1, scr, h);
+        /* rowwise prefix: keep the row length, cap the ROW count so the
+           position contexts see the same mapping as the full encode */
+        int64_t P = t->shape[0];
+        if (ne < ne0) { int64_t p2 = (int64_t)((__uint128_t)ne * P / ne0); if (p2 < 1) p2 = 1; P = p2; }
+        uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), P, 1, scr, h);
         hout[0] = h; chout[0] = c;
         return sz;
     }
     case M_F32: {
-        if (!is_f32(t->dtype)) return 0;
+        if (!is_f32(t->dtype) || !ne) return 0;
         uint64_t *h = hclone(C32);
         uint64_t sz = f32_enc((uint32_t *)t->data, ne, scr, h);
         hout[0] = h; chout[0] = C32;
         return sz;
     }
     case M_U8: {
-        if (!t->len) return 0;
+        if (!nB) return 0;
         uint64_t *h = hclone(C8);
-        uint64_t sz = u8_enc(t->data, t->len, scr, h);
+        uint64_t sz = u8_enc(t->data, nB, scr, h);
         hout[0] = h; chout[0] = C8;
         return sz;
     }
@@ -3612,7 +3623,8 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
            keeps per-row stream overhead inside ebound's slack; cols cap
            keeps each row's stream under the u32 length field
            (worst DELTA16 row is ~8*cols bytes) */
-        if (cols < 64 || cols > (1u << 28) || ne < 2 * cols || ne > cols * 65536) return 0;
+        if (cols < 64 || cols > (1u << 28) || ne0 < 2 * cols || ne0 > cols * 65536) return 0;
+        if (ne < 2 * cols) return 0;   /* prefix too small to sample a row pair */
         int mb = mbits_of(t->dtype), ec = is_bf(t->dtype) ? CBF : CFP;
         uint64_t *hd = hclone(CD), *hf = hclone(ec);
         uint64_t sz = prw_enc((const uint16_t *)t->data, ne, cols, mb, scr, hf, hd);
@@ -3768,11 +3780,13 @@ static Tensor *ref_resolve(Tensor *t) {
  */
 #define BCAP ((uint64_t)1 << 30)          /* max input bytes per batch */
 #define TRYBUD ((uint64_t)3 << 30)        /* scratch budget for parallel tries */
+#define PREF_EL (1u << 20)                /* prefix-trial length, elements */
 
 typedef struct {
     int m; Tensor *t; Tensor *all; uint32_t ri;
     uint64_t **ghs, **snp;               /* owner channel state (read-only here) */
     uint64_t sz; uint8_t *buf;
+    uint64_t capel;                       /* element cap: 0/~0 = full encode */
     uint64_t *ho[2]; int ch[2];
     int spawned;                          /* pthread_create succeeded -> join required */
 } TJob;
@@ -3799,8 +3813,11 @@ static void *tjob_run(void *a) {
     uint64_t **oh = gh, **os = gsnp;   /* restore on inline fallback so the
                                         caller's channel pointers survive */
     gh = j->ghs; gsnp = j->snp;
-    j->buf = xm(ebound(j->t->len));
-    j->sz = try_method(j->m, j->t, j->all, j->buf, j->ho, j->ch, j->ri);
+    int bsz = dtb(j->t->dtype);
+    uint64_t bl = j->t->len;
+    if (j->capel != ~0ull && j->capel < bl / (bsz ? bsz : 1)) bl = j->capel * (bsz ? bsz : 1);
+    j->buf = xm(ebound(bl));
+    j->sz = try_method(j->m, j->t, j->all, j->buf, j->ho, j->ch, j->ri, j->capel);
     gh = oh; gsnp = os;
     return 0;
 }
@@ -3843,6 +3860,42 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         if (t->candref[k] < refcut) { cref[nc] = t->candref[k]; cand[nc++] = M_DELTA; }
     if (t->xreft) { cref[nc] = 0xFFFFFFFFu; cand[nc++] = M_DELTAX; }
 
+    /* prefix pre-filter (big tensors only): encode the first PREF_EL
+       elements of every candidate, project to full size, and drop
+       candidates projected >1/6 + 256KB behind the best. Candidates within
+       the margin are re-encoded at full size below — the winner is still
+       chosen by real full-size bytes; a prefix-failing candidate is kept. */
+    {
+        int bsz = dtb(t->dtype);
+        uint64_t ne0 = bsz ? t->len / bsz : t->len;
+        uint64_t cap = ne0 / 8;                    /* ~12.5% of the tensor */
+        if (cap > PREF_EL) cap = PREF_EL;          /* cap absolute work */
+        if (nc > 1 && cap >= (1u << 16)) {         /* engage at >=512K elems */
+            uint64_t nBk = cap * (bsz ? bsz : 1);
+            if (nBk > t->len) nBk = t->len;
+            uint64_t *psz = xc(nc, 8);
+            for (int k = 0; k < nc; k++) {
+                uint8_t *pb = xm(ebound(nBk));
+                uint64_t *ph[2] = {0, 0}; int pc[2] = {-1, -1};
+                psz[k] = try_method(cand[k], t, all, pb, ph, pc, cref[k], cap);
+                free(pb); free(ph[0]); free(ph[1]);
+            }
+            __uint128_t bp = ~(__uint128_t)0;
+            for (int k = 0; k < nc; k++)
+                if (psz[k]) { __uint128_t p = (__uint128_t)psz[k] * t->len / nBk; if (p < bp) bp = p; }
+            int w = 0;
+            for (int k = 0; k < nc; k++) {
+                if (psz[k]) {
+                    __uint128_t p = (__uint128_t)psz[k] * t->len / nBk;
+                    if (p > bp + bp / 6 + 262144) continue;   /* clearly beaten */
+                }
+                cand[w] = cand[k]; cref[w] = cref[k]; w++;
+            }
+            nc = w;   /* argmin always survives its own test */
+            free(psz);
+        }
+    }
+
     TJob *jb = xc(nc, sizeof(TJob));
     pthread_t *th = xc(nc, sizeof(pthread_t));
     int nsp = ntry < nc ? ntry : nc;
@@ -3859,6 +3912,7 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         for (int k2 = k; k2 < e; k2++) {
             TJob *j = &jb[k2];
             j->m = cand[k2]; j->t = t; j->all = all; j->ri = cref[k2];
+            j->capel = ~0ull;   /* full-size competition */
             j->ghs = gh; j->snp = gsnp;
             if (nsp == 1) tjob_run(j);
             else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
