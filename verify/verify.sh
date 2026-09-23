@@ -29,9 +29,10 @@
 # properties of the compiled C semantics within the stated bounds; none of
 # these replace dynamic testing (sanitizers, regression corpus, test.sh).
 #
-# Env overrides: TLA_JAR ALLOY_JAR CBMC ESBMC COQC FRAMAC CBMC_TIMEOUT_SLOW
+# Env overrides: TLA_JAR ALLOY_JAR CBMC ESBMC COQC COQCHK FRAMAC CBMC_TIMEOUT_SLOW
 # Tool discovery order: env override → verify/tools/ (CI download dir) →
-# PATH.  Nothing here depends on a developer machine layout.
+# PATH → a few guarded local-machine fallbacks (opam switch, devbox dirs) —
+# every fallback is tested with -f/-x first, so absent paths are inert.
 set -u
 cd "$(dirname "$0")"
 V=.
@@ -299,25 +300,46 @@ else
 fi
 
 # Frama-C WP — deductive (unbounded) proofs of the ACSL contracts that live
-# in caiw.c on hex4/utf8_ok/dsym/kmap16/kmap16_inv, incl. RTE-generated
-# safety goals.  PASS iff every scheduled goal is proven ("Proved goals: N/N").
+# in caiw.c, incl. RTE-generated safety goals.  PASS iff every scheduled
+# goal is proven ("Proved goals: N/N"), summed over per-layer sessions.
 # Needs why3-registered provers (alt-ergo, z3) — see ~/.why3.conf.
+# One monolithic 3022-goal session peaks at ~4-5GB RSS (Why3 context +
+# parallel prover processes) — too much for a ~7GB host next to a desktop.
+# The scope is therefore split into per-layer sessions; each peaks under
+# ~2GB and their union covers the same 65 functions.  -wp-par 4 also caps
+# concurrent prover spawns.  The WP cache makes re-runs incremental.
 if command -v "$FRAMAC" >/dev/null 2>&1 && [ -f "$V/wp.c" ]; then
-    out=$(PATH="$(dirname "$FRAMAC"):$V/tools/bin:/home/nia/devbox/tools/usr/bin:$PATH" \
-        timeout 3600 "$FRAMAC" -wp -wp-rte \
-        -wp-fct p16le,p32le,p64le,g32le,g64le,fnv,hex4,utf8_ok,dsym,dsym_raw,kmap16,kmap16_inv,kmap32,crc_setup,crc32_of,is_bf,is_f16,is_f32,is_flt16,mbits_of,dbits,dtb,ck_shape_len,enc,dec,emit_blk,read_blk,norm_ctx,joinable,ebound,dec_aux,r64,r32,r16,r8,u8_blk,u8_dec,f16_elem,f16_blk,fill_ctx,norm_fM,f16_tab,f16_dec,pos_elem,pos_blk,pos_tab,pos_dec_ws,f32_elem,f32_blk,f32_tab,f32_dec_ws,pack_dec,dlt_val,dlt_elem,dlt_blk,dlt_tab,dlt_dec_ws,dlt_scatter,dlt_tail,d32_elem,d32_blk,d32_tab,d32_plane,dlt32_dec_ws,prw_dec_ws \
-        -wp-timeout 90 -wp-prover z3,alt-ergo -machdep gcc_x86_64 "$V/wp.c" 2>&1)
-    got=$(echo "$out" | grep -oE "[0-9]+ / [0-9]+" | tail -1)
-    if [ -n "$got" ]; then
-        set -- $got; p=$1; t=$3
-        if [ "$p" = "$t" ]; then
-            ok "Frama-C WP kernel contracts ($p/$t goals proved)"
+    wpp=0; wpt=0; wpbad=0
+    wp_run() { # label fct-list
+        lbl=$1; fcts=$2
+        out=$(PATH="$(dirname "$FRAMAC"):$V/tools/bin:/home/nia/devbox/tools/usr/bin:$PATH" \
+            timeout 1200 "$FRAMAC" -wp -wp-rte -wp-fct "$fcts" \
+            -wp-timeout 90 -wp-par 4 -wp-prover z3,alt-ergo \
+            -machdep gcc_x86_64 "$V/wp.c" 2>&1)
+        got=$(echo "$out" | grep -oE "[0-9]+ / [0-9]+" | tail -1)
+        if [ -n "$got" ]; then
+            set -- $got
+            wpp=$((wpp + $1)); wpt=$((wpt + $3))
+            note "     WP $1/$3 — layer: $lbl"
+            [ "$1" = "$3" ] || { wpbad=1; echo "$out" | tail -15; }
         else
-            bad "Frama-C WP ($p/$t proved)"
-            echo "$out" | grep -iE "warn|error|prover|fail|z3|ergo" | tail -30
+            wpbad=1; note "     WP no summary — layer: $lbl"; echo "$out" | tail -8
         fi
+    }
+    wp_run core    "p16le,p32le,p64le,g32le,g64le,fnv,hex4,utf8_ok,dsym,dsym_raw,kmap16,kmap16_inv,kmap32,crc_setup,crc32_of,is_bf,is_f16,is_f32,is_flt16,mbits_of,dbits,dtb,ck_shape_len"
+    wp_run framing "enc,dec,emit_blk,read_blk,norm_ctx,joinable,ebound,dec_aux,r64,r32,r16,r8"
+    wp_run u8      "u8_blk,u8_dec"
+    wp_run f16     "f16_elem,f16_blk,fill_ctx,norm_fM,f16_tab,f16_dec"
+    wp_run pos     "pos_elem,pos_blk,pos_tab,pos_dec_ws"
+    wp_run f32     "f32_elem,f32_blk,f32_tab,f32_dec_ws"
+    wp_run pack    "pack_dec"
+    wp_run delta16 "dlt_val,dlt_elem,dlt_blk,dlt_tab,dlt_dec_ws,dlt_scatter,dlt_tail"
+    wp_run delta32 "d32_elem,d32_blk,d32_tab,d32_plane,dlt32_dec_ws"
+    wp_run prw     "prw_dec_ws"
+    if [ "$wpbad" -eq 0 ] && [ "$wpp" -eq "$wpt" ]; then
+        ok "Frama-C WP kernel contracts ($wpp/$wpt goals proved)"
     else
-        bad "Frama-C WP (no summary)"; echo "$out" | tail -8
+        bad "Frama-C WP ($wpp/$wpt proved)"
     fi
 else
     skip=$((skip+1)); note "SKIP Frama-C WP — not installed"

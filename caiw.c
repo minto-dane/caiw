@@ -2019,6 +2019,16 @@ static void dltws_init(DltWs *w) {
     w->esc_cap = 8192; w->escbuf = xm(w->esc_cap * 2);
     w->escbits = 0; w->esccap = 0;
 }
+/* decode side never touches the encoder scratch (scr/cB/sB — ~2.5MB) —
+   skip it so a DELTA/PRW decode's fixed footprint is ~3.3MB, not ~5.4MB */
+static void dltws_init_dec(DltWs *w) {
+    w->scr = 0; w->cB = 0; w->sB = 0;
+    w->used = xm(DCTX);
+    w->ft = xm(DCTX * DSYMS * 2);
+    w->dcum = xm(DCTX * (DSYMS + 1) * 4);
+    w->esc_cap = 8192; w->escbuf = xm(w->esc_cap * 2);
+    w->escbits = 0; w->esccap = 0;
+}
 static void dltws_free(DltWs *w) {
     free(w->scr); free(w->cB); free(w->used);
     free(w->ft); free(w->sB); free(w->dcum);
@@ -2404,7 +2414,7 @@ static void dlt_tail(const uint8_t *in, const uint8_t *lim, uint64_t escn,
 
 static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, uint64_t n,
                     uint16_t *cur, uint64_t *h, int mb, uint64_t *hesc) {
-    DltWs w; dltws_init(&w);
+    DltWs w; dltws_init_dec(&w);
     dltws_need_bits(&w, n);
     uint64_t escn;
     const uint8_t *rp = dlt_dec_ws(in, lim, ref, n, cur, h, &w, &escn);
@@ -3499,7 +3509,7 @@ static void prw_dec_ws(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64
 
 static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t cols,
                     int mb, uint16_t *s, uint64_t *hf, uint64_t *hd) {
-    DltWs w; dltws_init(&w);
+    DltWs w; dltws_init_dec(&w);
     dltws_need_bits(&w, cols);
     dltws_need_eb(&w, cols);
     prw_dec_ws(in, lim, n, cols, mb, s, hf, hd, &w);
@@ -3932,9 +3942,12 @@ static void hsnap(uint64_t *snap[NCH]) {
 
 /* ================= decode ================= */
 /* Per-in-flight decode scratch the tensor buffer itself doesn't cover:
-   DELTA16 escape bitmap+value buffers ≈ 5x len, DELTA32 plane buffer ≈ len,
-   DELTAX aligned ref copy ≈ len, PRW escape workspace ≈ len/2 (escbuf is
-   sized to cols*2 upfront, escbits to cols/8), positional-ctx tables ≈ 17MB+.
+   DELTA16: escape values <= len (escn <= n u16's) + bitmap <= len/16 +
+   possible misaligned-ref copy <= len + ~3.3MB decode workspace.
+   DELTA32: plane+table scratch ~0.65MB + ref copy <= len.
+   DELTAX: same + aligned external-ref copy <= len (ref_resolve enforces
+   equal len).  PRW: escbuf = cols*2 <= len/2 (rows >= 2) + escbits <=
+   len/32 + workspace.  FIELDPOS/FIELDROW: K-context ft/cum <= ~14MB.
    Charged alongside t->len so g_dlive reflects real peak RSS, not just
    outputs. */
 /*@ requires \valid_read(t);
@@ -3947,7 +3960,7 @@ static uint64_t dec_aux(const Tensor *t) {
     switch (t->method) {
     case M_DELTA:  return (bsz == 2 ? 6 : 1) * t->len + 4194304u;
     case M_DELTAX: return (bsz == 2 ? 6 : 2) * t->len + 4194304u;
-    case M_PRW:    return t->len / 2 + t->len / 16 + 8388608u;
+    case M_PRW:    return t->len / 2 + t->len / 16 + 4194304u;
     case M_FIELDPOS: case M_FIELDROW: return 35651584ull;
     case M_F32:    return 4194304ull;
     default:       return 1048576u;
