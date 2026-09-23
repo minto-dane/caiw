@@ -1323,10 +1323,33 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
     uint8_t *scr = xm(SCRSZ);
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
-        for (int64_t c = 0; c < K; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
+        /* the block's po values are contiguous (rowwise: po=gi/D monotone;
+           column: a contiguous run, or a wraparound pair); ctx=po*K/P is
+           monotone in po → used ctxs form a contiguous range (or two).
+           norm/cum only those — untouched ctx tables are never read this
+           block; the decoder normalizes per-ctx independently so the
+           emitted bitstream is unchanged. */
+        int64_t r0lo, r0hi, r1lo = -1, r1hi = -1;
+        if (rowwise) { r0lo = (int64_t)(b0 / (uint64_t)D); r0hi = (int64_t)((b0 + bn - 1) / (uint64_t)D); }
+        else if ((uint64_t)P <= bn) { r0lo = 0; r0hi = P - 1; }
+        else {
+            int64_t p0 = (int64_t)(b0 % (uint64_t)P), p1 = (int64_t)((b0 + bn - 1) % (uint64_t)P);
+            if (p1 >= p0) { r0lo = p0; r0hi = p1; }
+            else { r0lo = p0; r0hi = P - 1; r1lo = 0; r1hi = p1; }
+        }
+        int64_t c0lo = r0lo * K / P, c0hi = r0hi * K / P;
+        int64_t c1lo = r1lo < 0 ? 0 : r1lo * K / P, c1hi = r1lo < 0 ? -1 : r1hi * K / P;
+        /* po can reach P when P∤n (ctx=K aliases the mantissa table area —
+           pre-existing self-consistent behavior); K's cells are rewritten by
+           the mantissa norms below, so clamp it out of the ctx range */
+        if (c0hi > K - 1) c0hi = K - 1;
+        if (c1hi > K - 1) c1hi = K - 1;
+        for (int64_t c = c0lo; c <= c0hi; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
+        for (int64_t c = c1lo; c <= c1hi; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
         for (int c = 0; c < 2 * ew; c++) norm_ctx(h + tSE + (size_t)c * mw, ft + tSE + (size_t)c * mw, mw);
         uint32_t *cSE = cum, *cM = cum + (size_t)K * (sew + 1);
-        for (int64_t c = 0; c < K; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
+        for (int64_t c = c0lo; c <= c0hi; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
+        for (int64_t c = c1lo; c <= c1hi; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
         for (int c = 0; c < 2 * ew; c++) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + ft[tSE + (size_t)c * mw + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
@@ -3166,7 +3189,8 @@ static void emit_rec(FILE *of, Tensor *t, int bat) {   /* bat: 0 solo, 1 head, 2
     w64(of, t->len);
     if (m == M_REF || m == M_DELTA || m == M_DELTAX) w32(of, t->ref);
     w64(of, t->plen);
-    w32(of, crc32b(t->data, t->len));
+    w32(of, bat ? t->crc : crc32b(t->data, t->len));   /* batch workers
+        precomputed the CRC inside ejob_run; solo tensors pay it inline */
 }
 
 static int g_amap; /* set by slurp when archive buffer is mmap-backed */
@@ -3722,36 +3746,12 @@ static uint64_t flog2(uint64_t n) {
 
 /* cheap pre-check: estimate H(SE) - H(SE|pos) on a sample; used to prune
  * FIELDPOS/FIELDROW candidates so ordinary matrices skip the slow encodes */
-static double pos_gain(const uint16_t *s, uint64_t n, int mb, int64_t P, int rowwise) {
-    if (P <= 0 || P > ((int64_t)1 << 40) || !n) return 0;  /* po*K must fit i64 */
-    int ew = 1 << (15 - mb), sew = 2 * ew;
-    int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
-    int64_t D = n / P;
-    if (D < 1) D = 1;
-    uint64_t ns = n < (4u << 20) ? n : (4u << 20);
-    /* u32 counts are safe: every cell counts at most ns <= 4M samples.
-       po/ctx are stepped incrementally (K<=P → ctx moves <=1 per po step),
-       removing the per-sample divisions; identical counts either way. */
-    uint32_t *jh = xc((size_t)K * sew, 4), *mh = xc(sew, 4);
-    int64_t po = 0, ctx = 0, rem = 0;
-    uint64_t pob = (uint64_t)D;   /* rowwise: next i where po increments */
-    for (uint64_t i = 0; i < ns; i++) {
-        uint32_t SE = s[i] >> mb;
-        jh[ctx * sew + SE]++; mh[SE]++;
-        if (rowwise) {
-            if (i + 1 == pob) {       /* po = i/D steps up at i = po*D */
-                po++; pob += (uint64_t)D;
-                rem += K; if (rem >= P) { rem -= P; ctx++; }
-            }
-        } else {
-            if (++po == P) { po = 0; ctx = 0; rem = 0; }
-            else { rem += K; if (rem >= P) { rem -= P; ctx++; } }
-        }
-    }
-    /* H0 - H1 = [ns·log2 ns - Σmh·log2 mh - Σtot·log2 tot + Σjh·log2 jh]/ns
-       — all in Q20 fixed point via flog2; deterministic everywhere */
-    __int128_t sum = (__int128_t)ns * (__int128_t)flog2(ns);
-    for (int i = 0; i < sew; i++) if (mh[i]) sum -= (__int128_t)mh[i] * (__int128_t)flog2(mh[i]);
+/* H0 - H1 = [ns·log2 ns - Σmh·log2 mh - Σtot·log2 tot + Σjh·log2 jh]/ns
+   — all in Q20 fixed point via flog2; deterministic everywhere. The
+   ns/mh terms are shared between the column and row gates (pos_gain2
+   computes both in one pass) — base is passed in precomputed. */
+static double pos_ent(const uint32_t *jh, int64_t K, int sew, uint64_t ns, __int128_t base) {
+    __int128_t sum = base;
     for (int64_t c = 0; c < K; c++) {
         uint64_t tot = 0;
         for (int i = 0; i < sew; i++) tot += jh[c * sew + i];
@@ -3760,9 +3760,55 @@ static double pos_gain(const uint16_t *s, uint64_t n, int mb, int64_t P, int row
         for (int i = 0; i < sew; i++)
             if (jh[c * sew + i]) sum += (__int128_t)jh[c * sew + i] * (__int128_t)flog2(jh[c * sew + i]);
     }
-    free(jh); free(mh);
     /* IEEE double division is correctly rounded → still deterministic */
     return sum > 0 ? (double)(uint64_t)sum / ((double)ns * 1048576.0) : 0;
+}
+/* column (po=i%Pc) and rowwise (po=i/Dr) position-gain in ONE sample pass —
+   same counts as two separate scans (the marginal mh is shared), so gate
+   decisions and archive bytes are unchanged. Prow<=0 disables the row gate
+   (nd<2). */
+static void pos_gain2(const uint16_t *s, uint64_t n, int mb, int64_t Pc, int64_t Pr,
+                      double *gc, double *gr) {
+    *gc = *gr = 0;
+    if (!n) return;
+    if (Pc <= 0 || Pc > ((int64_t)1 << 40)) Pc = 0;   /* invalid → gate off */
+    if (Pr <= 0 || Pr > ((int64_t)1 << 40)) Pr = 0;
+    if (!Pc && !Pr) return;
+    int ew = 1 << (15 - mb), sew = 2 * ew;
+    int64_t Kc = Pc ? (Pc < (int64_t)(PCAP / sew) ? Pc : (int64_t)(PCAP / sew)) : 0;
+    int64_t Kr = Pr ? (Pr < (int64_t)(PCAP / sew) ? Pr : (int64_t)(PCAP / sew)) : 0;
+    int64_t Dr = Pr ? n / Pr : 1; if (Dr < 1) Dr = 1;
+    uint64_t ns = n < (4u << 20) ? n : (4u << 20);
+    /* u32 counts are safe: every cell counts at most ns <= 4M samples.
+       po/ctx are stepped incrementally (K<=P → ctx moves <=1 per po step),
+       removing the per-sample divisions; identical counts either way. */
+    uint32_t *jc = Pc ? xc((size_t)Kc * sew, 4) : 0;
+    uint32_t *jr = Pr ? xc((size_t)Kr * sew, 4) : 0;
+    uint32_t *mh = xc(sew, 4);
+    int64_t poc = 0, ctxc = 0, remc = 0;
+    int64_t por = 0, ctxr = 0, remr = 0;
+    uint64_t pob = (uint64_t)Dr;   /* rowwise: next i where por increments */
+    for (uint64_t i = 0; i < ns; i++) {
+        uint32_t SE = s[i] >> mb;
+        mh[SE]++;
+        if (jc) {
+            jc[ctxc * sew + SE]++;
+            if (++poc == Pc) { poc = 0; ctxc = 0; remc = 0; }
+            else { remc += Kc; if (remc >= Pc) { remc -= Pc; ctxc++; } }
+        }
+        if (jr) {
+            jr[ctxr * sew + SE]++;
+            if (i + 1 == pob) {       /* por = i/Dr steps up at i = por*Dr */
+                por++; pob += (uint64_t)Dr;
+                remr += Kr; if (remr >= Pr) { remr -= Pr; ctxr++; }
+            }
+        }
+    }
+    __int128_t base = (__int128_t)ns * (__int128_t)flog2(ns);
+    for (int i = 0; i < sew; i++) if (mh[i]) base -= (__int128_t)mh[i] * (__int128_t)flog2(mh[i]);
+    if (jc) *gc = pos_ent(jc, Kc, sew, ns, base);
+    if (jr) *gr = pos_ent(jr, Kr, sew, ns, base);
+    free(jc); free(jr); free(mh);
 }
 
 static Tensor *ref_find(const char *name, const Tensor *t) {
@@ -3900,10 +3946,14 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         cand[nc++] = M_FIELD;
         int mb = mbits_of(t->dtype);
         uint64_t ne = t->len / 2;
-        if (t->nd >= 1 && pos_gain((uint16_t *)t->data, ne, mb, t->shape[t->nd - 1], 0) > 0.06)
-            cand[nc++] = M_FIELDPOS;
-        if (t->nd >= 2 && pos_gain((uint16_t *)t->data, ne, mb, t->shape[0], 1) > 0.06)
-            cand[nc++] = M_FIELDROW;
+        {   /* one sample pass produces both position gates */
+            double gc = 0, gr = 0;
+            pos_gain2((uint16_t *)t->data, ne, mb,
+                      t->nd >= 1 ? t->shape[t->nd - 1] : 0,
+                      t->nd >= 2 ? t->shape[0] : 0, &gc, &gr);
+            if (gc > 0.06) cand[nc++] = M_FIELDPOS;
+            if (t->nd >= 2 && gr > 0.06) cand[nc++] = M_FIELDROW;
+        }
         if (t->nd >= 2) {
             uint64_t cl = (uint64_t)t->shape[t->nd - 1];
             if (cl >= 64 && cl <= (1u << 28) && ne >= 2 * cl && ne <= cl * 65536 &&
@@ -4053,6 +4103,9 @@ static void *ejob_run(void *a) {
     uint64_t **oh = gh, **os = gsnp;
     gh = j->ch; gsnp = j->snp;
     compete(j->t, j->all, j->refcut, &j->out, 1);
+    j->t->crc = crc32b(j->t->data, j->t->len);   /* overlap the record CRC with
+                                                  sibling workers; emit_rec
+                                                  reads t->crc for bat>0 */
     gh = oh; gsnp = os;
     return 0;
 }
