@@ -1032,9 +1032,102 @@ static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *
 }
 
 /* ============ FIELD 16-bit ============ */
-static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint64_t *h) {
+/* Each emitted block is a self-contained bitstream (x starts at LOWER, the
+   block header carries x + payload len), so once a block's ft snapshot is
+   known its rANS encode is independent of every other block.  The parallel
+   path runs per wave: [norm block ft's from running h + count block into h]
+   sequential (the model dependency chain), [backward rANS encode] parallel,
+   [emit_blk] sequential.  ft/cum are identical to the serial pass, so the
+   output bytes are identical. */
+typedef struct {
+    const uint16_t *s; uint64_t n; int mb;
+    const uint16_t *fts; size_t fsn;
+    uint64_t blo, bhi;                 /* block index range */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;   /* per-block outputs */
+    int spawned;
+} F16W;
+static void *f16w_run(void *a) {
+    F16W *w = a;
+    int ew = 1 << (15 - w->mb), mw = 1 << w->mb;
+    uint8_t *scr = xm(SCRSZ);
+    uint32_t *cum = xm((4 + 2 * (ew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+        const uint16_t *fS = w->fts + (size_t)(b - w->blo) * w->fsn;
+        const uint16_t *fE = fS + 2, *fM = fS + 2 + 2 * ew;
+        uint32_t *cS = cum, *cE = cum + 4, *cM = cum + 4 + 2 * (ew + 1);
+        cS[0] = 0; cS[1] = fS[0]; cS[2] = (uint32_t)fS[0] + fS[1];
+        for (int c = 0; c < 2; c++) { uint32_t *u = cE + c * (ew + 1); u[0] = 0; for (int i = 0; i < ew; i++) u[i + 1] = u[i] + fE[c * ew + i]; }
+        for (int c = 0; c < 2 * ew; c++) { uint32_t *u = cM + (size_t)c * (mw + 1); u[0] = 0; for (int i = 0; i < mw; i++) u[i + 1] = u[i] + fM[(size_t)c * mw + i]; }
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        for (uint64_t i = bn; i-- > 0;) {
+            uint32_t v = w->s[b0 + i], S = v >> 15, E = (v >> w->mb) & (ew - 1), Mv = v & (mw - 1);
+            size_t se = (size_t)S * ew + E;
+            x = enc(x, fM[se * mw + Mv], cM[se * (mw + 1) + Mv], &pp);
+            x = enc(x, fE[S * ew + E], cE[S * (ew + 1) + E], &pp);
+            x = enc(x, fS[S], cS[S], &pp);
+        }
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        uint64_t lb = b - w->blo;             /* wave-local slot */
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr); free(cum);
+    return 0;
+}
+static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint64_t *h, int nthr) {
     int ew = 1 << (15 - mb), mw = 1 << mb;
     uint8_t *o = out;
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    if (nthr > 1 && nblk >= 2) {
+        /* wave-bounded parallel path: ft snapshots for WCAP blocks at a time */
+        size_t fsn = 2 + 2 * (size_t)ew + 2 * (size_t)ew * mw;
+        uint64_t wcap = (uint64_t)nthr * 8;
+        if (wcap > nblk) wcap = nblk;
+        uint16_t *fts = xm((size_t)wcap * fsn * 2);
+        uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+        uint32_t *lens = xc(wcap, 4);
+        uint64_t *xs = xc(wcap, 8);
+        F16W *wj = xc(nthr, sizeof(F16W));
+        pthread_t *th = xc(nthr, sizeof(pthread_t));
+        for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+            uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+            for (uint64_t b = 0; b < wn; b++) {          /* norm + count */
+                uint64_t b0 = (bs + b) * BLK, bn = n - b0 < BLK ? n - b0 : BLK;
+                uint16_t *ft = fts + (size_t)b * fsn;
+                norm_ctx(h, ft, 2);
+                for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, ft + 2 + c * ew, ew);
+                for (int c = 0; c < 2 * ew; c++) norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, ft + 2 + 2 * ew + (size_t)c * mw, mw);
+                for (uint64_t i = 0; i < bn; i++) {
+                    uint32_t v = s[b0 + i], S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
+                    h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
+                }
+            }
+            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+            uint64_t per = (wn + sp - 1) / sp, lo = bs;
+            for (int k = 0; k < sp; k++) {
+                F16W *w = &wj[k];
+                w->s = s; w->n = n; w->mb = mb; w->fts = fts + (size_t)(lo - bs) * fsn;
+                w->fsn = fsn; w->blo = lo;
+                w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
+                w->xs = xs + (lo - bs); w->spawned = 0;
+                lo = w->bhi;
+                if (pthread_create(&th[k], 0, f16w_run, w)) f16w_run(w);
+                else w->spawned = 1;
+            }
+            for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+            for (uint64_t b = 0; b < wn; b++) {          /* emit, in order */
+                uint8_t *bf = bufs[b];
+                o = emit_blk(o, bf + lens[b], bf, xs[b]);
+                free(bf);
+            }
+        }
+        free(fts); free(bufs); free(lens); free(xs); free(wj); free(th);
+        return o - out;
+    }
     uint16_t *ft = xm((2 + 2 * ew + (size_t)2 * ew * mw) * 2);
     uint32_t *cum = xm((4 + 2 * (ew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
     uint8_t *scr = xm(SCRSZ);
@@ -2156,7 +2249,7 @@ static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
         o = emit_blk(o, scr + SCRSZ, pp, x);
     }
     p64le(o, esc_n); o += 8;
-    o += f16_enc(escbuf, esc_n, mb, o, hesc);  /* escapes through FIELD channel */
+    o += f16_enc(escbuf, esc_n, mb, o, hesc, 1);  /* escapes through FIELD channel */
     w->escbuf = escbuf; w->esc_cap = esc_cap;
     return o - out;
 }
@@ -3385,7 +3478,7 @@ static size_t prw_enc(const uint16_t *s, uint64_t n, uint64_t cols, int mb,
                       uint8_t *out, uint64_t *hf, uint64_t *hd) {
     DltWs w; dltws_init(&w);
     uint8_t *o = out + 4;
-    uint32_t l1 = (uint32_t)f16_enc(s, cols, mb, o, hf);
+    uint32_t l1 = (uint32_t)f16_enc(s, cols, mb, o, hf, 1);
     p32le(out, l1); o += l1;
     for (uint64_t r = 1; r * cols < n; r++) {
         uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
@@ -3589,7 +3682,7 @@ static void prw_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint64_t 
    prefix-encoded candidate is never emitted; near-ties are re-encoded at
    full length and the winner is always chosen by real full-size bytes).
    ~0 means no cap. */
-static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri, uint64_t capel) {
+static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t **hout, int *chout, uint32_t ri, uint64_t capel, int nthr) {
     hout[0] = 0; hout[1] = 0; chout[0] = -1; chout[1] = -1;
     int bsz = dtb(t->dtype);
     uint64_t ne = bsz ? t->len / bsz : 0, ne0 = ne;
@@ -3607,7 +3700,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         if (!is_flt16(t->dtype) || !ne) return 0;
         int c = is_bf(t->dtype) ? CBF : CFP;
         uint64_t *h = hclone(c);
-        uint64_t sz = f16_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), scr, h);
+        uint64_t sz = f16_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), scr, h, nthr);
         hout[0] = h; chout[0] = c;
         return sz;
     }
@@ -3891,6 +3984,7 @@ typedef struct {
     uint64_t sz; uint8_t *buf;
     uint64_t capel;                       /* element cap: 0/~0 = full encode */
     uint64_t *ho[2]; int ch[2];
+    int nthr;                             /* inner block-parallelism budget */
     int spawned;                          /* pthread_create succeeded -> join required */
 } TJob;
 /* worst-case payload for method m on a len-byte tensor. Every enc() call
@@ -3920,7 +4014,7 @@ static void *tjob_run(void *a) {
     uint64_t bl = j->t->len;
     if (j->capel != ~0ull && j->capel < bl / (bsz ? bsz : 1)) bl = j->capel * (bsz ? bsz : 1);
     j->buf = xm(ebound(bl));
-    j->sz = try_method(j->m, j->t, j->all, j->buf, j->ho, j->ch, j->ri, j->capel);
+    j->sz = try_method(j->m, j->t, j->all, j->buf, j->ho, j->ch, j->ri, j->capel, j->nthr);
     gh = oh; gsnp = os;
     return 0;
 }
@@ -3994,6 +4088,7 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
                     TJob *j = &jb[k2];
                     j->m = cand[k2]; j->t = t; j->all = all; j->ri = cref[k2];
                     j->capel = cap; j->spawned = 0;
+                    j->nthr = ntry / psp;   /* wave runs psp jobs; split budget */
                     j->ghs = gh; j->snp = gsnp;
                     if (psp == 1) tjob_run(j);
                     else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
@@ -4039,6 +4134,7 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
             j->m = cand[k2]; j->t = t; j->all = all; j->ri = cref[k2];
             j->capel = ~0ull;   /* full-size competition */
             j->spawned = 0;
+            j->nthr = ntry / nsp;   /* a lone survivor gets the whole budget */
             j->ghs = gh; j->snp = gsnp;
             if (nsp == 1) tjob_run(j);
             else if (pthread_create(&th[k2], 0, tjob_run, j)) tjob_run(j);
@@ -4096,13 +4192,14 @@ typedef struct {
     uint64_t **snp;
     uint64_t *ch[NCH];
     uint8_t *out;
+    int ntry;                             /* candidate-trial thread budget */
     int spawned;
 } EJob;
 static void *ejob_run(void *a) {
     EJob *j = a;
     uint64_t **oh = gh, **os = gsnp;
     gh = j->ch; gsnp = j->snp;
-    compete(j->t, j->all, j->refcut, &j->out, 1);
+    compete(j->t, j->all, j->refcut, &j->out, j->ntry);
     j->t->crc = crc32b(j->t->data, j->t->len);   /* overlap the record CRC with
                                                   sibling workers; emit_rec
                                                   reads t->crc for bat>0 */
@@ -4466,6 +4563,12 @@ int main(int argc, char **argv) {
                 for (uint32_t k = 0; k < nm; k++) {
                     ej[k].t = &all[i + k]; ej[k].all = all;
                     ej[k].refcut = i; ej[k].snp = snap;
+                    /* split the machine's thread budget across the batch:
+                       when nm < g_threads each worker's candidate trials
+                       (and lone-survivor block encodes) parallelize into
+                       the spare slots. Sum of budgets <= g_threads. */
+                    ej[k].ntry = g_threads / (int)nm
+                               + ((int)k < g_threads % (int)nm ? 1 : 0);
                     if (pthread_create(&th[k], 0, ejob_run, &ej[k])) ejob_run(&ej[k]);
                     else ej[k].spawned = 1;
                 }
