@@ -1056,12 +1056,11 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
             x = enc(x, fM[se * mw + Mv], cM[se * (mw + 1) + Mv], &pp);
             x = enc(x, fE[S * ew + E], cE[S * (ew + 1) + E], &pp);
             x = enc(x, fS[S], cS[S], &pp);
+            /* hist update fused into the encode pass — increments commute,
+               and the encoder reads only the ft/cum snapshots, never h */
+            h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + se * mw + Mv]++;
         }
         o = emit_blk(o, scr + SCRSZ, pp, x);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = s[b0 + i], S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
-            h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
-        }
     }
     free(ft); free(cum); free(scr);
     return o - out;
@@ -1331,25 +1330,34 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
         for (int c = 0; c < 2 * ew; c++) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + ft[tSE + (size_t)c * mw + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
+        /* po = gi%P (column) or gi/D (rowwise), ctx = po*K/P — computed
+           incrementally while walking gi backward: one division to seed at
+           the block's last element, then pure add/subtract steps (K<=P so
+           ctx moves by at most 1 per element). Identical values, no per-
+           element division. */
+        uint64_t gl = b0 + bn - 1;
+        int64_t po = rowwise ? (int64_t)(gl / (uint64_t)D) : (int64_t)(gl % (uint64_t)P);
+        int64_t ctx = po * K / P, rem = po * K - ctx * P;
+        uint64_t pob = (uint64_t)po * (uint64_t)D;   /* rowwise: next-lower po boundary */
         for (uint64_t i = bn; i-- > 0;) {
             uint64_t gi = b0 + i;
-            int64_t po = rowwise ? (int64_t)(gi / D) : (int64_t)(gi % P);
-            int64_t ctx = po * K / P;
             uint32_t v = s[gi];
             uint32_t SE = v >> mb, Mv = v & (mw - 1);
             x = enc(x, ft[tSE + (size_t)SE * mw + Mv], cM[(size_t)SE * (mw + 1) + Mv], &pp);
             x = enc(x, ft[ctx * sew + SE], cSE[ctx * (sew + 1) + SE], &pp);
-        }
-        o = emit_blk(o, scr + SCRSZ, pp, x);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint64_t gi = b0 + i;
-            int64_t po = rowwise ? (int64_t)(gi / D) : (int64_t)(gi % P);
-            int64_t ctx = po * K / P;
-            uint32_t v = s[gi];
-            uint32_t SE = v >> mb, Mv = v & (mw - 1);
             h[ctx * sew + SE]++;
             h[tSE + (size_t)SE * mw + Mv]++;
+            if (rowwise) {
+                if (gi == pob && po > 0) {   /* po = gi/D steps down */
+                    po--; pob -= (uint64_t)D;
+                    rem -= K; if (rem < 0) { rem += P; ctx--; }
+                }
+            } else {
+                if (po == 0) { po = P - 1; ctx = K - 1; rem = P - K; }
+                else { po--; rem -= K; if (rem < 0) { rem += P; ctx--; } }
+            }
         }
+        o = emit_blk(o, scr + SCRSZ, pp, x);
     }
     free(ft); free(cum); free(scr);
     return o - out;
@@ -1644,16 +1652,12 @@ static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) 
             x = enc(x, f1[se * 128 + m1], c1[se * 129 + m1], &pp);
             x = enc(x, ft[2 + S * 256 + E], cE[S * 257 + E], &pp);
             x = enc(x, ft[S], cS[S], &pp);
+            h[S]++; h[2 + S * 256 + E]++;
+            h[2 + 512 + se * 128 + m1]++;
+            h[2 + 512 + nM1 + se * 256 + m2]++;
+            h[2 + 512 + nM1 + nM2 + se * 256 + m3]++;
         }
         o = emit_blk(o, scr + SCRSZ, pp, x);
-        for (uint64_t i = 0; i < bn; i++) {
-            uint32_t v = s[b0 + i], S = v >> 31, E = (v >> 23) & 255;
-            size_t se = S * 256 + E;
-            h[S]++; h[2 + S * 256 + E]++;
-            h[2 + 512 + se * 128 + ((v >> 16) & 127)]++;
-            h[2 + 512 + nM1 + se * 256 + ((v >> 8) & 255)]++;
-            h[2 + 512 + nM1 + nM2 + se * 256 + (v & 255)]++;
-        }
     }
     free(ft); free(cum); free(scr);
     return o - out;
@@ -1911,10 +1915,12 @@ static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
         if (cum[256] != TOT) die("norm bug");
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
-        for (uint64_t i = bn; i-- > 0;)
-            x = enc(x, ft[s[b0 + i]], cum[s[b0 + i]], &pp);
+        for (uint64_t i = bn; i-- > 0;) {
+            uint8_t sv = s[b0 + i];
+            x = enc(x, ft[sv], cum[sv], &pp);
+            h[sv]++;
+        }
         o = emit_blk(o, scr + SCRSZ, pp, x);
-        for (uint64_t i = 0; i < bn; i++) h[s[b0 + i]]++;
     }
     free(scr);
     return o - out;
@@ -2122,9 +2128,9 @@ static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
         for (uint64_t i = bn; i-- > 0;) {
             uint32_t sym = sB[i]; int c = cB[i];
             x = enc(x, ft[c * DSYMS + sym], dcum[c * (DSYMS + 1) + sym], &pp);
+            h[c * DSYMS + sym]++;
         }
         o = emit_blk(o, scr + SCRSZ, pp, x);
-        for (uint64_t i = 0; i < bn; i++) h[cB[i] * DSYMS + sB[i]]++;
     }
     p64le(o, esc_n); o += 8;
     o += f16_enc(escbuf, esc_n, mb, o, hesc);  /* escapes through FIELD channel */
@@ -2497,10 +2503,9 @@ static size_t dlt32_enc(const uint32_t *cur, const uint32_t *ref, uint64_t n,
                 for (uint64_t i = bn; i-- > 0;) {
                     int c = cb[b0 + i], sym = pl[b0 + i];
                     x = enc(x, ft[c * 256 + sym], cum[c * 257 + sym], &pp);
+                    h[(p * 256 + c) * 256 + sym]++;
                 }
                 o = emit_blk(o, scr + SCRSZ, pp, x);
-                for (uint64_t i = 0; i < bn; i++)
-                    h[(p * 256 + cb[b0 + i]) * 256 + pl[b0 + i]]++;
             }
         }
     }
@@ -3724,12 +3729,24 @@ static double pos_gain(const uint16_t *s, uint64_t n, int mb, int64_t P, int row
     int64_t D = n / P;
     if (D < 1) D = 1;
     uint64_t ns = n < (4u << 20) ? n : (4u << 20);
-    uint64_t *jh = xc((size_t)K * sew, 8), *mh = xc(sew, 8);
+    /* u32 counts are safe: every cell counts at most ns <= 4M samples.
+       po/ctx are stepped incrementally (K<=P → ctx moves <=1 per po step),
+       removing the per-sample divisions; identical counts either way. */
+    uint32_t *jh = xc((size_t)K * sew, 4), *mh = xc(sew, 4);
+    int64_t po = 0, ctx = 0, rem = 0;
+    uint64_t pob = (uint64_t)D;   /* rowwise: next i where po increments */
     for (uint64_t i = 0; i < ns; i++) {
-        int64_t po = rowwise ? (int64_t)(i / D) : (int64_t)(i % P);
-        int64_t ctx = po * K / P;
         uint32_t SE = s[i] >> mb;
         jh[ctx * sew + SE]++; mh[SE]++;
+        if (rowwise) {
+            if (i + 1 == pob) {       /* po = i/D steps up at i = po*D */
+                po++; pob += (uint64_t)D;
+                rem += K; if (rem >= P) { rem -= P; ctx++; }
+            }
+        } else {
+            if (++po == P) { po = 0; ctx = 0; rem = 0; }
+            else { rem += K; if (rem >= P) { rem -= P; ctx++; } }
+        }
     }
     /* H0 - H1 = [ns·log2 ns - Σmh·log2 mh - Σtot·log2 tot + Σjh·log2 jh]/ns
        — all in Q20 fixed point via flog2; deterministic everywhere */
