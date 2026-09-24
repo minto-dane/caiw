@@ -1042,13 +1042,28 @@ static const uint8_t *read_blk(const uint8_t *rp, const uint8_t *lim, uint64_t *
 typedef struct {
     const uint16_t *s; uint64_t n; int mb;
     const uint16_t *fts; size_t fsn;
-    uint64_t blo, bhi;                 /* block index range */
-    uint8_t **bufs; uint32_t *lens; uint64_t *xs;   /* per-block outputs */
+    uint64_t blo, bhi;                 /* block index range (absolute) */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;   /* wave-local outputs */
+    uint32_t *h32;                     /* wave-local per-block count hists */
+    int mode;                          /* 0 = count, 1 = encode */
     int spawned;
 } F16W;
 static void *f16w_run(void *a) {
     F16W *w = a;
     int ew = 1 << (15 - w->mb), mw = 1 << w->mb;
+    if (!w->mode) {
+        /* phase A1: per-block histograms into u32 (block <= BLK counts) */
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            uint32_t *bh = w->h32 + (size_t)(b - w->blo) * w->fsn;
+            memset(bh, 0, w->fsn * 4);
+            for (uint64_t i = 0; i < bn; i++) {
+                uint32_t v = w->s[b0 + i], S = v >> 15, E = (v >> w->mb) & (ew - 1), Mv = v & (mw - 1);
+                bh[S]++; bh[2 + S * ew + E]++; bh[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
+            }
+        }
+        return 0;
+    }
     uint8_t *scr = xm(SCRSZ);
     uint32_t *cum = xm((4 + 2 * (ew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
     for (uint64_t b = w->blo; b < w->bhi; b++) {
@@ -1082,11 +1097,16 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
     uint8_t *o = out;
     uint64_t nblk = (n + BLK - 1) / BLK;
     if (nthr > 1 && nblk >= 2) {
-        /* wave-bounded parallel path: ft snapshots for WCAP blocks at a time */
+        /* wave-bounded parallel path: WCAP blocks at a time.
+           A1 parallel per-block counting (u32 hists, increments commute) ->
+           A2 serial norm(ft from running h) + merge counts -> B parallel
+           rANS encode -> C serial in-order emit.  ft/cum identical to the
+           serial pass -> identical bytes. */
         size_t fsn = 2 + 2 * (size_t)ew + 2 * (size_t)ew * mw;
         uint64_t wcap = (uint64_t)nthr * 8;
         if (wcap > nblk) wcap = nblk;
         uint16_t *fts = xm((size_t)wcap * fsn * 2);
+        uint32_t *h32 = xc((size_t)wcap * fsn, 4);
         uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
         uint32_t *lens = xc(wcap, 4);
         uint64_t *xs = xc(wcap, 8);
@@ -1094,38 +1114,42 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
         pthread_t *th = xc(nthr, sizeof(pthread_t));
         for (uint64_t bs = 0; bs < nblk; bs += wcap) {
             uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
-            for (uint64_t b = 0; b < wn; b++) {          /* norm + count */
-                uint64_t b0 = (bs + b) * BLK, bn = n - b0 < BLK ? n - b0 : BLK;
-                uint16_t *ft = fts + (size_t)b * fsn;
-                norm_ctx(h, ft, 2);
-                for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, ft + 2 + c * ew, ew);
-                for (int c = 0; c < 2 * ew; c++) norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, ft + 2 + 2 * ew + (size_t)c * mw, mw);
-                for (uint64_t i = 0; i < bn; i++) {
-                    uint32_t v = s[b0 + i], S = v >> 15, E = (v >> mb) & (ew - 1), Mv = v & (mw - 1);
-                    h[S]++; h[2 + S * ew + E]++; h[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
+            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+            uint64_t per = (wn + sp - 1) / sp;
+            for (int phase = 0; phase < 2; phase++) {
+                uint64_t lo = bs;
+                for (int k = 0; k < sp; k++) {
+                    F16W *w = &wj[k];
+                    w->s = s; w->n = n; w->mb = mb; w->mode = phase;
+                    w->fts = fts + (size_t)(lo - bs) * fsn;
+                    w->h32 = h32 + (size_t)(lo - bs) * fsn;
+                    w->fsn = fsn; w->blo = lo;
+                    w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                    w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
+                    w->xs = xs + (lo - bs); w->spawned = 0;
+                    lo = w->bhi;
+                    if (pthread_create(&th[k], 0, f16w_run, w)) f16w_run(w);
+                    else w->spawned = 1;
+                }
+                for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+                if (phase) continue;
+                /* A2: ft[b] = norm(h) then h += hist32[b], in block order */
+                for (uint64_t b = 0; b < wn; b++) {
+                    uint16_t *ft = fts + (size_t)b * fsn;
+                    const uint32_t *bh = h32 + (size_t)b * fsn;
+                    norm_ctx(h, ft, 2);
+                    for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, ft + 2 + c * ew, ew);
+                    for (int c = 0; c < 2 * ew; c++) norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, ft + 2 + 2 * ew + (size_t)c * mw, mw);
+                    for (size_t i = 0; i < fsn; i++) h[i] += bh[i];
                 }
             }
-            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
-            uint64_t per = (wn + sp - 1) / sp, lo = bs;
-            for (int k = 0; k < sp; k++) {
-                F16W *w = &wj[k];
-                w->s = s; w->n = n; w->mb = mb; w->fts = fts + (size_t)(lo - bs) * fsn;
-                w->fsn = fsn; w->blo = lo;
-                w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
-                w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
-                w->xs = xs + (lo - bs); w->spawned = 0;
-                lo = w->bhi;
-                if (pthread_create(&th[k], 0, f16w_run, w)) f16w_run(w);
-                else w->spawned = 1;
-            }
-            for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
             for (uint64_t b = 0; b < wn; b++) {          /* emit, in order */
                 uint8_t *bf = bufs[b];
                 o = emit_blk(o, bf + lens[b], bf, xs[b]);
                 free(bf);
             }
         }
-        free(fts); free(bufs); free(lens); free(xs); free(wj); free(th);
+        free(fts); free(h32); free(bufs); free(lens); free(xs); free(wj); free(th);
         return o - out;
     }
     uint16_t *ft = xm((2 + 2 * ew + (size_t)2 * ew * mw) * 2);
@@ -4206,18 +4230,35 @@ static void *ejob_run(void *a) {
     gh = oh; gsnp = os;
     return 0;
 }
+/* serial emit of a joined+merged batch — record order is tensor order.
+   Deferred one batch so it overlaps the NEXT batch's encode. */
+static void emit_batch(FILE *of, EJob *ej, uint32_t nm, InFile **ins,
+                       uint64_t *tin, uint64_t *tout) {
+    for (uint32_t k = 0; k < nm; k++) {
+        Tensor *t = ej[k].t;
+        emit_rec(of, t, k ? 2 : 1);
+        if (t->plen) fwrite(ej[k].out ? ej[k].out : t->data, 1, t->plen, of);
+        free(ej[k].out);
+        *tin += t->len; *tout += t->plen;
+        drop_pages(t->data, t->len, ins[t->file]->mapped);
+    }
+}
 
 /* merge worker hist deltas: gch += (worker - snap), channel-wise.
-   counts commute, so member order is irrelevant. */
-static void hmerge(uint64_t *const wch[NCH], uint64_t *const snap[NCH]) {
+   counts commute, so member order is irrelevant.  The batch-start snapshot
+   is materialized lazily per channel at its FIRST merge: gch is never
+   written while a batch is in flight, so gch[c] still holds batch-start
+   state at that point.  Workers therefore clone directly from gch and the
+   unconditional ~44MB hsnap copy disappears — only channels a member
+   actually committed get snapshotted at all. */
+static void hmerge(uint64_t *const wch[NCH], uint64_t *snap[NCH]) {
     for (int c = 0; c < NCH; c++) if (wch[c]) {
-        uint64_t *w = wch[c], *g = gch[c], *s = snap[c];
+        uint64_t *w = wch[c], *g = gch[c];
+        if (!snap[c]) { snap[c] = xm(csz[c] * 8); memcpy(snap[c], g, csz[c] * 8); }
+        uint64_t *s = snap[c];
         for (int i = 0; i < csz[c]; i++) g[i] += w[i] - s[i];
         free(w);
     }
-}
-static void hsnap(uint64_t *snap[NCH]) {
-    for (int c = 0; c < NCH; c++) { snap[c] = xm(csz[c] * 8); memcpy(snap[c], gch[c], csz[c] * 8); }
 }
 
 /* ================= decode ================= */
@@ -4354,15 +4395,20 @@ static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf,
     for (uint32_t k = i; k < j; k++)
         if ((all[k].method == M_REF || all[k].method == M_DELTA) && all[k].ref >= i)
             die("batch ref into open batch");
-    uint64_t *snap[NCH]; hsnap(snap);
+    uint64_t *snap[NCH] = {0};   /* lazy: frozen per channel at first merge */
     for (uint32_t k = i; k < j; k += (uint32_t)g_threads) {
         uint32_t e = k + (uint32_t)g_threads < j ? k + (uint32_t)g_threads : j;
         uint32_t cnt = e - k;
+        /* batch-start view: gch[c] still holds batch-start state unless a
+           previous chunk merged channel c — then snap[c] (frozen at that
+           first merge) is the correct batch-start view instead */
+        uint64_t *view[NCH];
+        for (int c = 0; c < NCH; c++) view[c] = snap[c] ? snap[c] : gch[c];
         DJob *dj = xc(cnt, sizeof(DJob));
         pthread_t *th = xc(cnt, sizeof(pthread_t));
         for (uint32_t m = 0; m < cnt; m++) {
             dj[m].t = &all[k + m]; dj[m].pl = buf + all[k + m].off;
-            dj[m].all = all; dj[m].snp = snap; dj[m].keep = keep[k + m];
+            dj[m].all = all; dj[m].snp = view; dj[m].keep = keep[k + m];
             if (pthread_create(&th[m], 0, djob_run, &dj[m])) djob_run(&dj[m]);
             else dj[m].spawned = 1;
         }
@@ -4546,6 +4592,7 @@ int main(int argc, char **argv) {
         w32(of, NT);
         uint64_t tin = 0, tout = 0;
         uint32_t i = 0;
+        EJob *pej = 0; uint32_t pnm = 0;   /* pending emit (joined+merged) */
         while (i < (uint32_t)NT) {
             /* parallel batch: consecutive tensors sharing batch-start model
                state; members' intra refs are filtered to < i in compete() */
@@ -4557,12 +4604,12 @@ int main(int argc, char **argv) {
                     blen += all[i + nm].len; nm++;
                 }
             if (nm > 1) {
-                uint64_t *snap[NCH]; hsnap(snap);
+                uint64_t *snap[NCH] = {0};   /* lazy: frozen at first merge */
                 EJob *ej = xc(nm, sizeof(EJob));
                 pthread_t *th = xc(nm, sizeof(pthread_t));
                 for (uint32_t k = 0; k < nm; k++) {
                     ej[k].t = &all[i + k]; ej[k].all = all;
-                    ej[k].refcut = i; ej[k].snp = snap;
+                    ej[k].refcut = i; ej[k].snp = gch;
                     /* split the machine's thread budget across the batch:
                        when nm < g_threads each worker's candidate trials
                        (and lone-survivor block encodes) parallelize into
@@ -4572,21 +4619,19 @@ int main(int argc, char **argv) {
                     if (pthread_create(&th[k], 0, ejob_run, &ej[k])) ejob_run(&ej[k]);
                     else ej[k].spawned = 1;
                 }
+                /* the pending batch's serial emit overlaps this batch's
+                   encode; then join+merge so gch is post-batch before the
+                   next batch is spawned (workers clone gch directly) */
+                if (pej) { emit_batch(of, pej, pnm, ins, &tin, &tout); free(pej); }
                 for (uint32_t k = 0; k < nm; k++) if (ej[k].spawned) pthread_join(th[k], 0);
                 for (uint32_t k = 0; k < nm; k++) hmerge(ej[k].ch, snap);
-                for (uint32_t k = 0; k < nm; k++) {
-                    Tensor *t = ej[k].t;
-                    emit_rec(of, t, k ? 2 : 1);
-                    if (t->plen) fwrite(ej[k].out ? ej[k].out : t->data, 1, t->plen, of);
-                    free(ej[k].out);
-                    tin += t->len; tout += t->plen;
-                    drop_pages(t->data, t->len, ins[t->file]->mapped);
-                }
                 for (int c = 0; c < NCH; c++) free(snap[c]);
-                free(ej); free(th);
+                free(th);
+                pej = ej; pnm = nm;          /* emit deferred to next batch */
                 i += nm;
                 continue;
             }
+            if (pej) { emit_batch(of, pej, pnm, ins, &tin, &tout); free(pej); pej = 0; }
             Tensor *t = &all[i];
             uint8_t *buf = 0;
             if (t->len) compete(t, all, 0xFFFFFFFFu, &buf, g_threads);
@@ -4600,6 +4645,7 @@ int main(int argc, char **argv) {
             drop_pages(t->data, t->len, ins[t->file]->mapped);
             i++;
         }
+        if (pej) { emit_batch(of, pej, pnm, ins, &tin, &tout); free(pej); }
         if (ferror(of) || fclose(of)) die("write failed (disk full?)");
         if (rename(ctmp, argv[2])) die("rename failed");
         g_outok = 1;
