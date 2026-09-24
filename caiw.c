@@ -4777,6 +4777,7 @@ int main(int argc, char **argv) {
         g_outp = xc(1, sizeof(char *)); g_outp[0] = xstrdup(ctmp);
         g_outn = 0; g_outok = 0; atexit(out_cleanup);
         FILE *of = xfopen_tmp(ctmp);
+        setvbuf(of, 0, _IOFBF, 1 << 23);   /* big payloads: skip the 4KB stdio bounce */
         if (!of) die("out");
         g_outn = 1;
         InFile **ins = xc(nf, sizeof(InFile *));
