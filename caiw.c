@@ -103,7 +103,7 @@ static uint64_t g64le(const uint8_t *p) {
 #define SCRSZ (BLK * 16 + 64)   /* worst-case renorm bytes: 3B per enc call, <=5 calls/elem */
 #define XMAX(f) ((((LOWER) << 8) / TOT) * (uint64_t)(f))
 
-enum { M_RAW = 0, M_PACK, M_REF, M_FIELD, M_FIELDPOS, M_DELTA, M_U8, M_F32, M_FIELDROW, M_DELTAX, M_PRW };
+enum { M_RAW = 0, M_PACK, M_REF, M_FIELD, M_FIELDPOS, M_DELTA, M_U8, M_F32, M_FIELDROW, M_DELTAX, M_PRW, M_FIELDT };
 #define MF_BAT 0x80   /* method-byte flag: parallel batch member (CAI4) */
 #define MF_BH  0x40   /* batch head: first member opens a new batch */
 
@@ -339,6 +339,7 @@ static const char *jspan(const char *p) {
     }
 }
 static int dtb(const char *d);
+static uint64_t flog2(uint64_t n);
 static void ck_shape_len(const Tensor *t);
 static void ck_meta(const uint8_t *m, uint32_t ml);
 static uint64_t nfh(const char *name, int file);
@@ -1433,6 +1434,377 @@ static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, u
         rp = end;
     }
     if (rp != lim) die("corrupt field");   /* every caller hands the exact stream end */
+}
+
+/* ============ FIELDT: FIELD with a transmitted frozen table (CAI6) ======
+   Serial FIELD makes the decoder's model state depend on every preceding
+   block, so the stream decodes strictly serially.  FIELDT instead norms
+   ONCE over h_start + the tensor's own counts (counts are additive — the
+   channel's state afterwards is identical to FIELD's incremental merge on
+   both sides), writes that table DENSE, and encodes every block against
+   it: the blocks are then fully independent and decode in PARALLEL.
+   Payload: [u32 tlen][table][emit_blk stream], table =
+     [u16 fs0][u16 fs1]                     both >=1, sum == TOT
+     [u16 E0[ew]][u16 E1[ew]]               all >=1, each row sums to TOT
+     [u16 nmr]  nmr × [u16 ctx][u16 f[mw]]  ctxs strictly increasing,
+                                            each row dense (f>=1), sum TOT
+   A ctx WITHOUT a transmitted row decodes through the uniform fallback
+   f = TOT/mw (a power of two — decode is a shift, no table read): real
+   weight mantissas are near-uniform per (sign,exp) ctx, so most ctxs omit
+   their row entirely and the whole table shrinks to ~1-10KB.  The encoder
+   transmits a row only when its measured adaptive bit-cost beats uniform
+   by more than the row's serialization bytes.  Every transmitted row is
+   dense because h cells start at 1 and normalization never drops support
+   (f>=1 for h>0) — the decoder rejects any table row containing a zero
+   or not summing to TOT, and the record CRC covers any surviving drift. */
+typedef struct {
+    const uint16_t *s; uint64_t n; int mb;
+    uint64_t blo, bhi; size_t fsn;
+    uint64_t *hacc;                           /* count mode: [worker][fsn] */
+    uint8_t *used;                            /* count mode: [worker][2ew] */
+    const uint16_t *ft; const uint32_t *cum;  /* encode mode: shared */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;
+    int mode, spawned;
+} F16TW;
+static void *f16tw_run(void *a) {
+    F16TW *w = a;
+    int ew = 1 << (15 - w->mb), mw = 1 << w->mb;
+    if (!w->mode) {
+        uint64_t *ha = w->hacc;
+        uint8_t *u = w->used;
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            for (uint64_t i = 0; i < bn; i++) {
+                uint32_t v = w->s[b0 + i];
+                uint32_t S = v >> 15, E = (v >> w->mb) & (ew - 1), Mv = v & (mw - 1);
+                size_t se = (size_t)S * ew + E;
+                u[se] = 1;
+                ha[S]++; ha[2 + S * ew + E]++; ha[2 + 2 * ew + se * mw + Mv]++;
+            }
+        }
+        return 0;
+    }
+    uint8_t *scr = xm(SCRSZ);
+    const uint16_t *fS = w->ft, *fE = w->ft + 2, *fM = w->ft + 2 + 2 * ew;
+    const uint32_t *cE = w->cum, *cM = w->cum + 2 * (ew + 1);
+    const uint8_t *tr = w->used;   /* encode mode: transmitted-ctx mask */
+    const uint32_t uf = TOT / mw;  /* uniform freq for untransmitted ctxs */
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        for (uint64_t i = bn; i-- > 0;) {
+            uint32_t v = w->s[b0 + i], S = v >> 15, E = (v >> w->mb) & (ew - 1), Mv = v & (mw - 1);
+            size_t se = (size_t)S * ew + E;
+            if (tr[se]) x = enc(x, fM[se * mw + Mv], cM[se * (mw + 1) + Mv], &pp);
+            else        x = enc(x, uf, Mv * uf, &pp);
+            x = enc(x, fE[S * ew + E], cE[S * (ew + 1) + E], &pp);
+            x = enc(x, fS[S], S ? fS[0] : 0, &pp);
+        }
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        uint64_t lb = b - w->blo;
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr);
+    return 0;
+}
+/* cum in DECODE layout (cE = cum, cM = cum + 2ew+2) shared by enc & dec */
+static void f16t_cum(const uint16_t *ft, uint32_t *cum, int ew, int mw,
+                     const uint8_t *used) {
+    const uint16_t *fE = ft + 2, *fM = ft + 2 + 2 * ew;
+    uint32_t *cE = cum, *cM = cum + 2 * (ew + 1);
+    for (int c = 0; c < 2; c++) {
+        uint32_t *b = cE + c * (ew + 1); b[0] = 0;
+        for (int i = 0; i < ew; i++) b[i + 1] = b[i] + fE[c * ew + i];
+    }
+    for (int c = 0; c < 2 * ew; c++) {
+        if (!used[c]) continue;
+        uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0;
+        for (int i = 0; i < mw; i++) b[i + 1] = b[i] + fM[(size_t)c * mw + i];
+    }
+}
+static size_t f16t_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out,
+                       uint64_t *h, int nthr) {
+    int ew = 1 << (15 - mb), mw = 1 << mb;
+    size_t fsn = 2 + 2 * (size_t)ew + 2 * (size_t)ew * mw;
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    int sp = nthr > 1 && nblk >= 2 ? nthr : 1;
+    if ((uint64_t)sp > nblk) sp = (int)nblk;
+    /* phase 1: per-worker u64 histograms + used masks */
+    uint64_t *hacc = xc((size_t)sp * fsn, 8);
+    uint8_t *usedw = xc((size_t)sp * 2 * ew, 1);
+    F16TW *wj = xc(sp, sizeof(F16TW));
+    pthread_t *th = xc(sp, sizeof(pthread_t));
+    uint64_t per = (nblk + sp - 1) / sp;
+    for (int k = 0; k < sp; k++) {
+        F16TW *w = &wj[k];
+        w->s = s; w->n = n; w->mb = mb; w->mode = 0; w->fsn = fsn;
+        w->blo = (uint64_t)k * per;
+        w->bhi = w->blo + per < nblk ? w->blo + per : nblk;
+        w->hacc = hacc + (size_t)k * fsn;
+        w->used = usedw + (size_t)k * 2 * ew;
+        w->spawned = 0;
+        if (pthread_create(&th[k], 0, f16tw_run, w)) f16tw_run(w);
+        else w->spawned = 1;
+    }
+    for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+    /* tensor's own counts (before h absorbs them) drive the per-ctx
+       transmit-vs-uniform decision below */
+    uint64_t *tc = xc(fsn, 8);
+    for (int k = 0; k < sp; k++) {
+        const uint64_t *ha = hacc + (size_t)k * fsn;
+        for (size_t i = 0; i < fsn; i++) { tc[i] += ha[i]; h[i] += ha[i]; }
+    }
+    uint8_t *used = xc(2 * (size_t)ew, 1);
+    for (int k = 0; k < sp; k++)
+        for (int c = 0; c < 2 * ew; c++) used[c] |= usedw[(size_t)k * 2 * ew + c];
+    free(hacc); free(usedw);
+    /* norm once on the post-count model */
+    uint16_t *ft = xc(fsn, 2);
+    norm_ctx(h, ft, 2);
+    for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, ft + 2 + c * ew, ew);
+    for (int c = 0; c < 2 * ew; c++) if (used[c])
+        norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, ft + 2 + 2 * ew + (size_t)c * mw, mw);
+    /* per-ctx decision: transmit the adaptive M row only where it beats the
+       uniform fallback (absent ctx decodes at f = TOT/mw per sym) by enough
+       to pay its own serialization.  Rows are DENSE — h cells start at 1
+       and never lose support, so every transmitted row has all f >= 1.
+       Costs are Q20 fixed point (flog2) — the decision must stay
+       integer-only so identical input gives identical archives on every
+       libm (see README determinism note). */
+    const uint64_t lgT = 15ull << 20, lgU = (uint64_t)mb << 20;
+    uint8_t *tr = xc(2 * (size_t)ew, 1);
+    for (int c = 0; c < 2 * ew; c++) if (used[c]) {
+        const uint64_t *cnt = tc + 2 + 2 * ew + (size_t)c * mw;
+        const uint16_t *row = ft + 2 + 2 * ew + (size_t)c * mw;
+        uint64_t cntsum = 0; __uint128_t abits = 0;
+        for (int i = 0; i < mw; i++) {
+            cntsum += cnt[i];
+            if (cnt[i]) abits += (__uint128_t)cnt[i] * (lgT - flog2(row[i]));
+        }
+        tr[c] = abits + ((__uint128_t)8 * (2 + 2 * (uint64_t)mw) << 20)
+                < (__uint128_t)cntsum * lgU;
+    }
+    free(tc);
+    /* serialize DENSE: [u32 tlen][S:2×u16][E0:ew×u16][E1:ew×u16]
+       [u16 nmr][nmr × (u16 ctx + mw×u16 freqs)] */
+    uint8_t *o = out, *tp = o + 4;
+    p16le(tp, ft[0]); tp += 2; p16le(tp, ft[1]); tp += 2;
+    for (int c = 0; c < 2; c++)
+        for (int i = 0; i < ew; i++) { p16le(tp, ft[2 + c * ew + i]); tp += 2; }
+    int nmr = 0; for (int c = 0; c < 2 * ew; c++) nmr += tr[c] != 0;
+    p16le(tp, (uint16_t)nmr); tp += 2;
+    for (int c = 0; c < 2 * ew; c++) if (tr[c]) {
+        p16le(tp, (uint16_t)c); tp += 2;
+        for (int i = 0; i < mw; i++) {
+            p16le(tp, ft[2 + 2 * ew + (size_t)c * mw + i]); tp += 2;
+        }
+    }
+    p32le(out, (uint32_t)(tp - out - 4));
+    o = tp;
+    /* shared cum (decode layout) — untransmitted ctxs take the uniform
+       path and never touch cum */
+    uint32_t *cum = xc((2 * (ew + 1) + (size_t)2 * ew * (mw + 1)), 4);
+    f16t_cum(ft, cum, ew, mw, tr);
+    free(used); used = tr;   /* encode workers get the transmitted mask */
+    /* phase 2: parallel block encode, wave-bounded output buffers */
+    uint64_t wcap = (uint64_t)sp * 8;
+    if (wcap > nblk) wcap = nblk;
+    uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+    uint32_t *lens = xc(wcap, 4); uint64_t *xs = xc(wcap, 8);
+    for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+        uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+        int spw = (uint64_t)sp < wn ? sp : (int)wn;
+        uint64_t pw = (wn + spw - 1) / spw;
+        uint64_t lo = bs;
+        for (int k = 0; k < spw; k++) {
+            F16TW *w = &wj[k];
+            w->s = s; w->n = n; w->mb = mb; w->mode = 1; w->fsn = fsn;
+            w->blo = lo; w->bhi = lo + pw < bs + wn ? lo + pw : bs + wn;
+            w->ft = ft; w->cum = cum; w->used = used;
+            w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
+            w->xs = xs + (lo - bs); w->spawned = 0;
+            lo = w->bhi;
+            if (pthread_create(&th[k], 0, f16tw_run, w)) f16tw_run(w);
+            else w->spawned = 1;
+        }
+        for (int k = 0; k < spw; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+        for (uint64_t b = 0; b < wn; b++) {
+            uint8_t *bf = bufs[b];
+            o = emit_blk(o, bf + lens[b], bf, xs[b]);
+            free(bf);
+        }
+    }
+    free(ft); free(cum); free(used); free(bufs); free(lens); free(xs);
+    free(wj); free(th);
+    return o - out;
+}
+/* decode-side element step: f16_elem minus the h updates — the caller's
+   per-worker u64 bh collects identical counts for the deferred merge */
+static uint64_t f16t_elem(uint64_t x, const uint8_t **rp, const uint8_t *end,
+                          const uint16_t *ft, const uint32_t *cum,
+                          const uint8_t *tr,
+                          int ew, int mw, int mb, uint16_t *si, uint64_t *bh) {
+    const uint16_t *fS = ft, *fE = ft + 2, *fM = ft + 2 + 2 * ew;
+    const uint32_t *cE = cum, *cM = cum + 2 * ew + 2;
+    const uint8_t *r = *rp;
+    uint32_t v = (uint32_t)(x & (TOT - 1)), fc, S, E, M;
+    int se;
+    if (v >= fS[0]) {
+        S = 1;
+        if (!fS[1] || fS[1] > TOT) die("corrupt f16t");
+        x = dec(x, fS[1], fS[0], &r, end);
+        v = (uint32_t)(x & (TOT - 1));
+        E = dsym_raw(fE + ew, cE + ew + 1, ew, v, &fc);
+        if (!fc || fc > TOT) die("corrupt f16t");
+        x = dec(x, fc, cE[ew + 1 + E], &r, end);
+        se = ew + (int)E;
+    } else {
+        S = 0;
+        if (!fS[0] || fS[0] > TOT) die("corrupt f16t");
+        x = dec(x, fS[0], 0, &r, end);
+        v = (uint32_t)(x & (TOT - 1));
+        E = dsym_raw(fE, cE, ew, v, &fc);
+        if (!fc || fc > TOT) die("corrupt f16t");
+        x = dec(x, fc, cE[E], &r, end);
+        se = (int)E;
+    }
+    v = (uint32_t)(x & (TOT - 1));
+    if (tr[se]) {
+        if ((int64_t)se * mw + mw > 65536 ||
+            (int64_t)se * (mw + 1) + mw > (int64_t)2 * ew * (mw + 1) - 1)
+            die("corrupt f16t");
+        M = dsym_raw(fM + se * mw, cM + se * (mw + 1), mw, v, &fc);
+        if (!fc || fc > TOT) die("corrupt f16t");
+        x = dec(x, fc, cM[se * (mw + 1) + M], &r, end);
+    } else {
+        /* uniform fallback: f = TOT/mw per sym — no table needed */
+        uint32_t uf = TOT >> mb;
+        M = v >> (15 - mb);
+        x = dec(x, uf, M * uf, &r, end);
+    }
+    *si = (uint16_t)((S << 15) | (E << mb) | M);
+    bh[S]++; bh[2 + S * ew + E]++; bh[2 + 2 * ew + se * mw + M]++;
+    *rp = r;
+    return x;
+}
+typedef struct {
+    const uint16_t *ft; const uint32_t *cum; const uint8_t *tr; int mb;
+    uint16_t *s; uint64_t n;
+    const uint8_t **rps, **ends; const uint64_t *xs;
+    uint64_t *hacc;                           /* [worker][fsn] */
+    uint64_t blo, bhi; size_t fsn;
+    int spawned;
+} F16TD;
+static void *f16td_run(void *a) {
+    F16TD *w = a;
+    int ew = 1 << (15 - w->mb), mw = 1 << w->mb;
+    uint64_t *bh = w->hacc;
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+        uint64_t x = w->xs[b];
+        const uint8_t *r = w->rps[b], *end = w->ends[b];
+        for (uint64_t i = 0; i < bn; i++)
+            x = f16t_elem(x, &r, end, w->ft, w->cum, w->tr, ew, mw, w->mb,
+                          w->s + b0 + i, bh);
+        if (r != end) die("corrupt f16t");   /* block must consume exactly */
+    }
+    return 0;
+}
+static void f16t_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb,
+                     uint16_t *s, uint64_t *h, int nthr) {
+    int ew = 1 << (15 - mb), mw = 1 << mb;
+    size_t fsn = 2 + 2 * (size_t)ew + 2 * (size_t)ew * mw;
+#define F16T_BND(q, need) do { if ((q) > lim || (uint64_t)(need) > (uint64_t)(lim - (q))) die("truncated f16t table"); } while (0)
+    const uint8_t *q = in;
+    F16T_BND(q, 4);
+    uint32_t tlen = (uint32_t)q[0] + 256u * q[1] + 65536u * q[2] + 16777216u * q[3];
+    q += 4;
+    F16T_BND(q, tlen);
+    const uint8_t *te = q + tlen;
+    /* dense table into zeroed ft — ctxs without a row take the uniform
+       path (f = TOT/mw) and never touch ft/cum */
+    uint16_t *ft = xc(fsn, 2);
+    uint8_t *used = xc(2 * (size_t)ew, 1);
+    F16T_BND(q, 4);
+    uint32_t fs0 = q[0] + 256u * q[1], fs1 = q[2] + 256u * q[3]; q += 4;
+    if (!fs0 || !fs1 || fs0 + fs1 != TOT) die("corrupt f16t table");
+    ft[0] = (uint16_t)fs0; ft[1] = (uint16_t)fs1;
+    for (int c = 0; c < 2; c++) {             /* E rows, dense, always both */
+        F16T_BND(q, 2 * ew);
+        uint32_t sum = 0;
+        for (int i = 0; i < ew; i++) {
+            uint32_t f = q[0] + 256u * q[1]; q += 2;
+            if (!f || f > TOT) die("corrupt f16t table");
+            ft[2 + c * ew + i] = (uint16_t)f;
+            if ((sum += f) > TOT) die("corrupt f16t table");
+        }
+        if (sum != TOT) die("corrupt f16t table");
+    }
+    F16T_BND(q, 2);
+    uint32_t nmr = q[0] + 256u * q[1]; q += 2;
+    if (nmr > (uint32_t)2 * ew) die("corrupt f16t table");
+    uint32_t lastc = 0;
+    for (uint32_t rr = 0; rr < nmr; rr++) {
+        F16T_BND(q, 2 + 2 * (size_t)mw);
+        uint32_t ctx = q[0] + 256u * q[1]; q += 2;
+        if (ctx >= (uint32_t)2 * ew || (ctx <= lastc && rr)) die("corrupt f16t table");
+        lastc = ctx;
+        used[ctx] = 1;
+        uint32_t sum = 0;
+        for (int i = 0; i < mw; i++) {
+            uint32_t f = q[0] + 256u * q[1]; q += 2;
+            if (!f || f > TOT) die("corrupt f16t table");
+            ft[2 + 2 * ew + (size_t)ctx * mw + i] = (uint16_t)f;
+            if ((sum += f) > TOT) die("corrupt f16t table");
+        }
+        if (sum != TOT) die("corrupt f16t table");
+    }
+    if (q != te) die("corrupt f16t table");   /* table must consume exactly */
+    uint32_t *cum = xc((2 * (ew + 1) + (size_t)2 * ew * (mw + 1)), 4);
+    f16t_cum(ft, cum, ew, mw, used);
+    /* sequential header scan — pointers only, payload untouched */
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    const uint8_t **rps = xc(nblk, sizeof(uint8_t *));
+    const uint8_t **ends = xc(nblk, sizeof(uint8_t *));
+    uint64_t *xs = xc(nblk, 8);
+    const uint8_t *rp = q;
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *end;
+        rps[b] = read_blk(rp, lim, &xs[b], &end);   /* payload start = rp+12 */
+        ends[b] = end;
+        rp = end;
+    }
+    if (rp != lim) die("corrupt f16t");
+    /* parallel decode + deferred additive count */
+    int sp = nthr > 1 && nblk >= 2 ? nthr : 1;
+    if ((uint64_t)sp > nblk) sp = (int)nblk;
+    uint64_t *hacc = xc((size_t)sp * fsn, 8);
+    F16TD *wj = xc(sp, sizeof(F16TD));
+    pthread_t *th = xc(sp, sizeof(pthread_t));
+    uint64_t per = (nblk + sp - 1) / sp;
+    for (int k = 0; k < sp; k++) {
+        F16TD *w = &wj[k];
+        w->ft = ft; w->cum = cum; w->tr = used; w->mb = mb;
+        w->s = s; w->n = n;
+        w->rps = rps; w->ends = ends; w->xs = xs;
+        w->hacc = hacc + (size_t)k * fsn;
+        w->blo = (uint64_t)k * per;
+        w->bhi = w->blo + per < nblk ? w->blo + per : nblk;
+        w->fsn = fsn; w->spawned = 0;
+        if (pthread_create(&th[k], 0, f16td_run, w)) f16td_run(w);
+        else w->spawned = 1;
+    }
+    for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+    for (int k = 0; k < sp; k++) {
+        const uint64_t *ha = hacc + (size_t)k * fsn;
+        for (size_t i = 0; i < fsn; i++) h[i] += ha[i];
+    }
+    free(ft); free(cum); free(used); free(hacc); free(wj); free(th);
+    free(rps); free(ends); free(xs);
+#undef F16T_BND
 }
 
 /* ============ FIELD+POS: 16-bit, exact position contexts ============
@@ -4476,6 +4848,14 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         hout[0] = h; chout[0] = c;
         return sz;
     }
+    case M_FIELDT: {
+        if (!is_flt16(t->dtype) || !ne) return 0;
+        int c = is_bf(t->dtype) ? CBF : CFP;
+        uint64_t *h = hclone(c);
+        uint64_t sz = f16t_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), scr, h, nthr);
+        hout[0] = h; chout[0] = c;
+        return sz;
+    }
     case M_FIELDPOS: {
         if (!is_flt16(t->dtype) || !ne || t->nd < 1) return 0;
         int c = is_bf(t->dtype) ? CBPOS : CFPOS;
@@ -4814,6 +5194,9 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         cand[nc++] = M_FIELD;
         int mb = mbits_of(t->dtype);
         uint64_t ne = t->len / 2;
+        /* FIELDT ships a frozen per-tensor table so its blocks decode in
+           parallel — worth a trial once the table (~KBs) amortizes */
+        if (ne >= BLK) cand[nc++] = M_FIELDT;
         {   /* one sample pass produces both position gates */
             double gc = 0, gr = 0;
             pos_gain2((uint16_t *)t->data, ne, mb,
@@ -4901,6 +5284,12 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
        memory is ~(nsp+1) x ebound, not nc x ebound */
     uint64_t best = t->len; int wm = -1; uint32_t wri = 0;
     uint8_t *wbuf = 0; uint64_t *who[2] = {0, 0}; int wch[2] = {-1, -1};
+    /* FIELDT near-best preference: its transmitted frozen table makes every
+       block independently decodable (parallel decode), so when it lands
+       within ~0.8%+4KB of the byte-winner we take it — bounded ratio cost,
+       a full thread-count of decode parallelism. */
+    uint8_t *tbuf = 0; uint64_t tsz = 0; uint32_t tri = 0;
+    uint64_t *tho[2] = {0, 0}; int tch[2] = {-1, -1};
     for (int k = 0; k < nc; k += nsp) {
         int e = k + nsp < nc ? k + nsp : nc;
         for (int k2 = k; k2 < e; k2++) {
@@ -4917,16 +5306,31 @@ static void compete(Tensor *t, Tensor *all, uint32_t refcut, uint8_t **outp, int
         for (int k2 = k; k2 < e; k2++) if (jb[k2].spawned) pthread_join(th[k2], 0);
         for (int k2 = k; k2 < e; k2++) {
             TJob *j = &jb[k2];
+            if (j->m == M_FIELDT && j->sz) {   /* retain FIELDT separately */
+                free(tbuf); free(tho[0]); free(tho[1]);
+                tbuf = j->buf; tsz = j->sz; tri = j->ri;
+                tho[0] = j->ho[0]; tho[1] = j->ho[1];
+                tch[0] = j->ch[0]; tch[1] = j->ch[1];
+            }
             if (j->sz && j->sz < best) {   /* promote: free old best, keep this */
                 free(wbuf); free(who[0]); free(who[1]);
                 best = j->sz; wm = j->m; wri = j->ri; wbuf = j->buf;
                 who[0] = j->ho[0]; who[1] = j->ho[1];
                 wch[0] = j->ch[0]; wch[1] = j->ch[1];
-            } else {
+                if (j->m == M_FIELDT)      /* winner IS the t-slot: unalias */
+                    { tbuf = 0; tho[0] = tho[1] = 0; }
+            } else if (j->buf != tbuf) {
                 free(j->buf);
                 for (int s = 0; s < 2; s++) free(j->ho[s]);
             }
         }
+    }
+    if (tbuf && wm != M_FIELDT && tsz <= best + (best >> 7) + 4096) {
+        free(wbuf); free(who[0]); free(who[1]);
+        best = tsz; wm = M_FIELDT; wri = tri; wbuf = tbuf;
+        who[0] = tho[0]; who[1] = tho[1]; wch[0] = tch[0]; wch[1] = tch[1];
+    } else {
+        free(tbuf); free(tho[0]); free(tho[1]);
     }
     if (wm >= 0) {
         t->method = wm; t->plen = best;
@@ -5034,11 +5438,14 @@ static uint64_t dec_aux(const Tensor *t) {
     case M_PRW:    return t->len / 2 + t->len / 16 + 4194304u;
     case M_FIELDPOS: case M_FIELDROW: return 35651584ull;
     case M_F32:    return 4194304ull;
+    /* FIELDT: ft+cum (~400KB) + per-worker u64 hists (~528KB each) +
+       block header arrays — bound generously under ~40MB */
+    case M_FIELDT: return (uint64_t)g_threads * 66050 * 8 + (6u << 20);
     default:       return 1048576u;
     }
 }
 
-static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
+static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all, int nthr) {
     uint64_t ch = t->len + dec_aux(t);
     t->dlivc = ch;
     if (__sync_add_and_fetch(&g_dlive, ch) > g_dlim)
@@ -5065,6 +5472,9 @@ static void dec_tensor(Tensor *t, const uint8_t *payload, Tensor *all) {
     case M_FIELD:
         if (!is_flt16(t->dtype)) die("bad field dtype");
         f16_dec(payload, lim, ne, mbits_of(t->dtype), (uint16_t *)t->data, H(is_bf(t->dtype) ? CBF : CFP)); break;
+    case M_FIELDT:
+        if (!is_flt16(t->dtype)) die("bad fieldt dtype");
+        f16t_dec(payload, lim, ne, mbits_of(t->dtype), (uint16_t *)t->data, H(is_bf(t->dtype) ? CBF : CFP), nthr); break;
     case M_FIELDPOS:
         if (!is_flt16(t->dtype) || t->nd < 1) die("bad fieldpos");
         pos_dec(payload, lim, ne, mbits_of(t->dtype), t->shape[t->nd-1], 0, (uint16_t *)t->data, H(is_bf(t->dtype) ? CBPOS : CFPOS)); break;
@@ -5131,7 +5541,7 @@ static void *djob_run(void *a) {
             die("crc mismatch: archive corrupt");
         teach(j->t, j->pl);
     } else {
-        dec_tensor(j->t, j->pl, j->all);
+        dec_tensor(j->t, j->pl, j->all, 1);
         if (crc32b(j->t->data, j->t->len) != j->t->crc)
             die("crc mismatch: archive corrupt");
     }
@@ -5397,16 +5807,24 @@ int main(int argc, char **argv) {
             i++;
         }
         if (pej) { emit_batch(of, pej, pnm, ins, &tin, &tout); free(pej); }
+        /* CAI6 iff a tabled method was actually emitted — archives without
+           FIELDT stay CAI5 so older decoders keep reading them */
+        int sawt = 0;
+        for (int ti = 0; ti < NT; ti++) if (all[ti].method == M_FIELDT) { sawt = 1; break; }
+        if (sawt) {
+            if (fseeko(of, 0, SEEK_SET) || fwrite("CAI6", 4, 1, of) != 1)
+                die("write failed (magic)");
+        }
         if (ferror(of) || fclose(of)) die("write failed (disk full?)");
         if (rename(ctmp, argv[2])) die("rename failed");
         g_outok = 1;
-        static const char *mn[] = {"RAW","PACK","REF","FIELD","FIELDPOS","DELTA","U8","F32","FIELDROW","DELTAX","PRW"};
-        uint64_t mc[11] = {0}, mb2[11] = {0};
+        static const char *mn[] = {"RAW","PACK","REF","FIELD","FIELDPOS","DELTA","U8","F32","FIELDROW","DELTAX","PRW","FIELDT"};
+        uint64_t mc[12] = {0}, mb2[12] = {0};
         for (int ti = 0; ti < NT; ti++) { mc[all[ti].method]++; mb2[all[ti].method] += all[ti].plen; }
         fprintf(stderr, "in=%llu out=%llu ratio=%.3f\n",
                 (unsigned long long)tin, (unsigned long long)tout,
                 tin ? (double)tout / tin : 0);
-        for (int m = 0; m < 11; m++) if (mc[m])
+        for (int m = 0; m < 12; m++) if (mc[m])
             fprintf(stderr, "  %-8s n=%-5llu payload=%.1fMB\n", mn[m],
                     (unsigned long long)mc[m], (double)mb2[m] / 1048576);
         return 0;
@@ -5420,7 +5838,8 @@ int main(int argc, char **argv) {
 #define BND(q, need) do { if ((q) > bend || (uint64_t)(need) > (uint64_t)(bend - (q))) die("truncated archive"); } while (0)
         BND(p, 4);
         int cver;
-        if (!memcmp(p, "CAI5", 4)) cver = 5;
+        if (!memcmp(p, "CAI6", 4)) cver = 6;
+        else if (!memcmp(p, "CAI5", 4)) cver = 5;
         else if (!memcmp(p, "CAI4", 4)) cver = 4;
         else if (!memcmp(p, "CAI3", 4)) cver = 3;
         else die("bad magic");
@@ -5517,7 +5936,8 @@ int main(int argc, char **argv) {
             if ((mraw & MF_BH) && !(mraw & MF_BAT)) die("bad method flags");
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
-            if (t->method > M_PRW) die("bad method");
+            if (t->method > M_FIELDT || (t->method == M_FIELDT && cver < 6))
+                die("bad method");
             BND(q, 8); t->len = r64(&q);
             ck_shape_len(t);
             t->ref = 0xFFFFFFFFu;
@@ -5652,7 +6072,7 @@ int main(int argc, char **argv) {
                 drop_pages(pd, t->plen, g_amap);
                 i++; continue;
             }
-            dec_tensor(t, buf + t->off, all);
+            dec_tensor(t, buf + t->off, all, g_threads);
             if (crc32b(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
             FILE *of = ofs[t->file];
             if (fseeko(of, hbase[t->file] + t->dataoff, SEEK_SET)) die("seek");
@@ -5694,7 +6114,8 @@ int main(int argc, char **argv) {
         const uint8_t *p = buf, *bend = buf + fsz;
         BND(p, 4);
         int cver;
-        if (!memcmp(p, "CAI5", 4)) cver = 5;
+        if (!memcmp(p, "CAI6", 4)) cver = 6;
+        else if (!memcmp(p, "CAI5", 4)) cver = 5;
         else if (!memcmp(p, "CAI4", 4)) cver = 4;
         else if (!memcmp(p, "CAI3", 4)) cver = 3;
         else die("bad magic");
@@ -5767,7 +6188,8 @@ int main(int argc, char **argv) {
             if ((mraw & MF_BH) && !(mraw & MF_BAT)) die("bad method flags");
             t->bat = (mraw & MF_BAT) != 0 ? ((mraw & MF_BH) ? 1 : 2) : 0;
             t->method = mraw & 0x3F;
-            if (t->method > M_PRW) die("bad method");
+            if (t->method > M_FIELDT || (t->method == M_FIELDT && cver < 6))
+                die("bad method");
             BND(q, 8); t->len = r64(&q);
             ck_shape_len(t);
             t->ref = 0xFFFFFFFFu;
@@ -5806,7 +6228,7 @@ int main(int argc, char **argv) {
                         die("crc mismatch: archive corrupt");
                     teach(t, buf + t->off);
                 } else {
-                    dec_tensor(t, buf + t->off, all);
+                    dec_tensor(t, buf + t->off, all, g_threads);
                     if (crc32b(t->data, t->len) != t->crc) die("crc mismatch: archive corrupt");
                 }
             }

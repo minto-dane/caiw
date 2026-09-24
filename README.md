@@ -58,6 +58,7 @@ they never pick the winner — and if nothing helps, RAW wins.
 | method | exploits |
 |---|---|
 | `FIELD` | sign/exponent/mantissa of f16-family, context-conditioned rANS |
+| `FIELDT` | FIELD with the model transmitted as a frozen table — blocks decode in parallel (`CAI6`) |
 | `FIELDPOS`/`FIELDROW` | + column/row-position context (embeddings, rotary tables) |
 | `F32` | 5-plane field decomposition for f32 |
 | `DELTA` | residual vs an earlier same-name/family tensor (checkpoint chains) |
@@ -69,10 +70,18 @@ they never pick the winner — and if nothing helps, RAW wins.
 | `RAW` | store — the honest floor |
 
 **Parallelism without nondeterminism.** Candidate trials and consecutive
-tensors encode in parallel (batches, `CAI5`): each worker sees a snapshot
+tensors encode in parallel (batches): each worker sees a snapshot
 of the committed histogram state, histogram deltas merge commutatively,
 and the archive records batch boundaries so an archive written at *any*
-`-j` decodes to identical bytes under *any* `-j`.
+`-j` decodes to identical bytes under *any* `-j`. Every stream encoder
+is additionally *block-parallel* internally. On the decode side, FIELD's
+adaptive table chains blocks serially — so FIELDT normalizes the model
+over the whole tensor once, transmits that table in the payload (dense
+sign/exponent rows; a mantissa row only where it provably beats uniform
+coding), and each block then decodes independently across threads. On
+real-weight tensors FIELDT beats FIELD outright on bytes (~-1.3% on
+pythia-160m) *and* decodes ~3.8x faster at `-j8`; archives containing it
+are stamped `CAI6`, anything else stays `CAI5` for older readers.
 
 **Rolling context models.** Each channel keeps a cumulative histogram;
 per-block tables are normalized only over contexts the block actually

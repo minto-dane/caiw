@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 set -u; fail=0
 [ -f out/edgeA.st ] || python3 gen_fixtures.py
 for t in "edgeA.st edgeB.st" "chA.st chB.st chC.st" "f32A.st f32B.st" "exp.st" \
-         "pack1.st" "escname.st" "ndim9.st" "meta.st" "split.st" "rows.st"; do
+         "pack1.st" "escname.st" "ndim9.st" "meta.st" "split.st" "rows.st" "f16t.st"; do
     for j in 1 4; do
         ok=1; args=""
         set -- $t; for a in "$@"; do args="$args out/$a"; done
@@ -39,6 +39,50 @@ def data_region(p):
 assert data_region('out/rows.st') == data_region('/tmp/rowsd/rows.st'), "PRW data mismatch"
 PYEOF
 [ $? -eq 0 ] || { echo "PRW DATA MISMATCH"; fail=1; }
+# FIELDT: drifting-exponent bf16 must select the transmitted-table method
+# (CAI6 magic), decode to identical bytes at any -j, and reject a flipped
+# table byte loudly
+"$BIN" c /tmp/f16t.caiw out/f16t.st -j1 2>&1 | grep -q "FIELDT" || { echo "FIELDT NOT SELECTED"; fail=1; }
+python3 - <<'PYEOF' || { echo "FIELDT MAGIC"; fail=1; }
+assert open('/tmp/f16t.caiw','rb').read(4) == b'CAI6', "FIELDT archive must be CAI6"
+PYEOF
+for j in 1 4 8; do
+    rm -rf /tmp/f16td$j && "$BIN" d /tmp/f16t.caiw /tmp/f16td$j -j$j >/dev/null 2>&1 || { echo "FIELDT DECODE FAIL -j$j"; fail=1; }
+done
+python3 - <<'PYEOF' || { echo "FIELDT DATA MISMATCH"; fail=1; }
+import struct
+def data_region(p):
+    d = open(p, 'rb').read(); hl = struct.unpack('<Q', d[:8])[0]
+    return d[8 + hl:]
+ref = data_region('out/f16t.st')
+for j in (1, 4, 8):
+    assert data_region('/tmp/f16td%d/f16t.st' % j) == ref, "f16t -j%d mismatch" % j
+PYEOF
+python3 - <<'PYEOF'
+# corrupt one byte inside the FIELDT table — must die, not decode wrong
+import struct, subprocess, os
+d = bytearray(open('/tmp/f16t.caiw','rb').read())
+p = 4
+nf = struct.unpack('<I', d[p:p+4])[0]; p += 4
+for _ in range(nf):
+    nl = struct.unpack('<I', d[p:p+4])[0]; p += 4 + nl
+    ml = struct.unpack('<I', d[p:p+4])[0]; p += 4 + ml
+p += 4                                       # NT
+for _ in range(struct.unpack('<I', d[p-4:p])[0]):
+    nl = struct.unpack('<H', d[p:p+2])[0]; p += 2 + nl
+    dl = struct.unpack('<H', d[p:p+2])[0]; p += 2 + dl
+    nd = d[p]; p += 1 + 8*nd
+    p += 2
+    m = d[p]; p += 1
+    p += 8
+    if (m & 0x3f) in (2, 5, 9): p += 4
+    plen = struct.unpack('<Q', d[p:p+8])[0]; p += 8 + 4
+    if (m & 0x3f) == 11:
+        d[p + 100] ^= 0xFF                   # inside transmitted table
+    p += plen
+open('/tmp/f16t_bad.caiw','wb').write(d)
+PYEOF
+"$BIN" v /tmp/f16t_bad.caiw out/f16t.st -j4 >/dev/null 2>&1 && { echo "FIELDT-BADTAB ACCEPTED"; fail=1; }
 # v completeness: dropping a source file must fail (MISS-SRC / FILECOUNT)
 "$BIN" c /tmp/tst2.caiw out/pack1.st out/meta.st -j1 >/dev/null 2>&1
 "$BIN" v /tmp/tst2.caiw out/pack1.st 2>&1 | grep -q "0 bad" && { echo "V-COMPLETENESS FAIL"; fail=1; }

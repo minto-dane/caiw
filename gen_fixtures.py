@@ -119,6 +119,15 @@ def main():
         S['expert.%02d' % e] = ('BF16', [256, 256], bf16(rows[e * 65536:(e + 1) * 65536]))
     wst(os.path.join(OUT, 'split.st'), S)
 
+    # f16t: bf16 tensor with a concentrated, row-drifting exponent profile —
+    # the transmitted frozen table (FIELDT, CAI6) beats per-block adaptation
+    # here; must select method 11, write CAI6 magic, and round-trip at any -j
+    vals = []
+    for i in range(1600 * 1024):
+        r = i // 1024
+        vals.append(rng.gauss(0, 0.011 + 0.004 * ((r * 7) % 13) / 13.0))
+    wst(os.path.join(OUT, 'f16t.st'), {'w': ('BF16', [1600, 1024], bf16(vals))})
+
     # rows: smooth-row f16 matrix — adjacent rows are tiny perturbations of
     # each other (embedding-like) -> PREVROW should beat FIELD outright
     R = 2048; C = 256
