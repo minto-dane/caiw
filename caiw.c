@@ -1454,6 +1454,7 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
     uint16_t *ft = xm((tSE + tM) * 2);
     uint32_t *cum = xm(((size_t)K * (sew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
     uint8_t *scr = xm(SCRSZ);
+    uint8_t *used = xm(2 * (size_t)ew);
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         /* the block's po values are contiguous (rowwise: po=gi/D monotone;
@@ -1479,11 +1480,16 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
         if (c1hi > K - 1) c1hi = K - 1;
         for (int64_t c = c0lo; c <= c0hi; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
         for (int64_t c = c1lo; c <= c1hi; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
-        for (int c = 0; c < 2 * ew; c++) norm_ctx(h + tSE + (size_t)c * mw, ft + tSE + (size_t)c * mw, mw);
+        /* mantissa rows conditioned on SE = v>>mb: real blocks touch only a
+           few dozen of 2*ew — norm only used rows (same trick as f16/f32) */
+        memset(used, 0, 2 * (size_t)ew);
+        for (uint64_t i = 0; i < bn; i++) used[s[b0 + i] >> mb] = 1;
+        for (int c = 0; c < 2 * ew; c++) if (used[c])
+            norm_ctx(h + tSE + (size_t)c * mw, ft + tSE + (size_t)c * mw, mw);
         uint32_t *cSE = cum, *cM = cum + (size_t)K * (sew + 1);
         for (int64_t c = c0lo; c <= c0hi; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
         for (int64_t c = c1lo; c <= c1hi; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
-        for (int c = 0; c < 2 * ew; c++) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + ft[tSE + (size_t)c * mw + i]; }
+        for (int c = 0; c < 2 * ew; c++) if (used[c]) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + ft[tSE + (size_t)c * mw + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
         /* po = gi%P (column) or gi/D (rowwise), ctx = po*K/P — computed
@@ -1515,7 +1521,7 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
         }
         o = emit_blk(o, scr + SCRSZ, pp, x);
     }
-    free(ft); free(cum); free(scr);
+    free(ft); free(cum); free(scr); free(used);
     return o - out;
 }
 /*@ requires 1 <= ew <= 32768;
