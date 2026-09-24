@@ -1442,8 +1442,124 @@ static void f16_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, u
  * K = min(P, KCAP) ctxs, ctx = p*K/P — exact column when K==P.
  * hist: [SE|pos: K*sew][M|SE: 2*ew*mw]
  */
+/* block-parallel pos_enc: per-block [pos-ctx range memset + forward count]
+   (model-independent — po derives from block bounds), serial norm+merge in
+   block order, parallel backward encode, serial in-order emit. */
+typedef struct {
+    const uint16_t *s; uint64_t n; int mb; int64_t P, K, D;
+    int rowwise;
+    uint64_t blo, bhi;
+    uint8_t *useds;                           /* [blk][2*ew] mantissa mask */
+    int64_t *crng;                            /* [blk][4]: c0lo,c0hi,c1lo,c1hi */
+    uint16_t *fts;                            /* [blk][tSE+tM] */
+    uint32_t *h32;                            /* [blk][tSE+tM] */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;
+    size_t fsn;
+    int mode, spawned;
+} PosW;
+static void *posw_run(void *a) {
+    PosW *w = a;
+    int ew = 1 << (15 - w->mb), mw = 1 << w->mb, sew = 2 * ew;
+    int64_t K = w->K, P = w->P, D = w->D;
+    size_t tSE = (size_t)K * sew;
+    int arows = (sew + mw - 1) / mw;          /* mantissa rows aliased by ctx=K */
+    if (!w->mode) {
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t lb = b - w->blo;
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            uint8_t *used = w->useds + lb * 2 * (size_t)ew;
+            int64_t *cr = w->crng + lb * 4;
+            uint32_t *bh = w->h32 + lb * w->fsn;
+            /* same used-range derivation as the serial path */
+            int64_t r0lo, r0hi, r1lo = -1, r1hi = -1;
+            if (w->rowwise) {
+                r0lo = (int64_t)(b0 / (uint64_t)D); if (r0lo > P - 1) r0lo = P - 1;
+                r0hi = (int64_t)((b0 + bn - 1) / (uint64_t)D); if (r0hi > P - 1) r0hi = P - 1;
+            }
+            else if ((uint64_t)P <= bn) { r0lo = 0; r0hi = P - 1; }
+            else {
+                int64_t p0 = (int64_t)(b0 % (uint64_t)P), p1 = (int64_t)((b0 + bn - 1) % (uint64_t)P);
+                if (p1 >= p0) { r0lo = p0; r0hi = p1; }
+                else { r0lo = p0; r0hi = P - 1; r1lo = 0; r1hi = p1; }
+            }
+            int64_t c0lo = r0lo * K / P, c0hi = r0hi * K / P;
+            int64_t c1lo = r1lo < 0 ? 0 : r1lo * K / P, c1hi = r1lo < 0 ? -1 : r1hi * K / P;
+            if (c0hi > K - 1) c0hi = K - 1;
+            if (c1hi > K - 1) c1hi = K - 1;
+            cr[0] = c0lo; cr[1] = c0hi; cr[2] = c1lo; cr[3] = c1hi;
+            memset(used, 0, 2 * (size_t)ew);
+            for (uint64_t i = 0; i < bn; i++) used[w->s[b0 + i] >> w->mb] = 1;
+            /* memset only rows that will be counted */
+            for (int64_t c = c0lo; c <= c0hi; c++) memset(bh + c * sew, 0, (size_t)sew * 4);
+            for (int64_t c = c1lo; c <= c1hi; c++) memset(bh + c * sew, 0, (size_t)sew * 4);
+            for (int c = 0; c < 2 * ew; c++) if (used[c] || c < arows)
+                memset(bh + tSE + (size_t)c * mw, 0, (size_t)mw * 4);
+            /* forward count: po steps forward, identical ctx values */
+            int64_t po = w->rowwise ? (int64_t)(b0 / (uint64_t)D) : (int64_t)(b0 % (uint64_t)P);
+            if (po > P - 1) po = P - 1;
+            int64_t ctx = po * K / P, rem = po * K - ctx * P;
+            uint64_t pob = ((uint64_t)po + 1) * (uint64_t)D;
+            for (uint64_t i = 0; i < bn; i++) {
+                uint64_t gi = b0 + i;
+                uint32_t v = w->s[gi];
+                uint32_t SE = v >> w->mb, Mv = v & (mw - 1);
+                bh[ctx * sew + SE]++;
+                bh[tSE + (size_t)SE * mw + Mv]++;
+                if (w->rowwise) {
+                    if (gi + 1 == pob) {
+                        pob += (uint64_t)D;
+                        if (po < P - 1) { po++; rem += K; if (rem >= P) { rem -= P; ctx++; } }
+                    }
+                } else {
+                    if (po == P - 1) { po = 0; ctx = 0; rem = 0; }
+                    else { po++; rem += K; if (rem >= P) { rem -= P; ctx++; } }
+                }
+            }
+        }
+        return 0;
+    }
+    uint8_t *scr = xm(SCRSZ);
+    uint32_t *cum = xm(((size_t)K * (sew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t lb = b - w->blo;
+        uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+        const uint8_t *used = w->useds + lb * 2 * (size_t)ew;
+        const int64_t *cr = w->crng + lb * 4;
+        const uint16_t *ft = w->fts + lb * w->fsn;
+        uint32_t *cSE = cum, *cM = cum + (size_t)K * (sew + 1);
+        for (int64_t c = cr[0]; c <= cr[1]; c++) { uint32_t *bb = cSE + c * (sew + 1); bb[0] = 0; for (int i = 0; i < sew; i++) bb[i + 1] = bb[i] + ft[c * sew + i]; }
+        for (int64_t c = cr[2]; c <= cr[3]; c++) { uint32_t *bb = cSE + c * (sew + 1); bb[0] = 0; for (int i = 0; i < sew; i++) bb[i + 1] = bb[i] + ft[c * sew + i]; }
+        for (int c = 0; c < 2 * ew; c++) if (used[c] || c < arows) { uint32_t *bb = cM + (size_t)c * (mw + 1); bb[0] = 0; for (int i = 0; i < mw; i++) bb[i + 1] = bb[i] + ft[tSE + (size_t)c * mw + i]; }
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        uint64_t gl = b0 + bn - 1;
+        int64_t po = w->rowwise ? (int64_t)(gl / (uint64_t)D) : (int64_t)(gl % (uint64_t)P);
+        if (po > P - 1) po = P - 1;
+        int64_t ctx = po * K / P, rem = po * K - ctx * P;
+        uint64_t pob = (uint64_t)po * (uint64_t)D;
+        for (uint64_t i = bn; i-- > 0;) {
+            uint64_t gi = b0 + i;
+            uint32_t v = w->s[gi];
+            uint32_t SE = v >> w->mb, Mv = v & (mw - 1);
+            x = enc(x, ft[tSE + (size_t)SE * mw + Mv], cM[(size_t)SE * (mw + 1) + Mv], &pp);
+            x = enc(x, ft[ctx * sew + SE], cSE[ctx * (sew + 1) + SE], &pp);
+            if (w->rowwise) {
+                if (gi == pob && po > 0) { po--; pob -= (uint64_t)D; rem -= K; if (rem < 0) { rem += P; ctx--; } }
+            } else {
+                if (po == 0) { po = P - 1; ctx = K - 1; rem = P - K; }
+                else { po--; rem -= K; if (rem < 0) { rem += P; ctx--; } }
+            }
+        }
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr); free(cum);
+    return 0;
+}
 static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int rowwise,
-                      uint8_t *out, uint64_t *h) {
+                      uint8_t *out, uint64_t *h, int nthr) {
     if (P <= 0 || P > ((int64_t)1 << 40)) return 0;  /* degenerate/absurd; po*K must fit i64 */
     int ew = 1 << (15 - mb), mw = 1 << mb, sew = 2 * ew;
     int64_t K = P < (int64_t)(PCAP / sew) ? P : (int64_t)(PCAP / sew);
@@ -1451,6 +1567,77 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
     if (D < 1) D = 1;
     uint8_t *o = out;
     size_t tSE = (size_t)K * sew, tM = (size_t)2 * ew * mw;
+    size_t fsn = tSE + tM;
+    int arows = (sew + mw - 1) / mw;
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    if (nthr > 1 && nblk >= 2) {
+        uint64_t wcap = (uint64_t)nthr * 2;
+        if (wcap > nblk) wcap = nblk;
+        uint16_t *fts = xm(wcap * fsn * 2);
+        uint32_t *h32 = xc(wcap * fsn, 4);
+        uint8_t *useds = xc(wcap * 2 * (size_t)ew, 1);
+        int64_t *crng = xc(wcap * 4, 8);
+        uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+        uint32_t *lens = xc(wcap, 4); uint64_t *xs = xc(wcap, 8);
+        PosW *wj = xc(nthr, sizeof(PosW));
+        pthread_t *th = xc(nthr, sizeof(pthread_t));
+        for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+            uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+            uint64_t per = (wn + sp - 1) / sp;
+            for (int phase = 0; phase < 2; phase++) {
+                uint64_t lo = bs;
+                for (int k = 0; k < sp; k++) {
+                    PosW *w = &wj[k];
+                    w->s = s; w->n = n; w->mb = mb; w->P = P; w->K = K; w->D = D;
+                    w->rowwise = rowwise; w->mode = phase; w->fsn = fsn;
+                    w->blo = lo; w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                    w->useds = useds + (lo - bs) * 2 * (size_t)ew;
+                    w->crng = crng + (lo - bs) * 4;
+                    w->fts = fts + (lo - bs) * fsn;
+                    w->h32 = h32 + (lo - bs) * fsn;
+                    w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
+                    w->xs = xs + (lo - bs); w->spawned = 0;
+                    lo = w->bhi;
+                    if (pthread_create(&th[k], 0, posw_run, w)) posw_run(w);
+                    else w->spawned = 1;
+                }
+                for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+                if (phase) continue;
+                /* serial norm + merge in block order */
+                for (uint64_t b = 0; b < wn; b++) {
+                    const uint8_t *u = useds + b * 2 * (size_t)ew;
+                    const int64_t *cr = crng + b * 4;
+                    uint16_t *f = fts + b * fsn;
+                    const uint32_t *bh = h32 + b * fsn;
+                    for (int64_t c = cr[0]; c <= cr[1]; c++) {
+                        norm_ctx(h + c * sew, f + c * sew, sew);
+                        uint64_t *hp = h + c * sew; const uint32_t *bp = bh + c * sew;
+                        for (int i = 0; i < sew; i++) hp[i] += bp[i];
+                    }
+                    for (int64_t c = cr[2]; c <= cr[3]; c++) {
+                        norm_ctx(h + c * sew, f + c * sew, sew);
+                        uint64_t *hp = h + c * sew; const uint32_t *bp = bh + c * sew;
+                        for (int i = 0; i < sew; i++) hp[i] += bp[i];
+                    }
+                    for (int c = 0; c < 2 * ew; c++) if (u[c] || c < arows) {
+                        norm_ctx(h + tSE + (size_t)c * mw, f + tSE + (size_t)c * mw, mw);
+                        uint64_t *hp = h + tSE + (size_t)c * mw;
+                        const uint32_t *bp = bh + tSE + (size_t)c * mw;
+                        for (int i = 0; i < mw; i++) hp[i] += bp[i];
+                    }
+                }
+            }
+            for (uint64_t b = 0; b < wn; b++) {
+                uint8_t *bf = bufs[b];
+                o = emit_blk(o, bf + lens[b], bf, xs[b]);
+                free(bf);
+            }
+        }
+        free(fts); free(h32); free(useds); free(crng); free(bufs); free(lens); free(xs);
+        free(wj); free(th);
+        return o - out;
+    }
     uint16_t *ft = xm((tSE + tM) * 2);
     uint32_t *cum = xm(((size_t)K * (sew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
     uint8_t *scr = xm(SCRSZ);
@@ -1464,7 +1651,13 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
            block; the decoder normalizes per-ctx independently so the
            emitted bitstream is unchanged. */
         int64_t r0lo, r0hi, r1lo = -1, r1hi = -1;
-        if (rowwise) { r0lo = (int64_t)(b0 / (uint64_t)D); r0hi = (int64_t)((b0 + bn - 1) / (uint64_t)D); }
+        if (rowwise) {
+            /* prefix calls may pass P that doesn't divide n: tail elements
+               clamp to po=P-1 (old unclamped behavior let po*K/P run past K
+               and index beyond the ft/cum/h tables — latent OOB) */
+            r0lo = (int64_t)(b0 / (uint64_t)D); if (r0lo > P - 1) r0lo = P - 1;
+            r0hi = (int64_t)((b0 + bn - 1) / (uint64_t)D); if (r0hi > P - 1) r0hi = P - 1;
+        }
         else if ((uint64_t)P <= bn) { r0lo = 0; r0hi = P - 1; }
         else {
             int64_t p0 = (int64_t)(b0 % (uint64_t)P), p1 = (int64_t)((b0 + bn - 1) % (uint64_t)P);
@@ -1473,9 +1666,9 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
         }
         int64_t c0lo = r0lo * K / P, c0hi = r0hi * K / P;
         int64_t c1lo = r1lo < 0 ? 0 : r1lo * K / P, c1hi = r1lo < 0 ? -1 : r1hi * K / P;
-        /* po can reach P when P∤n (ctx=K aliases the mantissa table area —
-           pre-existing self-consistent behavior); K's cells are rewritten by
-           the mantissa norms below, so clamp it out of the ctx range */
+        /* po is clamped to P-1 above so ctx < K; belt-and-braces clamp for
+           the ctx range anyway (mantissa rows 0..arows-1 are normed below
+           to cover the historical ctx=K alias geometry) */
         if (c0hi > K - 1) c0hi = K - 1;
         if (c1hi > K - 1) c1hi = K - 1;
         for (int64_t c = c0lo; c <= c0hi; c++) norm_ctx(h + c * sew, ft + c * sew, sew);
@@ -1484,12 +1677,16 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
            few dozen of 2*ew — norm only used rows (same trick as f16/f32) */
         memset(used, 0, 2 * (size_t)ew);
         for (uint64_t i = 0; i < bn; i++) used[s[b0 + i] >> mb] = 1;
-        for (int c = 0; c < 2 * ew; c++) if (used[c])
+        /* arows guard: ctx=K (po=P when P∤n) reads/writes the first
+           ceil(sew/mw) mantissa rows via the flat-alias, so those are
+           normed unconditionally — a block whose mantissa rows 0..arows-1
+           are unused would otherwise leave ft cells at 0 and die in enc */
+        for (int c = 0; c < 2 * ew; c++) if (used[c] || c < arows)
             norm_ctx(h + tSE + (size_t)c * mw, ft + tSE + (size_t)c * mw, mw);
         uint32_t *cSE = cum, *cM = cum + (size_t)K * (sew + 1);
         for (int64_t c = c0lo; c <= c0hi; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
         for (int64_t c = c1lo; c <= c1hi; c++) { uint32_t *b = cSE + c * (sew + 1); b[0] = 0; for (int i = 0; i < sew; i++) b[i + 1] = b[i] + ft[c * sew + i]; }
-        for (int c = 0; c < 2 * ew; c++) if (used[c]) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + ft[tSE + (size_t)c * mw + i]; }
+        for (int c = 0; c < 2 * ew; c++) if (used[c] || c < arows) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + ft[tSE + (size_t)c * mw + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
         /* po = gi%P (column) or gi/D (rowwise), ctx = po*K/P — computed
@@ -1499,6 +1696,7 @@ static size_t pos_enc(const uint16_t *s, uint64_t n, int mb, int64_t P, int roww
            element division. */
         uint64_t gl = b0 + bn - 1;
         int64_t po = rowwise ? (int64_t)(gl / (uint64_t)D) : (int64_t)(gl % (uint64_t)P);
+        if (po > P - 1) po = P - 1;            /* tail clamp (see above) */
         int64_t ctx = po * K / P, rem = po * K - ctx * P;
         uint64_t pob = (uint64_t)po * (uint64_t)D;   /* rowwise: next-lower po boundary */
         for (uint64_t i = bn; i-- > 0;) {
@@ -1783,9 +1981,170 @@ static void pos_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, int mb, i
 }
 
 /* ============ F32: S|E|m1(7)|m2(8)|m3(8) ============ */
-static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
+/* block-parallel F32: per-block build is just counting (data is read
+   directly at encode); h32 rows are huge so only USED rows are touched —
+   a cheap se-mask prescan first, then memset+count only those rows. */
+#define F32FSN (2 + 512 + 512 * 128 + 512 * 256 + 512 * 256)
+typedef struct {
+    const uint32_t *s; uint64_t n;
+    uint64_t blo, bhi;
+    uint8_t *useds;                           /* [blk][512] */
+    uint16_t *fts;                            /* [blk][F32FSN] */
+    uint32_t *h32;                            /* [blk][F32FSN] */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;
+    int mode, spawned;
+} F32W;
+static void *f32w_run(void *a) {
+    F32W *w = a;
+    const size_t M1 = 2 + 512, M2 = M1 + 512 * 128, M3 = M2 + 512 * 256;
+    if (!w->mode) {
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t lb = b - w->blo;
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            uint8_t *used = w->useds + lb * 512;
+            uint32_t *bh = w->h32 + lb * F32FSN;
+            memset(used, 0, 512);
+            for (uint64_t i = 0; i < bn; i++)
+                used[(w->s[b0 + i] >> 23) & 511] = 1;
+            /* clear only what pass 2 will count: S cells, E rows for the
+               sign halves present, and the 3 mantissa rows per used se */
+            memset(bh, 0, 8);
+            for (int c = 0; c < 2; c++) {
+                if (used[c * 256] || memchr(used + c * 256, 1, 256))
+                    memset(bh + 2 + c * 256, 0, 1024);
+            }
+            for (int c = 0; c < 512; c++) if (used[c]) {
+                memset(bh + M1 + (size_t)c * 128, 0, 512);
+                memset(bh + M2 + (size_t)c * 256, 0, 1024);
+                memset(bh + M3 + (size_t)c * 256, 0, 1024);
+            }
+            for (uint64_t i = 0; i < bn; i++) {
+                uint32_t v = w->s[b0 + i], S = v >> 31, E = (v >> 23) & 255;
+                uint32_t m1 = (v >> 16) & 127, m2 = (v >> 8) & 255, m3 = v & 255;
+                uint32_t se = S * 256 + E;
+                bh[S]++; bh[2 + S * 256 + E]++;
+                bh[M1 + se * 128 + m1]++;
+                bh[M2 + se * 256 + m2]++;
+                bh[M3 + se * 256 + m3]++;
+            }
+        }
+        return 0;
+    }
+    uint8_t *scr = xm(SCRSZ);
+    uint32_t *cum = xm((4 + 2 * 257 + 512 * 129 + 2 * 512 * 257) * 4);
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t lb = b - w->blo;
+        uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+        const uint8_t *used = w->useds + lb * 512;
+        const uint16_t *ft = w->fts + lb * F32FSN;
+        uint16_t *f1 = (uint16_t *)ft + M1, *f2 = (uint16_t *)ft + M2, *f3 = (uint16_t *)ft + M3;
+        uint32_t *cS = cum, *cE = cum + 4, *c1 = cE + 2 * 257, *c2 = c1 + 512 * 129, *c3 = c2 + 512 * 257;
+        int u0 = memchr(used, 1, 256) != 0, u1 = memchr(used + 256, 1, 256) != 0;
+        cS[0] = 0; cS[1] = ft[0]; cS[2] = (uint32_t)ft[0] + ft[1];
+        for (int c = 0; c < 2; c++) if (c ? u1 : u0) { uint32_t *bb = cE + c * 257; bb[0] = 0; for (int i = 0; i < 256; i++) bb[i + 1] = bb[i] + ft[2 + c * 256 + i]; }
+        for (int c = 0; c < 512; c++) if (used[c]) { uint32_t *bb = c1 + c * 129; bb[0] = 0; for (int i = 0; i < 128; i++) bb[i + 1] = bb[i] + f1[c * 128 + i]; }
+        for (int c = 0; c < 512; c++) if (used[c]) { uint32_t *bb = c2 + c * 257; bb[0] = 0; for (int i = 0; i < 256; i++) bb[i + 1] = bb[i] + f2[c * 256 + i]; }
+        for (int c = 0; c < 512; c++) if (used[c]) { uint32_t *bb = c3 + c * 257; bb[0] = 0; for (int i = 0; i < 256; i++) bb[i + 1] = bb[i] + f3[c * 256 + i]; }
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        for (uint64_t i = bn; i-- > 0;) {
+            uint32_t v = w->s[b0 + i], S = v >> 31, E = (v >> 23) & 255;
+            uint32_t m1 = (v >> 16) & 127, m2 = (v >> 8) & 255, m3 = v & 255;
+            uint32_t se = S * 256 + E;
+            x = enc(x, f3[se * 256 + m3], c3[se * 257 + m3], &pp);
+            x = enc(x, f2[se * 256 + m2], c2[se * 257 + m2], &pp);
+            x = enc(x, f1[se * 128 + m1], c1[se * 129 + m1], &pp);
+            x = enc(x, ft[2 + S * 256 + E], cE[S * 257 + E], &pp);
+            x = enc(x, ft[S], cS[S], &pp);
+        }
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr); free(cum);
+    return 0;
+}
+static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h,
+                      int nthr) {
     uint8_t *o = out;
     size_t nM1 = 512 * 128, nM2 = 512 * 256, nM3 = 512 * 256;
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    if (nthr > 1 && nblk >= 2) {
+        uint64_t wcap = (uint64_t)nthr * 2;   /* F32FSN rows are fat */
+        if (wcap > nblk) wcap = nblk;
+        uint16_t *fts = xm(wcap * F32FSN * 2);
+        uint32_t *h32 = xc(wcap * F32FSN, 4);   /* virtual; only used rows resident */
+        uint8_t *useds = xc(wcap * 512, 1);
+        uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+        uint32_t *lens = xc(wcap, 4); uint64_t *xs = xc(wcap, 8);
+        F32W *wj = xc(nthr, sizeof(F32W));
+        pthread_t *th = xc(nthr, sizeof(pthread_t));
+        for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+            uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+            uint64_t per = (wn + sp - 1) / sp;
+            for (int phase = 0; phase < 2; phase++) {
+                uint64_t lo = bs;
+                for (int k = 0; k < sp; k++) {
+                    F32W *w = &wj[k];
+                    w->s = s; w->n = n; w->mode = phase;
+                    w->blo = lo; w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                    w->useds = useds + (lo - bs) * 512;
+                    w->fts = fts + (lo - bs) * F32FSN;
+                    w->h32 = h32 + (lo - bs) * F32FSN;
+                    w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
+                    w->xs = xs + (lo - bs); w->spawned = 0;
+                    lo = w->bhi;
+                    if (pthread_create(&th[k], 0, f32w_run, w)) f32w_run(w);
+                    else w->spawned = 1;
+                }
+                for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+                if (phase) continue;
+                /* serial norm+merge per block, in order */
+                for (uint64_t b = 0; b < wn; b++) {
+                    const uint8_t *u = useds + b * 512;
+                    uint16_t *f = fts + b * F32FSN;
+                    const uint32_t *bh = h32 + b * F32FSN;
+                    norm_ctx(h, f, 2);
+                    for (int c = 0; c < 2; c++) if (memchr(u + c * 256, 1, 256))
+                        norm_ctx(h + 2 + c * 256, f + 2 + c * 256, 256);
+                    for (int c = 0; c < 512; c++) if (u[c]) {
+                        norm_ctx(h + 2 + 512 + (size_t)c * 128, f + 2 + 512 + (size_t)c * 128, 128);
+                        norm_ctx(h + 2 + 512 + nM1 + (size_t)c * 256, f + 2 + 512 + nM1 + (size_t)c * 256, 256);
+                        norm_ctx(h + 2 + 512 + nM1 + nM2 + (size_t)c * 256, f + 2 + 512 + nM1 + nM2 + (size_t)c * 256, 256);
+                    }
+                    /* merge exactly the counted cells: S, E rows present,
+                       used se rows' 3 mantissa bands */
+                    h[0] += bh[0]; h[1] += bh[1];
+                    for (int c = 0; c < 2; c++) if (memchr(u + c * 256, 1, 256)) {
+                        uint64_t *hp = h + 2 + c * 256;
+                        const uint32_t *bp = bh + 2 + c * 256;
+                        for (int i = 0; i < 256; i++) hp[i] += bp[i];
+                    }
+                    for (int c = 0; c < 512; c++) if (u[c]) {
+                        uint64_t *hp = h + 2 + 512 + (size_t)c * 128;
+                        const uint32_t *bp = bh + 2 + 512 + (size_t)c * 128;
+                        for (int i = 0; i < 128; i++) hp[i] += bp[i];
+                        hp = h + 2 + 512 + nM1 + (size_t)c * 256;
+                        bp = bh + 2 + 512 + nM1 + (size_t)c * 256;
+                        for (int i = 0; i < 256; i++) hp[i] += bp[i];
+                        hp = h + 2 + 512 + nM1 + nM2 + (size_t)c * 256;
+                        bp = bh + 2 + 512 + nM1 + nM2 + (size_t)c * 256;
+                        for (int i = 0; i < 256; i++) hp[i] += bp[i];
+                    }
+                }
+            }
+            for (uint64_t b = 0; b < wn; b++) {
+                uint8_t *bf = bufs[b];
+                o = emit_blk(o, bf + lens[b], bf, xs[b]);
+                free(bf);
+            }
+        }
+        free(fts); free(h32); free(useds); free(bufs); free(lens); free(xs);
+        free(wj); free(th);
+        return o - out;
+    }
     uint16_t *ft = xm((2 + 512 + nM1 + nM2 + nM3) * 2);
     uint32_t *cum = xm((4 + 2 * 257 + 512 * 129 + 2 * 512 * 257) * 4);
     uint8_t *scr = xm(SCRSZ);
@@ -2076,8 +2435,96 @@ static void f32_dec(const uint8_t *in, const uint8_t *lim, uint64_t n, uint32_t 
 }
 
 /* ============ U8 ============ */
-static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint64_t *h) {
-    uint8_t *o = out, *scr = xm(SCRSZ);
+typedef struct {
+    const uint8_t *s; uint64_t n;
+    uint64_t blo, bhi;
+    uint16_t *fts;                            /* [blk][256] */
+    uint32_t *h32;                            /* [blk][256] */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;
+    int mode, spawned;
+} U8W;
+static void *u8w_run(void *a) {
+    U8W *w = a;
+    if (!w->mode) {
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t lb = b - w->blo;
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            uint32_t *bh = w->h32 + lb * 256;
+            memset(bh, 0, 1024);
+            for (uint64_t i = 0; i < bn; i++) bh[w->s[b0 + i]]++;
+        }
+        return 0;
+    }
+    uint8_t *scr = xm(SCRSZ);
+    uint32_t cum[257];
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t lb = b - w->blo;
+        uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+        const uint16_t *ft = w->fts + lb * 256;
+        cum[0] = 0; for (int i = 0; i < 256; i++) cum[i + 1] = cum[i] + ft[i];
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        for (uint64_t i = bn; i-- > 0;)
+            x = enc(x, ft[w->s[b0 + i]], cum[w->s[b0 + i]], &pp);
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr);
+    return 0;
+}
+static size_t u8_enc(const uint8_t *s, uint64_t n, uint8_t *out, uint64_t *h,
+                     int nthr) {
+    uint8_t *o = out, *scr;
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    if (nthr > 1 && nblk >= 2) {
+        uint64_t wcap = (uint64_t)nthr * 4;
+        if (wcap > nblk) wcap = nblk;
+        uint16_t *fts = xc(wcap * 256, 2);
+        uint32_t *h32 = xc(wcap * 256, 4);
+        uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+        uint32_t *lens = xc(wcap, 4); uint64_t *xs = xc(wcap, 8);
+        U8W *wj = xc(nthr, sizeof(U8W));
+        pthread_t *th = xc(nthr, sizeof(pthread_t));
+        for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+            uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+            uint64_t per = (wn + sp - 1) / sp;
+            for (int phase = 0; phase < 2; phase++) {
+                uint64_t lo = bs;
+                for (int k = 0; k < sp; k++) {
+                    U8W *w = &wj[k];
+                    w->s = s; w->n = n; w->mode = phase;
+                    w->blo = lo; w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                    w->fts = fts + (lo - bs) * 256;
+                    w->h32 = h32 + (lo - bs) * 256;
+                    w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
+                    w->xs = xs + (lo - bs); w->spawned = 0;
+                    lo = w->bhi;
+                    if (pthread_create(&th[k], 0, u8w_run, w)) u8w_run(w);
+                    else w->spawned = 1;
+                }
+                for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+                if (phase) continue;
+                for (uint64_t b = 0; b < wn; b++) {
+                    const uint32_t *bh = h32 + b * 256;
+                    uint16_t *f = fts + b * 256;
+                    norm_ctx(h, f, 256);
+                    for (int i = 0; i < 256; i++) h[i] += bh[i];
+                }
+            }
+            for (uint64_t b = 0; b < wn; b++) {
+                uint8_t *bf = bufs[b];
+                o = emit_blk(o, bf + lens[b], bf, xs[b]);
+                free(bf);
+            }
+        }
+        free(fts); free(h32); free(bufs); free(lens); free(xs);
+        free(wj); free(th);
+        return o - out;
+    }
+    scr = xm(SCRSZ);
     uint16_t ft[256]; uint32_t cum[257];
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
@@ -4033,7 +4480,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         if (!is_flt16(t->dtype) || !ne || t->nd < 1) return 0;
         int c = is_bf(t->dtype) ? CBPOS : CFPOS;
         uint64_t *h = hclone(c);
-        uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), t->shape[t->nd - 1], 0, scr, h);
+        uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), t->shape[t->nd - 1], 0, scr, h, nthr);
         hout[0] = h; chout[0] = c;
         return sz;
     }
@@ -4045,21 +4492,21 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
            position contexts see the same mapping as the full encode */
         int64_t P = t->shape[0];
         if (ne < ne0) { int64_t p2 = (int64_t)((__uint128_t)ne * P / ne0); if (p2 < 1) p2 = 1; P = p2; }
-        uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), P, 1, scr, h);
+        uint64_t sz = pos_enc((uint16_t *)t->data, ne, mbits_of(t->dtype), P, 1, scr, h, nthr);
         hout[0] = h; chout[0] = c;
         return sz;
     }
     case M_F32: {
         if (!is_f32(t->dtype) || !ne) return 0;
         uint64_t *h = hclone(C32);
-        uint64_t sz = f32_enc((uint32_t *)t->data, ne, scr, h);
+        uint64_t sz = f32_enc((uint32_t *)t->data, ne, scr, h, nthr);
         hout[0] = h; chout[0] = C32;
         return sz;
     }
     case M_U8: {
         if (!nB) return 0;
         uint64_t *h = hclone(C8);
-        uint64_t sz = u8_enc(t->data, nB, scr, h);
+        uint64_t sz = u8_enc(t->data, nB, scr, h, nthr);
         hout[0] = h; chout[0] = C8;
         return sz;
     }
@@ -4216,9 +4663,11 @@ static void pos_gain2(const uint16_t *s, uint64_t n, int mb, int64_t Pc, int64_t
         }
         if (jr) {
             jr[ctxr * sew + SE]++;
-            if (i + 1 == pob) {       /* por = i/Dr steps up at i = por*Dr */
-                por++; pob += (uint64_t)Dr;
-                remr += Kr; if (remr >= Pr) { remr -= Pr; ctxr++; }
+            if (i + 1 == pob) {       /* por = i/Dr steps up at i = por*Dr;
+                                         clamp at Pr-1: tail elements past
+                                         P*Dr would index past jr's rows */
+                pob += (uint64_t)Dr;
+                if (por < Pr - 1) { por++; remr += Kr; if (remr >= Pr) { remr -= Pr; ctxr++; } }
             }
         }
     }
@@ -4777,8 +5226,8 @@ int main(int argc, char **argv) {
         g_outp = xc(1, sizeof(char *)); g_outp[0] = xstrdup(ctmp);
         g_outn = 0; g_outok = 0; atexit(out_cleanup);
         FILE *of = xfopen_tmp(ctmp);
-        setvbuf(of, 0, _IOFBF, 1 << 23);   /* big payloads: skip the 4KB stdio bounce */
         if (!of) die("out");
+        setvbuf(of, 0, _IOFBF, 1 << 23);   /* big payloads: skip the 4KB stdio bounce */
         g_outn = 1;
         InFile **ins = xc(nf, sizeof(InFile *));
         int64_t NT64 = 0;
