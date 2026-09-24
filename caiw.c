@@ -1045,6 +1045,7 @@ typedef struct {
     uint64_t blo, bhi;                 /* block index range (absolute) */
     uint8_t **bufs; uint32_t *lens; uint64_t *xs;   /* wave-local outputs */
     uint32_t *h32;                     /* wave-local per-block count hists */
+    uint8_t *useds;                    /* wave-local [blk][2*ew] ctx masks */
     int mode;                          /* 0 = count, 1 = encode */
     int spawned;
 } F16W;
@@ -1056,9 +1057,11 @@ static void *f16w_run(void *a) {
         for (uint64_t b = w->blo; b < w->bhi; b++) {
             uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
             uint32_t *bh = w->h32 + (size_t)(b - w->blo) * w->fsn;
-            memset(bh, 0, w->fsn * 4);
+            uint8_t *used = w->useds + (size_t)(b - w->blo) * 2 * ew;
+            memset(bh, 0, w->fsn * 4); memset(used, 0, 2 * (size_t)ew);
             for (uint64_t i = 0; i < bn; i++) {
                 uint32_t v = w->s[b0 + i], S = v >> 15, E = (v >> w->mb) & (ew - 1), Mv = v & (mw - 1);
+                used[S * ew + E] = 1;
                 bh[S]++; bh[2 + S * ew + E]++; bh[2 + 2 * ew + (size_t)(S * ew + E) * mw + Mv]++;
             }
         }
@@ -1073,7 +1076,8 @@ static void *f16w_run(void *a) {
         uint32_t *cS = cum, *cE = cum + 4, *cM = cum + 4 + 2 * (ew + 1);
         cS[0] = 0; cS[1] = fS[0]; cS[2] = (uint32_t)fS[0] + fS[1];
         for (int c = 0; c < 2; c++) { uint32_t *u = cE + c * (ew + 1); u[0] = 0; for (int i = 0; i < ew; i++) u[i + 1] = u[i] + fE[c * ew + i]; }
-        for (int c = 0; c < 2 * ew; c++) { uint32_t *u = cM + (size_t)c * (mw + 1); u[0] = 0; for (int i = 0; i < mw; i++) u[i + 1] = u[i] + fM[(size_t)c * mw + i]; }
+        const uint8_t *used = w->useds + (size_t)(b - w->blo) * 2 * ew;
+        for (int c = 0; c < 2 * ew; c++) if (used[c]) { uint32_t *u = cM + (size_t)c * (mw + 1); u[0] = 0; for (int i = 0; i < mw; i++) u[i + 1] = u[i] + fM[(size_t)c * mw + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
         for (uint64_t i = bn; i-- > 0;) {
@@ -1107,6 +1111,7 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
         if (wcap > nblk) wcap = nblk;
         uint16_t *fts = xm((size_t)wcap * fsn * 2);
         uint32_t *h32 = xc((size_t)wcap * fsn, 4);
+        uint8_t *useds = xc((size_t)wcap * 2 * ew, 1);
         uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
         uint32_t *lens = xc(wcap, 4);
         uint64_t *xs = xc(wcap, 8);
@@ -1127,6 +1132,7 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
                     w->bhi = lo + per < bs + wn ? lo + per : bs + wn;
                     w->bufs = bufs + (lo - bs); w->lens = lens + (lo - bs);
                     w->xs = xs + (lo - bs); w->spawned = 0;
+                    w->useds = useds + (size_t)(lo - bs) * 2 * ew;
                     lo = w->bhi;
                     if (pthread_create(&th[k], 0, f16w_run, w)) f16w_run(w);
                     else w->spawned = 1;
@@ -1137,9 +1143,11 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
                 for (uint64_t b = 0; b < wn; b++) {
                     uint16_t *ft = fts + (size_t)b * fsn;
                     const uint32_t *bh = h32 + (size_t)b * fsn;
+                    const uint8_t *u = useds + (size_t)b * 2 * ew;
                     norm_ctx(h, ft, 2);
                     for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, ft + 2 + c * ew, ew);
-                    for (int c = 0; c < 2 * ew; c++) norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, ft + 2 + 2 * ew + (size_t)c * mw, mw);
+                    for (int c = 0; c < 2 * ew; c++) if (u[c])
+                        norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, ft + 2 + 2 * ew + (size_t)c * mw, mw);
                     for (size_t i = 0; i < fsn; i++) h[i] += bh[i];
                 }
             }
@@ -1149,22 +1157,30 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
                 free(bf);
             }
         }
-        free(fts); free(h32); free(bufs); free(lens); free(xs); free(wj); free(th);
+        free(fts); free(h32); free(useds); free(bufs); free(lens); free(xs); free(wj); free(th);
         return o - out;
     }
     uint16_t *ft = xm((2 + 2 * ew + (size_t)2 * ew * mw) * 2);
     uint32_t *cum = xm((4 + 2 * (ew + 1) + (size_t)2 * ew * (mw + 1)) * 4);
     uint8_t *scr = xm(SCRSZ);
+    uint8_t *used = xm(2 * (size_t)ew);
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         uint16_t *fS = ft, *fE = ft + 2, *fM = ft + 2 + 2 * ew;
+        /* used-se mask: real tensors touch only a few dozen of the 2*ew
+           exponent contexts — norm only those mantissa rows (unused rows'
+           ft values are never read by either side) */
+        memset(used, 0, 2 * (size_t)ew);
+        for (uint64_t i = 0; i < bn; i++)
+            used[(s[b0 + i] >> mb) & (2 * ew - 1)] = 1;
         norm_ctx(h, fS, 2);
         for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * ew, fE + c * ew, ew);
-        for (int c = 0; c < 2 * ew; c++) norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, fM + (size_t)c * mw, mw);
+        for (int c = 0; c < 2 * ew; c++) if (used[c])
+            norm_ctx(h + 2 + 2 * ew + (size_t)c * mw, fM + (size_t)c * mw, mw);
         uint32_t *cS = cum, *cE = cum + 4, *cM = cum + 4 + 2 * (ew + 1);
         cS[0] = 0; cS[1] = fS[0]; cS[2] = (uint32_t)fS[0] + fS[1];
         for (int c = 0; c < 2; c++) { uint32_t *b = cE + c * (ew + 1); b[0] = 0; for (int i = 0; i < ew; i++) b[i + 1] = b[i] + fE[c * ew + i]; }
-        for (int c = 0; c < 2 * ew; c++) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + fM[(size_t)c * mw + i]; }
+        for (int c = 0; c < 2 * ew; c++) if (used[c]) { uint32_t *b = cM + (size_t)c * (mw + 1); b[0] = 0; for (int i = 0; i < mw; i++) b[i + 1] = b[i] + fM[(size_t)c * mw + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
         for (uint64_t i = bn; i-- > 0;) {
@@ -1179,7 +1195,7 @@ static size_t f16_enc(const uint16_t *s, uint64_t n, int mb, uint8_t *out, uint6
         }
         o = emit_blk(o, scr + SCRSZ, pp, x);
     }
-    free(ft); free(cum); free(scr);
+    free(ft); free(cum); free(scr); free(used);
     return o - out;
 }
 /*@ requires 1 <= ew <= 32768;
@@ -1767,20 +1783,32 @@ static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) 
     uint16_t *ft = xm((2 + 512 + nM1 + nM2 + nM3) * 2);
     uint32_t *cum = xm((4 + 2 * 257 + 512 * 129 + 2 * 512 * 257) * 4);
     uint8_t *scr = xm(SCRSZ);
+    uint8_t *used = xm(512), urow[2];
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
+        /* used-se mask: f32 tensors touch a few dozen of the 512 sign×exp
+           contexts — norm only those mantissa rows (and the E rows for the
+           sign halves actually present); unused rows are never read */
+        memset(used, 0, 512); urow[0] = urow[1] = 0;
+        for (uint64_t i = 0; i < bn; i++) {
+            uint32_t v = s[b0 + i];
+            uint32_t se = (v >> 23) & 511;   /* = S*256+E (bit8 is S) */
+            used[se] = 1; urow[v >> 31] = 1;
+        }
         norm_ctx(h, ft, 2);
-        for (int c = 0; c < 2; c++) norm_ctx(h + 2 + c * 256, ft + 2 + c * 256, 256);
+        for (int c = 0; c < 2; c++) if (urow[c]) norm_ctx(h + 2 + c * 256, ft + 2 + c * 256, 256);
         uint16_t *f1 = ft + 2 + 512, *f2 = f1 + nM1, *f3 = f2 + nM2;
-        for (int c = 0; c < 512; c++) norm_ctx(h + 2 + 512 + (size_t)c * 128, f1 + (size_t)c * 128, 128);
-        for (int c = 0; c < 512; c++) norm_ctx(h + 2 + 512 + nM1 + (size_t)c * 256, f2 + (size_t)c * 256, 256);
-        for (int c = 0; c < 512; c++) norm_ctx(h + 2 + 512 + nM1 + nM2 + (size_t)c * 256, f3 + (size_t)c * 256, 256);
+        for (int c = 0; c < 512; c++) if (used[c]) {
+            norm_ctx(h + 2 + 512 + (size_t)c * 128, f1 + (size_t)c * 128, 128);
+            norm_ctx(h + 2 + 512 + nM1 + (size_t)c * 256, f2 + (size_t)c * 256, 256);
+            norm_ctx(h + 2 + 512 + nM1 + nM2 + (size_t)c * 256, f3 + (size_t)c * 256, 256);
+        }
         uint32_t *cS = cum, *cE = cum + 4, *c1 = cE + 2 * 257, *c2 = c1 + 512 * 129, *c3 = c2 + 512 * 257;
         cS[0] = 0; cS[1] = ft[0]; cS[2] = (uint32_t)ft[0] + ft[1];
-        for (int c = 0; c < 2; c++) { uint32_t *b = cE + c * 257; b[0] = 0; for (int i = 0; i < 256; i++) b[i + 1] = b[i] + ft[2 + c * 256 + i]; }
-        for (int c = 0; c < 512; c++) { uint32_t *b = c1 + c * 129; b[0] = 0; for (int i = 0; i < 128; i++) b[i + 1] = b[i] + f1[c * 128 + i]; }
-        for (int c = 0; c < 512; c++) { uint32_t *b = c2 + c * 257; b[0] = 0; for (int i = 0; i < 256; i++) b[i + 1] = b[i] + f2[c * 256 + i]; }
-        for (int c = 0; c < 512; c++) { uint32_t *b = c3 + c * 257; b[0] = 0; for (int i = 0; i < 256; i++) b[i + 1] = b[i] + f3[c * 256 + i]; }
+        for (int c = 0; c < 2; c++) if (urow[c]) { uint32_t *b = cE + c * 257; b[0] = 0; for (int i = 0; i < 256; i++) b[i + 1] = b[i] + ft[2 + c * 256 + i]; }
+        for (int c = 0; c < 512; c++) if (used[c]) { uint32_t *b = c1 + c * 129; b[0] = 0; for (int i = 0; i < 128; i++) b[i + 1] = b[i] + f1[c * 128 + i]; }
+        for (int c = 0; c < 512; c++) if (used[c]) { uint32_t *b = c2 + c * 257; b[0] = 0; for (int i = 0; i < 256; i++) b[i + 1] = b[i] + f2[c * 256 + i]; }
+        for (int c = 0; c < 512; c++) if (used[c]) { uint32_t *b = c3 + c * 257; b[0] = 0; for (int i = 0; i < 256; i++) b[i + 1] = b[i] + f3[c * 256 + i]; }
         uint8_t *pp = scr + SCRSZ;
         uint64_t x = LOWER;
         for (uint64_t i = bn; i-- > 0;) {
@@ -1799,7 +1827,7 @@ static size_t f32_enc(const uint32_t *s, uint64_t n, uint8_t *out, uint64_t *h) 
         }
         o = emit_blk(o, scr + SCRSZ, pp, x);
     }
-    free(ft); free(cum); free(scr);
+    free(ft); free(cum); free(scr); free(used);
     return o - out;
 }
 /*@ requires \valid_read(ft + (0 .. 328193));
@@ -2233,14 +2261,158 @@ static void dltws_need_eb(DltWs *w, uint64_t escn) {
         if (!w->escbuf) die("oom");
     }
 }
+/* block-parallel DELTA16: the element pass (sym/ctx/escapes) depends only on
+   cur+ref so it runs in parallel into per-block buffers; the norm+merge of h
+   is the serial model chain; blocks then encode in parallel against their
+   frozen ft snapshots.  Same ft/cum => same bytes as the serial path. */
+typedef struct {
+    const uint16_t *cur, *ref; uint64_t n;
+    uint64_t blo, bhi;                        /* absolute block range */
+    uint8_t *cBs; uint16_t *sBs;              /* [blk][BLK] wave-local */
+    uint8_t *useds;                           /* [blk][DCTX] */
+    uint16_t *fts;                            /* [blk][DCTX*DSYMS] */
+    uint32_t *h32;                            /* [blk][DCTX*DSYMS] */
+    uint16_t **escs; uint32_t *escn;          /* per-block escape lists */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;
+    int mode;                                 /* 0 = build+count, 1 = encode */
+    int spawned;
+} DltW;
+static void *dltw_run(void *a) {
+    DltW *w = a;
+    if (!w->mode) {
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t lb = b - w->blo;
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            uint8_t *cB = w->cBs + lb * BLK, *used = w->useds + lb * DCTX;
+            uint16_t *sB = w->sBs + lb * BLK;
+            uint32_t *bh = w->h32 + lb * (size_t)(DCTX * DSYMS);
+            /* fused single pass — a full bh memset is cheaper than scanning
+               ref twice just to learn which ctx rows need clearing */
+            memset(used, 0, DCTX);
+            memset(bh, 0, (size_t)DCTX * DSYMS * 4);
+            uint16_t *eb = xm(bn * 2 + 2); uint32_t en = 0;
+            for (uint64_t i = 0; i < bn; i++) {
+                int c = w->ref[b0 + i] >> 9;
+                int64_t d = kmap16(w->cur[b0 + i]) - kmap16(w->ref[b0 + i]);
+                uint32_t sym = (d < -DR || d >= DR) ? DESC : (uint32_t)(d + DR);
+                cB[i] = (uint8_t)c; sB[i] = (uint16_t)sym; used[c] = 1;
+                bh[c * DSYMS + sym]++;
+                if (sym == DESC) eb[en++] = w->cur[b0 + i];
+            }
+            w->escs[lb] = eb; w->escn[lb] = en;
+        }
+        return 0;
+    }
+    uint8_t *scr = xm(SCRSZ);
+    uint32_t *dcum = xm(DCTX * (DSYMS + 1) * 4);
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t lb = b - w->blo;
+        uint64_t bn = w->n - b * BLK < BLK ? w->n - b * BLK : BLK;
+        const uint8_t *cB = w->cBs + lb * BLK, *used = w->useds + lb * DCTX;
+        const uint16_t *sB = w->sBs + lb * BLK;
+        const uint16_t *ft = w->fts + lb * (size_t)(DCTX * DSYMS);
+        for (int c = 0; c < DCTX; c++) if (used[c]) {
+            uint32_t *cu = dcum + c * (DSYMS + 1);
+            cu[0] = 0;
+            for (int i = 0; i < DSYMS; i++) cu[i + 1] = cu[i] + ft[c * DSYMS + i];
+        }
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        for (uint64_t i = bn; i-- > 0;) {
+            uint32_t sym = sB[i]; int c = cB[i];
+            x = enc(x, ft[c * DSYMS + sym], dcum[c * (DSYMS + 1) + sym], &pp);
+        }
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr); free(dcum);
+    return 0;
+}
 static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
-                         uint8_t *out, uint64_t *h, int mb, uint64_t *hesc, DltWs *w) {
+                         uint8_t *out, uint64_t *h, int mb, uint64_t *hesc, DltWs *w,
+                         int nthr) {
     uint8_t *o = out, *scr = w->scr;
     uint16_t *ft = w->ft;
     uint32_t *dcum = w->dcum;
     uint16_t *sB = w->sB; uint8_t *cB = w->cB, *used = w->used;
     uint64_t esc_cap = w->esc_cap, esc_n = 0;
     uint16_t *escbuf = w->escbuf;
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    if (nthr > 1 && nblk >= 2) {
+        uint64_t wcap = (uint64_t)nthr * 4;   /* heavier per-block state */
+        if (wcap > nblk) wcap = nblk;
+        uint8_t *cBs = xm(wcap * BLK), *useds = xm(wcap * DCTX);
+        uint16_t *sBs = xm(wcap * BLK * 2), *fts = xm(wcap * (size_t)(DCTX * DSYMS) * 2);
+        uint32_t *h32 = xc(wcap * (size_t)(DCTX * DSYMS), 4);
+        uint16_t **escs = xc(wcap, sizeof(uint16_t *));
+        uint32_t *escn = xc(wcap, 4), *lens = xc(wcap, 4);
+        uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+        uint64_t *xs = xc(wcap, 8);
+        DltW *wj = xc(nthr, sizeof(DltW));
+        pthread_t *th = xc(nthr, sizeof(pthread_t));
+        for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+            uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+            int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+            uint64_t per = (wn + sp - 1) / sp;
+            for (int phase = 0; phase < 2; phase++) {
+                uint64_t lo = bs;
+                for (int k = 0; k < sp; k++) {
+                    DltW *q = &wj[k];
+                    q->cur = cur; q->ref = ref; q->n = n; q->mode = phase;
+                    q->blo = lo; q->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                    q->cBs = cBs + (lo - bs) * BLK; q->sBs = sBs + (lo - bs) * BLK;
+                    q->useds = useds + (lo - bs) * DCTX;
+                    q->fts = fts + (lo - bs) * (size_t)(DCTX * DSYMS);
+                    q->h32 = h32 + (lo - bs) * (size_t)(DCTX * DSYMS);
+                    q->escs = escs + (lo - bs); q->escn = escn + (lo - bs);
+                    q->bufs = bufs + (lo - bs); q->lens = lens + (lo - bs);
+                    q->xs = xs + (lo - bs); q->spawned = 0;
+                    lo = q->bhi;
+                    if (pthread_create(&th[k], 0, dltw_run, q)) dltw_run(q);
+                    else q->spawned = 1;
+                }
+                for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+                if (phase) continue;
+                /* serial norm+merge per block, in order (model chain) */
+                for (uint64_t b = 0; b < wn; b++) {
+                    const uint8_t *u = useds + b * DCTX;
+                    uint16_t *f = fts + b * (size_t)(DCTX * DSYMS);
+                    const uint32_t *bh = h32 + b * (size_t)(DCTX * DSYMS);
+                    for (int c = 0; c < DCTX; c++) if (u[c]) {
+                        norm_ctx(h + c * DSYMS, f + c * DSYMS, DSYMS);
+                        uint64_t *hp = h + c * DSYMS;
+                        const uint32_t *bp = bh + c * DSYMS;
+                        for (int i = 0; i < DSYMS; i++) hp[i] += bp[i];
+                    }
+                }
+            }
+            for (uint64_t b = 0; b < wn; b++) {          /* emit, in order */
+                uint8_t *bf = bufs[b];
+                o = emit_blk(o, bf + lens[b], bf, xs[b]);
+                free(bf);
+                /* escapes concatenate in element order */
+                if (escn[b]) {
+                    if (esc_n + escn[b] > esc_cap) {
+                        while (esc_n + escn[b] > esc_cap) esc_cap *= 2;
+                        escbuf = realloc(escbuf, esc_cap * 2);
+                        if (!escbuf) die("oom");
+                    }
+                    memcpy(escbuf + esc_n, escs[b], escn[b] * 2);
+                    esc_n += escn[b];
+                }
+                free(escs[b]);
+            }
+        }
+        free(cBs); free(sBs); free(useds); free(fts); free(h32);
+        free(escs); free(escn); free(lens); free(bufs); free(xs);
+        free(wj); free(th);
+        p64le(o, esc_n); o += 8;
+        o += f16_enc(escbuf, esc_n, mb, o, hesc, nthr > 1 ? nthr : 1);
+        w->escbuf = escbuf; w->esc_cap = esc_cap;
+        return o - out;
+    }
     for (uint64_t b0 = 0; b0 < n; b0 += BLK) {
         uint64_t bn = n - b0 < BLK ? n - b0 : BLK;
         /* fused forward pass: sym + refctx per elem, used-ctx mask, escapes */
@@ -2273,14 +2445,14 @@ static size_t dlt_enc_ws(const uint16_t *cur, const uint16_t *ref, uint64_t n,
         o = emit_blk(o, scr + SCRSZ, pp, x);
     }
     p64le(o, esc_n); o += 8;
-    o += f16_enc(escbuf, esc_n, mb, o, hesc, 1);  /* escapes through FIELD channel */
+    o += f16_enc(escbuf, esc_n, mb, o, hesc, nthr);  /* escapes through FIELD channel */
     w->escbuf = escbuf; w->esc_cap = esc_cap;
     return o - out;
 }
 static size_t dlt_enc(const uint16_t *cur, const uint16_t *ref, uint64_t n,
-                      uint8_t *out, uint64_t *h, int mb, uint64_t *hesc) {
+                      uint8_t *out, uint64_t *h, int mb, uint64_t *hesc, int nthr) {
     DltWs w; dltws_init(&w);
-    size_t r = dlt_enc_ws(cur, ref, n, out, h, mb, hesc, &w);
+    size_t r = dlt_enc_ws(cur, ref, n, out, h, mb, hesc, &w, nthr);
     dltws_free(&w);
     return r;
 }
@@ -2616,10 +2788,133 @@ static void dlt_dec(const uint8_t *in, const uint8_t *lim, const uint16_t *ref, 
 #define D32CN (1u << 24)   /* elements per plane chunk */
 /* each XOR plane coded conditioned on ref exponent byte (ref>>23):
  * ~0.6b/elem gain on real F32 checkpoint deltas */
+/* block-parallel DELTA32: planes are still serial (h is shared across them),
+   but within a plane blocks run build+count in parallel, norm+merge serially
+   in order, then encode in parallel.  pl/cb are wave-local. */
+typedef struct {
+    const uint32_t *cur, *ref; uint64_t n; int sh;
+    uint64_t blo, bhi;
+    uint8_t *pl, *cb, *useds;                 /* [blk][BLK], [blk][256] */
+    uint16_t *fts;                            /* [blk][65536] */
+    uint32_t *h32;                            /* [blk][65536] */
+    uint8_t **bufs; uint32_t *lens; uint64_t *xs;
+    int mode, spawned;
+} D32W;
+static void *d32w_run(void *a) {
+    D32W *w = a;
+    if (!w->mode) {
+        for (uint64_t b = w->blo; b < w->bhi; b++) {
+            uint64_t lb = b - w->blo;
+            uint64_t b0 = b * BLK, bn = w->n - b0 < BLK ? w->n - b0 : BLK;
+            uint8_t *pl = w->pl + lb * BLK, *cb = w->cb + lb * BLK;
+            uint8_t *used = w->useds + lb * 256;
+            uint32_t *bh = w->h32 + lb * 65536;
+            /* fused single pass per plane (wave-local cb — each plane rebuilds
+               it, same reads as the serial chunk pass).  Full bh memset is
+               cheaper than a separate ref scan to learn the used mask first */
+            memset(used, 0, 256);
+            memset(bh, 0, 65536 * 4);
+            for (uint64_t i = 0; i < bn; i++) {
+                int c = (w->ref[b0 + i] >> 23) & 255;
+                uint32_t sym = ((w->cur[b0 + i] ^ w->ref[b0 + i]) >> w->sh) & 255;
+                cb[i] = (uint8_t)c; pl[i] = (uint8_t)sym;
+                used[c] = 1; bh[c * 256 + sym]++;
+            }
+        }
+        return 0;
+    }
+    uint8_t *scr = xm(SCRSZ);
+    uint32_t *cum = xm(256 * 257 * 4);
+    for (uint64_t b = w->blo; b < w->bhi; b++) {
+        uint64_t lb = b - w->blo;
+        uint64_t bn = w->n - b * BLK < BLK ? w->n - b * BLK : BLK;
+        const uint8_t *pl = w->pl + lb * BLK, *cb = w->cb + lb * BLK;
+        const uint8_t *used = w->useds + lb * 256;
+        const uint16_t *ft = w->fts + lb * 65536;
+        for (int c = 0; c < 256; c++) if (used[c]) {
+            uint32_t *cu = cum + c * 257;
+            cu[0] = 0;
+            for (int i = 0; i < 256; i++) cu[i + 1] = cu[i] + ft[c * 256 + i];
+        }
+        uint8_t *pp = scr + SCRSZ;
+        uint64_t x = LOWER;
+        for (uint64_t i = bn; i-- > 0;) {
+            int c = cb[i], sym = pl[i];
+            x = enc(x, ft[c * 256 + sym], cum[c * 257 + sym], &pp);
+        }
+        uint64_t bl = (uint64_t)(scr + SCRSZ - pp);
+        w->bufs[lb] = xm(bl ? bl : 1);
+        memcpy(w->bufs[lb], pp, bl);
+        w->lens[lb] = (uint32_t)bl; w->xs[lb] = x;
+    }
+    free(scr); free(cum);
+    return 0;
+}
 static size_t dlt32_enc(const uint32_t *cur, const uint32_t *ref, uint64_t n,
-                        uint8_t *out, uint64_t *h) {
-    uint8_t *pl = xm(D32CN), *cb = xm(D32CN), *o = out, *scr = xm(SCRSZ);
+                        uint8_t *out, uint64_t *h, int nthr) {
+    uint8_t *o = out, *scr = xm(SCRSZ);
     uint16_t *ft = xm(256 * 256 * 2); uint32_t *cum = xm(256 * 257 * 4);
+    uint64_t nblk = (n + BLK - 1) / BLK;
+    if (nthr > 1 && nblk >= 2) {
+        uint64_t wcap = (uint64_t)nthr * 4;
+        if (wcap > nblk) wcap = nblk;
+        uint8_t *pl = xm(wcap * BLK), *cb = xm(wcap * BLK), *useds = xm(wcap * 256);
+        uint16_t *fts = xm(wcap * 65536 * 2);
+        uint32_t *h32 = xc(wcap * 65536, 4);
+        uint8_t **bufs = xc(wcap, sizeof(uint8_t *));
+        uint32_t *lens = xc(wcap, 4); uint64_t *xs = xc(wcap, 8);
+        D32W *wj = xc(nthr, sizeof(D32W));
+        pthread_t *th = xc(nthr, sizeof(pthread_t));
+        for (int p = 0; p < 4; p++) {
+            int sh = p * 8;
+            for (uint64_t bs = 0; bs < nblk; bs += wcap) {
+                uint64_t wn = nblk - bs < wcap ? nblk - bs : wcap;
+                int sp = (uint64_t)nthr < wn ? nthr : (int)wn;
+                uint64_t per = (wn + sp - 1) / sp;
+                for (int phase = 0; phase < 2; phase++) {
+                    uint64_t lo = bs;
+                    for (int k = 0; k < sp; k++) {
+                        D32W *q = &wj[k];
+                        q->cur = cur; q->ref = ref; q->n = n; q->sh = sh;
+                        q->mode = phase; q->blo = lo;
+                        q->bhi = lo + per < bs + wn ? lo + per : bs + wn;
+                        q->pl = pl + (lo - bs) * BLK; q->cb = cb + (lo - bs) * BLK;
+                        q->useds = useds + (lo - bs) * 256;
+                        q->fts = fts + (lo - bs) * 65536;
+                        q->h32 = h32 + (lo - bs) * 65536;
+                        q->bufs = bufs + (lo - bs); q->lens = lens + (lo - bs);
+                        q->xs = xs + (lo - bs); q->spawned = 0;
+                        lo = q->bhi;
+                        if (pthread_create(&th[k], 0, d32w_run, q)) d32w_run(q);
+                        else q->spawned = 1;
+                    }
+                    for (int k = 0; k < sp; k++) if (wj[k].spawned) pthread_join(th[k], 0);
+                    if (phase) continue;
+                    for (uint64_t b = 0; b < wn; b++) {
+                        const uint8_t *u = useds + b * 256;
+                        uint16_t *f = fts + b * 65536;
+                        const uint32_t *bh = h32 + b * 65536;
+                        for (int c = 0; c < 256; c++) if (u[c]) {
+                            norm_ctx(h + (p * 256 + c) * 256, f + c * 256, 256);
+                            uint64_t *hp = h + (p * 256 + c) * 256;
+                            const uint32_t *bp = bh + c * 256;
+                            for (int i = 0; i < 256; i++) hp[i] += bp[i];
+                        }
+                    }
+                }
+                for (uint64_t b = 0; b < wn; b++) {
+                    uint8_t *bf = bufs[b];
+                    o = emit_blk(o, bf + lens[b], bf, xs[b]);
+                    free(bf);
+                }
+            }
+        }
+        free(pl); free(cb); free(useds); free(fts); free(h32);
+        free(bufs); free(lens); free(xs); free(wj); free(th);
+        free(scr); free(ft); free(cum);
+        return o - out;
+    }
+    uint8_t *pl = xm(D32CN), *cb = xm(D32CN);
     for (int p = 0; p < 4; p++) {
         int sh = p * 8;
         for (uint64_t c0 = 0; c0 < n; c0 += D32CN) {
@@ -3507,7 +3802,7 @@ static size_t prw_enc(const uint16_t *s, uint64_t n, uint64_t cols, int mb,
     for (uint64_t r = 1; r * cols < n; r++) {
         uint64_t rn = n - r * cols < cols ? n - r * cols : cols;
         uint8_t *hdr = o; o += 4;
-        uint32_t lr = (uint32_t)dlt_enc_ws(s + r * cols, s + (r - 1) * cols, rn, o, hd, mb, hf, &w);
+        uint32_t lr = (uint32_t)dlt_enc_ws(s + r * cols, s + (r - 1) * cols, rn, o, hd, mb, hf, &w, 1);
         p32le(hdr, lr); o += lr;
     }
     dltws_free(&w);
@@ -3770,7 +4065,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         const uint8_t *rd = alview(r->data, r->len, bsz, &rh);
         if (is_f32(t->dtype)) {
             uint64_t *h = hclone(C32D);
-            uint64_t sz = dlt32_enc((const uint32_t *)t->data, (const uint32_t *)rd, ne, scr, h);
+            uint64_t sz = dlt32_enc((const uint32_t *)t->data, (const uint32_t *)rd, ne, scr, h, nthr);
             free(rh); hout[0] = h; chout[0] = C32D;
             return sz;
         }
@@ -3778,7 +4073,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         {
             int ec = is_bf(t->dtype) ? CBF : CFP;
             uint64_t *h = hclone(CD), *h2 = hclone(ec);
-            uint64_t sz = dlt_enc((const uint16_t *)t->data, (const uint16_t *)rd, ne, scr, h, mbits_of(t->dtype), h2);
+            uint64_t sz = dlt_enc((const uint16_t *)t->data, (const uint16_t *)rd, ne, scr, h, mbits_of(t->dtype), h2, nthr);
             free(rh); hout[0] = h; chout[0] = CD; hout[1] = h2; chout[1] = ec;
             return sz;
         }
@@ -3789,7 +4084,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         const uint8_t *rd = alview(t->xreft->data, t->xreft->len, bsz, &rh);
         if (is_f32(t->dtype)) {
             uint64_t *h = hclone(C32D);
-            uint64_t sz = dlt32_enc((const uint32_t *)t->data, (const uint32_t *)rd, ne, scr, h);
+            uint64_t sz = dlt32_enc((const uint32_t *)t->data, (const uint32_t *)rd, ne, scr, h, nthr);
             free(rh); hout[0] = h; chout[0] = C32D;
             return sz;
         }
@@ -3797,7 +4092,7 @@ static uint64_t try_method(int m, Tensor *t, Tensor *all, uint8_t *scr, uint64_t
         {
             int ec = is_bf(t->dtype) ? CBF : CFP;
             uint64_t *h = hclone(CD), *h2 = hclone(ec);
-            uint64_t sz = dlt_enc((const uint16_t *)t->data, (const uint16_t *)rd, ne, scr, h, mbits_of(t->dtype), h2);
+            uint64_t sz = dlt_enc((const uint16_t *)t->data, (const uint16_t *)rd, ne, scr, h, mbits_of(t->dtype), h2, nthr);
             free(rh); hout[0] = h; chout[0] = CD; hout[1] = h2; chout[1] = ec;
             return sz;
         }
