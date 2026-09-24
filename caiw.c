@@ -5581,6 +5581,12 @@ static void dec_batch(Tensor *all, uint32_t i, uint32_t j, const uint8_t *buf,
 
 int main(int argc, char **argv) {
     if (argc < 3) die("usage: caiw c|d|v ... [--ref base.st] [-j N] ...");
+    /* build CRC tables here on the main thread, before any worker exists:
+       crc32b's lazy init would otherwise let one worker's crc_setup8 write
+       race a sibling's table read (identical bytes, but still a C-level
+       race — TSan).  pthread_create's happens-before makes these writes
+       visible to every worker. */
+    crc_setup(); crc_setup8();
     {
         long np = sysconf(_SC_NPROCESSORS_ONLN);
         g_threads = np > 0 ? (int)(np < 8 ? np : 8) : 1;
