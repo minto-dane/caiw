@@ -5439,8 +5439,9 @@ static uint64_t dec_aux(const Tensor *t) {
     case M_FIELDPOS: case M_FIELDROW: return 35651584ull;
     case M_F32:    return 4194304ull;
     /* FIELDT: ft+cum (~400KB) + per-worker u64 hists (~528KB each) +
-       block header arrays — bound generously under ~40MB */
-    case M_FIELDT: return (uint64_t)g_threads * 66050 * 8 + (6u << 20);
+       rps/ends/xs block header arrays (~24B per 128K-elem block) */
+    case M_FIELDT: return (uint64_t)g_threads * 66050 * 8 +
+                   t->len / 8192 + (6u << 20);
     default:       return 1048576u;
     }
 }
